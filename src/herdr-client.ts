@@ -344,3 +344,12 @@ export async function startAgent(opts: {
 export function closeTab(tabId: string): void {
   execHerdr(["tab", "close", tabId]);
 }
+
+/** Give an agent pane a new name: what `!bind` and the pane list use. */
+export function renameAgent(target: string, name: string): void {
+  execHerdr(["agent", "rename", target, name]);
+}
+
+export function renameTab(tabId: string, label: string): void {
+  execHerdr(["tab", "rename", tabId, label]);
+}

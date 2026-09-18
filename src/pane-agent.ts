@@ -223,6 +223,11 @@ export class PaneAgent {
     return this.opts.communicator.verbatim;
   }
 
+  /** Prompts the bridge typed into this pane: what finds its Claude session when herdr names none. */
+  sentPrompts(): string[] {
+    return this.opts.communicator.sentPrompts();
+  }
+
   /** Whether `getLastAnswer` is one answer, not the whole log. See the communicator. */
   canIsolateLastAnswer(): boolean {
     return this.opts.communicator.canIsolateLastAnswer();

@@ -27,8 +27,9 @@ import { createLogger, type Logger } from "./logger.js";
 import { SlackClient, isDirectMessage, type SlackThread, type ThreadMessage } from "./slack-client.js";
 import { formatForSlack } from "./slack-format.js";
 import { cleanPaneDelta, cleanPaneOutput, stripStatusBar } from "./output-format.js";
-import { createAgentCommunicator } from "./agent-sessions.js";
-import { closeTab, createTab, getAgents, getAgentInfo, readPane, sendKeys, startAgent } from "./herdr-client.js";
+import { createAgentCommunicator, findClaudeSessionByPrompt } from "./agent-sessions.js";
+import { closeTab, createTab, getAgents, getAgentInfo, readPane, renameAgent, renameTab, sendKeys, startAgent } from "./herdr-client.js";
+import type { AgentSessionRef } from "./herdr-client.js";
 import { PaneAgent } from "./pane-agent.js";
 import { PaneWatcher } from "./turn/pane-watcher.js";
 import { PendingTurnLog } from "./turn/pending-turns.js";
@@ -230,6 +231,7 @@ const COMMANDS = [
   "!bind <label|pane id> — bind this thread to a pane (e.g. !bind w4:p7)",
   "!spawn [dir] [agent] [-- args] — open a pane for this bot here and bind it",
   "!close — unbind, and close the tab !spawn opened for it",
+  "!name <name> — rename this thread's pane (!name alone shows the current name)",
   "!unbind — release this thread's pane",
   "!last — this pane's most recent answer",
   "!files [minutes] — files changed in this pane's directory (default 120)",
@@ -293,6 +295,29 @@ interface SlackState {
    * owed is compared against it: the same text was not lost, it was sent.
    */
   delivered: Record<string, string>;
+  /**
+   * Per binding key, the session an idle sweep closed. The next mention in
+   * that thread resumes it (`claude --resume`) instead of starting cold, so
+   * the conversation carries on where it stopped.
+   */
+  closed: Record<string, ClosedSession>;
+}
+
+interface ClosedSession {
+  label: string;
+  agent: string;
+  dir: string;
+  /** The agent's own session id, when herdr reported one. */
+  session_id?: string;
+  closed_at: number;
+}
+
+/** The agent's own session id from herdr's reference: an id, or a Claude transcript path `<id>.jsonl`. */
+function sessionIdOf(ref: AgentSessionRef | undefined): string | undefined {
+  if (!ref) return undefined;
+  if (ref.kind === "id") return ref.id;
+  const match = /([0-9a-f-]{36})\.jsonl$/i.exec(ref.path);
+  return match?.[1];
 }
 
 /** Bumped when the bridge note changes, so panes that have the old one are told again. */
@@ -930,6 +955,21 @@ export async function startSlackDaemon(
       let pending = spawning.get(key);
       if (!pending) {
         pending = (async () => {
+          const previous = state.closed[key];
+          if (previous && existsSync(previous.dir)) {
+            log.info("resuming the session an idle sweep closed", { bot: bot.name, thread: threadKey(thread), ...previous });
+            await spawn(bot, thread, undefined, [previous.dir, previous.agent], userId, undefined, {
+              fresh: true, quiet: true, label: previous.label, resumeSession: previous.session_id,
+            });
+            if (state.threads[key]) {
+              delete state.closed[key];
+              persist();
+              return state.threads[key];
+            }
+            log.warn("could not resume the closed session; starting fresh", { bot: bot.name, thread: threadKey(thread) });
+            delete state.closed[key];
+            persist();
+          }
           const cwd = bot.cfg.spawnCwd || homedir();
           log.info("opening a pane for this thread", { bot: bot.name, thread: threadKey(thread), cwd });
           await spawn(bot, thread, undefined, [cwd], userId, undefined, { fresh: true, quiet: true, labelHint: hint });
@@ -1005,6 +1045,7 @@ export async function startSlackDaemon(
     await markWorking(bot, binding.pane_id, thread.channel, messageTs);
     log.info("turn started", { bot: bot.name, paneId: binding.pane_id, label: binding.label, thread: threadKey(thread) });
     pendingTurns.open(binding.pane_id);
+    await dismissBlockingDialog(binding.pane_id);
     paneAgentFor(binding).handleMessage(await withThreadContext(binding, thread, text, messageTs));
   };
 
@@ -1034,6 +1075,10 @@ export async function startSlackDaemon(
       quiet?: boolean;
       /** Something recognisable for the tab label, e.g. the question's first words. */
       labelHint?: string;
+      /** The exact label to use (a resumed session keeps its old name). */
+      label?: string;
+      /** A Claude session id to continue with `--resume` instead of starting cold. */
+      resumeSession?: string;
     } = {},
   ): Promise<void> => {
     const client = bot.client;
@@ -1043,8 +1088,11 @@ export async function startSlackDaemon(
     }
     const dashDash = args.indexOf("--");
     const positional = dashDash === -1 ? args : args.slice(0, dashDash);
-    const agentArgs = dashDash === -1 ? bot.cfg.spawnArgs : args.slice(dashDash + 1);
+    const baseArgs = dashDash === -1 ? bot.cfg.spawnArgs : args.slice(dashDash + 1);
     const kind = positional[1] ?? bot.cfg.spawnAgent;
+    const agentArgs = opts.resumeSession && kind === "claude"
+      ? [...baseArgs, "--resume", opts.resumeSession]
+      : baseArgs;
     // Where: given, or wherever the other bot here is working.
     let dir = positional[0] ?? "";
     if (!dir) {
@@ -1082,7 +1130,7 @@ export async function startSlackDaemon(
     }
     const sibling = bindingsIn(thread).find((b) => b.bot !== bot.name);
     const workspaceId = sibling ? getAgentInfo(sibling.pane_id)?.workspace_id : undefined;
-    const label = `${bot.name}-${opts.labelHint ? slug(opts.labelHint) : basename(dir)}`;
+    let label = opts.label ?? `${bot.name}-${opts.labelHint ? slug(opts.labelHint) : basename(dir)}`;
     // Starting an agent takes a while; the status line says so, and the
     // bind reply that follows names the pane. A message for the wait on top
     // of both was one line too many.
@@ -1093,7 +1141,16 @@ export async function startSlackDaemon(
       tab = await createTab({ cwd: dir, label, workspaceId });
       log.info("spawn: tab created", { bot: bot.name, ...tab, dir });
       try {
-        await startAgent({ paneId: tab.pane_id, kind, name: label, agentArgs });
+        try {
+          await startAgent({ paneId: tab.pane_id, kind, name: label, agentArgs });
+        } catch (err) {
+          // Another pane (often a finished one) already has this name: the
+          // same first words asked twice. Keep the words, make the name unique.
+          if (!/agent_name_taken/.test(String(err))) throw err;
+          label = `${label}-${Date.now().toString(36).slice(-4)}`;
+          log.info("spawn: name taken, retrying", { bot: bot.name, label });
+          await startAgent({ paneId: tab.pane_id, kind, name: label, agentArgs });
+        }
       } catch (err) {
         // Claude Code in a directory it has not seen asks whether to trust
         // it before anything else, and herdr reports the agent blocked. The
@@ -1128,7 +1185,18 @@ export async function startSlackDaemon(
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     await new Promise((resolve) => setTimeout(resolve, 2000));
+    // Claude Code can open on a one-time dialog ("Teach auto mode about your
+    // environment?"). Everything typed at it is lost and the bridge then
+    // repeats the pane's last answer, so dismiss it before the first prompt.
+    await dismissBlockingDialog(pane.pane_id);
     await bind(bot, thread, pane, userId, { spawnedTab: tab.tab_id, quiet: opts.quiet });
+    // A resumed session already holds the thread up to where it stopped;
+    // relaying the whole history again would only repeat it.
+    const resumed = opts.resumeSession ? state.threads[bindingKey(bot.name, thread)] : undefined;
+    if (resumed && resumed.pane_id === pane.pane_id) {
+      resumed.context_sent = true;
+      persist();
+    }
   };
 
   /**
@@ -1148,6 +1216,21 @@ export async function startSlackDaemon(
       if (status === "idle" || status === "done") return true;
     }
     return false;
+  };
+
+  /**
+   * Claude Code sometimes opens a one-time dialog over its prompt ("Teach
+   * auto mode about your environment?") — at startup or between turns.
+   * Text typed at it is lost and the bridge would repeat the pane's last
+   * answer, so close it (Esc cancels it) before sending anything.
+   */
+  const dismissBlockingDialog = async (paneId: string): Promise<void> => {
+    let screen = "";
+    try { screen = readPane(paneId, 25); } catch { return; }
+    if (!/Teach auto mode/i.test(screen)) return;
+    log.info("dismissing a Claude Code dialog before sending", { paneId });
+    sendKeys(paneId, "Escape");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   };
 
   /** A short fingerprint of an answer, for "was this already sent". */
@@ -1306,6 +1389,34 @@ export async function startSlackDaemon(
     }
     if (word === "close") {
       await close(bot, thread, binding);
+      return true;
+    }
+    if (word === "name" || word === "rename") {
+      if (!arg) {
+        await client.post(thread, `This thread's pane is *${binding.label}* (${binding.pane_id}). Rename it with !name <name>.`);
+        return true;
+      }
+      const name = arg.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+      if (!name) { await client.post(thread, "Usage: !name <name> — letters, digits, dots, dashes."); return true; }
+      if (name === binding.label) { await client.post(thread, `Already named *${name}*.`); return true; }
+      if (panes.some((pane) => pane.label === name && pane.pane_id !== binding.pane_id)) {
+        await client.post(thread, `*${name}* is already another pane's name. Pick another.`);
+        return true;
+      }
+      try {
+        renameAgent(binding.pane_id, name);
+        const tabId = binding.spawned_tab ?? getAgentInfo(binding.pane_id)?.tab_id;
+        if (tabId) { try { renameTab(tabId, name); } catch { /* the pane's name is what counts */ } }
+      } catch (err) {
+        await client.post(thread, `Could not rename *${binding.label}*: ${err instanceof Error ? err.message : String(err)}`);
+        return true;
+      }
+      const old = binding.label;
+      binding.label = name;
+      persist();
+      await client.rename(thread, cwd ? `${name} · ${cwd}` : name);
+      log.info("pane renamed", { bot: bot.name, paneId: binding.pane_id, from: old, to: name });
+      await client.post(thread, `Renamed *${old}* → *${name}*. Use !bind ${name} to come back to it from another thread.`);
       return true;
     }
     if (word === "last") {
@@ -1542,6 +1653,20 @@ export async function startSlackDaemon(
       if (backgroundOn(binding.pane_id)) continue;
       const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
       log.info("closing an idle pane", { bot: bot.name, key, paneId: binding.pane_id, idleMinutes: Math.round(idleMs / 60_000) });
+      const info = getAgentInfo(binding.pane_id);
+      if (info?.cwd) {
+        state.closed[key] = {
+          label: binding.label,
+          agent: binding.agent,
+          dir: info.cwd,
+          session_id: sessionIdOf(info.agent_session)
+            ?? (info.agent === "claude"
+              ? findClaudeSessionByPrompt(info.cwd, agents.get(binding.pane_id)?.sentPrompts() ?? []) ?? undefined
+              : undefined),
+          closed_at: now,
+        };
+        persist();
+      }
       await unbind(bot, thread, binding);
       try {
         closeTab(binding.spawned_tab);
@@ -1550,7 +1675,7 @@ export async function startSlackDaemon(
       }
       await bot.client.post(
         thread,
-        `Closed *${binding.label}* after ${bot.cfg.idleCloseMinutes} minutes without a message. Mention me again to start a fresh session here — it will get this thread's history.`,
+        `Closed *${binding.label}* after ${bot.cfg.idleCloseMinutes} minutes without a message. Mention me again to pick it up where it stopped.`,
       ).catch(() => {});
     }
   };
@@ -1604,10 +1729,11 @@ export function loadSlackState(stateDir: string, log: Logger, firstBot: string):
       marked: parsed.marked ?? {},
       last_answer: parsed.last_answer ?? {},
       delivered: parsed.delivered ?? {},
+      closed: parsed.closed ?? {},
     };
   } catch {
     log.info("no existing Slack state; starting fresh", { stateDir });
-    return { threads: {}, last_user: {}, asked_from: {}, marked: {}, last_answer: {}, delivered: {} };
+    return { threads: {}, last_user: {}, asked_from: {}, marked: {}, last_answer: {}, delivered: {}, closed: {} };
   }
 }
 
