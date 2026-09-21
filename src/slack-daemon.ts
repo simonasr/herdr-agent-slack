@@ -1712,6 +1712,11 @@ export async function startSlackDaemon(
         const rebinds = isDirectMessage(binding.channel)
           ? Boolean(bot.cfg.defaultPane)
           : Boolean(bot.cfg.channelPanes[binding.channel.toLowerCase()]) || bot.cfg.channelPane === "fresh";
+        // The default pane is always there and a mention alone comes back to
+        // it, so letting a quiet thread go is bookkeeping, not news.
+        const isDefault = bot.cfg.defaultPane
+          && (binding.label === bot.cfg.defaultPane || binding.pane_id === bot.cfg.defaultPane);
+        if (isDefault) continue;
         await bot.client.post(
           thread,
           `Let go of *${binding.label}* after ${bot.cfg.idleCloseMinutes} minutes without a message. Its tab is untouched; `
