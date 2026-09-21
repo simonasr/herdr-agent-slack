@@ -1706,9 +1706,16 @@ export async function startSlackDaemon(
       if (!binding.spawned_tab) {
         log.info("releasing an idle pane the bridge did not open", { bot: bot.name, key, paneId: binding.pane_id });
         await unbind(bot, thread, binding);
+        // Where a mention alone binds this thread again (a DM with a default
+        // pane, a channel with one of its own, or a channel that opens a pane
+        // per thread), saying "!bind" would be busywork.
+        const rebinds = isDirectMessage(binding.channel)
+          ? Boolean(bot.cfg.defaultPane)
+          : Boolean(bot.cfg.channelPanes[binding.channel.toLowerCase()]) || bot.cfg.channelPane === "fresh";
         await bot.client.post(
           thread,
-          `Let go of *${binding.label}* after ${bot.cfg.idleCloseMinutes} minutes without a message. Its tab is untouched; !bind ${binding.label} to come back to it.`,
+          `Let go of *${binding.label}* after ${bot.cfg.idleCloseMinutes} minutes without a message. Its tab is untouched; `
+          + (rebinds ? "just mention me again here." : `!bind ${binding.label} to come back to it.`),
         ).catch(() => {});
         continue;
       }
