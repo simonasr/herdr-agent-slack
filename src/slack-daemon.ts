@@ -876,6 +876,9 @@ export async function startSlackDaemon(
       thread_ts: thread.threadTs,
       context_sent: false,
       note_version: 0,
+      // Without this an untouched binding reads as "active now" forever and
+      // the idle sweep never reaches it.
+      last_active: Date.now(),
       ...(spawnedTab ? { spawned_tab: spawnedTab } : {}),
     };
     const previous = state.threads[bindingKey(bot.name, thread)];
@@ -1658,12 +1661,23 @@ export async function startSlackDaemon(
     const now = Date.now();
     for (const [key, binding] of Object.entries(state.threads)) {
       const bot = bots.get(binding.bot);
-      if (!bot || !binding.spawned_tab || !bot.cfg.idleCloseMinutes) continue;
+      if (!bot || !bot.cfg.idleCloseMinutes) continue;
       const idleMs = now - (binding.last_active ?? now);
       if (idleMs < bot.cfg.idleCloseMinutes * 60_000) continue;
       if (getAgentInfo(binding.pane_id)?.agent_status === "working") continue;
       if (backgroundOn(binding.pane_id)) continue;
       const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
+      // A pane the bridge did not open belongs to whoever did: let the thread
+      // go, so the pane is free again, but never close their tab.
+      if (!binding.spawned_tab) {
+        log.info("releasing an idle pane the bridge did not open", { bot: bot.name, key, paneId: binding.pane_id });
+        await unbind(bot, thread, binding);
+        await bot.client.post(
+          thread,
+          `Let go of *${binding.label}* after ${bot.cfg.idleCloseMinutes} minutes without a message. Its tab is untouched; !bind ${binding.label} to come back to it.`,
+        ).catch(() => {});
+        continue;
+      }
       log.info("closing an idle pane", { bot: bot.name, key, paneId: binding.pane_id, idleMinutes: Math.round(idleMs / 60_000) });
       const info = getAgentInfo(binding.pane_id);
       if (info?.cwd) {
