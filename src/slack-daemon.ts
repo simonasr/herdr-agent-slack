@@ -1659,6 +1659,40 @@ export async function startSlackDaemon(
    */
   const sweepIdle = async (): Promise<void> => {
     const now = Date.now();
+    // A pane closed from the terminal or by hand leaves its thread bound to
+    // something that no longer exists, and silent: say so there, the way an
+    // idle close does, and let the binding go. Only when herdr is answering —
+    // an empty list means herdr is down, not that every pane vanished.
+    const live = getAgents();
+    if (live.length > 0) {
+      const alive = new Set(live.map((pane) => pane.pane_id));
+      for (const [key, binding] of Object.entries(state.threads)) {
+        if (alive.has(binding.pane_id)) continue;
+        const bot = bots.get(binding.bot);
+        if (!bot) continue;
+        const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
+        log.info("a bound pane is gone; releasing the thread", { bot: bot.name, key, paneId: binding.pane_id });
+        const info = getAgentInfo(binding.pane_id);
+        const dir = info?.cwd || state.closed[key]?.dir || bot.cfg.spawnCwd || "";
+        state.closed[key] = {
+          label: binding.label,
+          agent: binding.agent,
+          dir,
+          session_id: sessionIdOf(info?.agent_session)
+            ?? (binding.agent === "claude"
+              ? findClaudeSessionByPrompt(dir, agents.get(binding.pane_id)?.sentPrompts() ?? []) ?? undefined
+              : undefined)
+            ?? state.closed[key]?.session_id,
+          closed_at: now,
+        };
+        persist();
+        await unbind(bot, thread, binding);
+        await bot.client.post(
+          thread,
+          `Closed *${binding.label}*. Mention me again to pick it up where it stopped.`,
+        ).catch(() => {});
+      }
+    }
     for (const [key, binding] of Object.entries(state.threads)) {
       const bot = bots.get(binding.bot);
       if (!bot || !bot.cfg.idleCloseMinutes) continue;
