@@ -320,6 +320,18 @@ function sessionIdOf(ref: AgentSessionRef | undefined): string | undefined {
   return match?.[1];
 }
 
+/**
+ * herdr's rule for an agent name: 1-32 characters, starting with a lowercase
+ * letter, then lowercase letters, digits, `-` or `_`. A name built from a
+ * question's first words broke `!spawn` once it ran past 32 characters
+ * (`invalid_agent_name`), so every name the bridge sends goes through here.
+ */
+export function agentName(raw: string, fallback = "thread"): string {
+  const cleaned = raw.toLowerCase().replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[^a-z]+/, "").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+  return (cleaned || fallback).slice(0, 32).replace(/[-_]+$/, "") || fallback;
+}
+
 /** Bumped when the bridge note changes, so panes that have the old one are told again. */
 const NOTE_VERSION = 3;
 
@@ -1130,7 +1142,7 @@ export async function startSlackDaemon(
     }
     const sibling = bindingsIn(thread).find((b) => b.bot !== bot.name);
     const workspaceId = sibling ? getAgentInfo(sibling.pane_id)?.workspace_id : undefined;
-    let label = opts.label ?? `${bot.name}-${opts.labelHint ? slug(opts.labelHint) : basename(dir)}`;
+    let label = agentName(opts.label ?? `${bot.name}-${opts.labelHint ? slug(opts.labelHint) : basename(dir)}`, bot.name);
     // Starting an agent takes a while; the status line says so, and the
     // bind reply that follows names the pane. A message for the wait on top
     // of both was one line too many.
@@ -1147,7 +1159,7 @@ export async function startSlackDaemon(
           // Another pane (often a finished one) already has this name: the
           // same first words asked twice. Keep the words, make the name unique.
           if (!/agent_name_taken/.test(String(err))) throw err;
-          label = `${label}-${Date.now().toString(36).slice(-4)}`;
+          label = agentName(`${label.slice(0, 27)}-${Date.now().toString(36).slice(-4)}`, bot.name);
           log.info("spawn: name taken, retrying", { bot: bot.name, label });
           await startAgent({ paneId: tab.pane_id, kind, name: label, agentArgs });
         }
@@ -1396,8 +1408,8 @@ export async function startSlackDaemon(
         await client.post(thread, `This thread's pane is *${binding.label}* (${binding.pane_id}). Rename it with !name <name>.`);
         return true;
       }
-      const name = arg.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
-      if (!name) { await client.post(thread, "Usage: !name <name> — letters, digits, dots, dashes."); return true; }
+      const name = agentName(arg, "");
+      if (!name) { await client.post(thread, "Usage: !name <name> — start with a letter; letters, digits, - and _; up to 32 characters."); return true; }
       if (name === binding.label) { await client.post(thread, `Already named *${name}*.`); return true; }
       if (panes.some((pane) => pane.label === name && pane.pane_id !== binding.pane_id)) {
         await client.post(thread, `*${name}* is already another pane's name. Pick another.`);
