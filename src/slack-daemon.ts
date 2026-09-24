@@ -212,6 +212,52 @@ export function backgroundWork(screen: string): string {
     .join(", ");
 }
 
+/**
+ * The one-time menu an agent can open on startup, and the option to take.
+ *
+ * A pane sitting at one of these is not started: herdr waits, then reports
+ * the agent blocked or the wait timed out, and the thread gets nothing. The
+ * answer is never simply Enter — Claude Code preselects "No, exit" on its
+ * trust prompt, Codex preselects "Update now", which would run an install —
+ * so each entry says which line to land on, matched on the screen.
+ *
+ * Returns the line to select, or "" when the screen shows no menu this
+ * knows: an unknown block stays a failure rather than a guessed keypress.
+ */
+const STARTUP_MENUS: Array<{ shows: RegExp; choose: RegExp; what: string }> = [
+  // Claude Code, in a directory it has not seen before.
+  { shows: /Is this a project you created or one you trust|trust the files|Do you trust/i,
+    choose: /^\s*[›❯>]?\s*(?:\d+[.)]\s*)?Yes, I trust this folder/i,
+    what: "trust this folder" },
+  // Codex, when a newer version is out.
+  { shows: /Update available!/i,
+    choose: /^\s*[›❯>]?\s*(?:\d+[.)]\s*)?Skip(?! until)/i,
+    what: "skip the update" },
+];
+
+/** A line the terminal draws as selected: `❯ Yes, …`, `› 2. Skip`. */
+const SELECTED = /^\s*[›❯>]\s*\S/;
+
+/**
+ * How to answer a startup menu on this screen: how many times to press Down
+ * before Enter, or null when there is no menu to answer. Zero means the
+ * wanted line is already selected.
+ */
+export function startupMenuChoice(screen: string): { downs: number; what: string } | null {
+  for (const menu of STARTUP_MENUS) {
+    if (!menu.shows.test(screen)) continue;
+    const lines = screen.split("\n");
+    const wanted = lines.findIndex((line) => menu.choose.test(line));
+    if (wanted === -1) continue;
+    // The options are the run of lines around the wanted one that look like
+    // menu entries; the selected one carries the marker.
+    const selected = lines.findIndex((line) => SELECTED.test(line));
+    if (selected === -1 || selected > wanted) continue;
+    return { downs: wanted - selected, what: menu.what };
+  }
+  return null;
+}
+
 /** How far back `!files` looks by default. */
 const DEFAULT_FILE_WINDOW_MINUTES = 120;
 /**
@@ -1167,10 +1213,13 @@ export async function startSlackDaemon(
           await startAgent({ paneId: tab.pane_id, kind, name: label, agentArgs });
         }
       } catch (err) {
-        // Claude Code in a directory it has not seen asks whether to trust
-        // it before anything else, and herdr reports the agent blocked. The
-        // bridge opened this directory on purpose; answer yes and wait.
-        if (!/blocked during startup/.test(String(err)) || !(await acceptTrustDialog(tab.pane_id))) throw err;
+        // An agent can open a one-time menu before its prompt — Claude Code
+        // asking whether this directory is trusted, Codex offering to
+        // update. herdr reports the agent blocked, or simply times out
+        // waiting; either way the pane is sitting at a question the bridge
+        // can answer. An unknown screen is still a failure.
+        if (!/blocked during startup|timed out waiting for agent startup/.test(String(err))
+          || !(await answerStartupMenu(tab.pane_id))) throw err;
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1219,16 +1268,25 @@ export async function startSlackDaemon(
    * is selected — and wait for the agent to come up. False when the pane
    * shows something else, which is then a real failure.
    */
-  const acceptTrustDialog = async (paneId: string): Promise<boolean> => {
+  const answerStartupMenu = async (paneId: string): Promise<boolean> => {
     let screen = "";
     try { screen = readPane(paneId, 40); } catch { return false; }
-    if (!/trust the files|Do you trust/i.test(screen)) return false;
-    log.info("spawn: accepting the trust prompt", { paneId });
+    const choice = startupMenuChoice(screen);
+    if (!choice) return false;
+    log.info("spawn: answering a startup menu", { paneId, ...choice });
+    for (let i = 0; i < choice.downs; i++) {
+      sendKeys(paneId, "Down");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
     sendKeys(paneId, "Enter");
     for (let attempt = 0; attempt < 60; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
       const status = getAgentInfo(paneId)?.agent_status;
       if (status === "idle" || status === "done") return true;
+      // One menu can follow another — trust, then a version notice.
+      try {
+        if (startupMenuChoice(readPane(paneId, 40))) return answerStartupMenu(paneId);
+      } catch { /* the pane may be gone */ }
     }
     return false;
   };
@@ -1242,6 +1300,9 @@ export async function startSlackDaemon(
   const dismissBlockingDialog = async (paneId: string): Promise<void> => {
     let screen = "";
     try { screen = readPane(paneId, 25); } catch { return; }
+    // A menu the bridge knows the answer to — a version notice can appear
+    // between turns too — is answered rather than cancelled.
+    if (startupMenuChoice(screen)) { await answerStartupMenu(paneId); return; }
     if (!/Teach auto mode/i.test(screen)) return;
     log.info("dismissing a Claude Code dialog before sending", { paneId });
     sendKeys(paneId, "Escape");
