@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   post: vi.fn(async (_thread: SlackThread, _text: string) => "answer-ts"),
   status: vi.fn(async () => {}),
   history: vi.fn(async (): Promise<ThreadMessage[]> => []),
+  start: vi.fn(async () => {}),
 }));
 
 vi.mock("node:os", async (original) => ({
@@ -38,7 +39,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
     constructor(deps: SlackClientDeps) { mocks.client = deps; }
     threadHistory = mocks.history;
     rename = vi.fn(async () => {});
-    start = vi.fn(async () => {});
+    start = mocks.start;
     stop = vi.fn(async () => {});
     post = mocks.post;
     setStatus = mocks.status;
@@ -347,6 +348,37 @@ describe("Slack session routing — real observe loops", () => {
     appendFileSync(newPath, message("reply to the new question"));
     await vi.advanceTimersByTimeAsync(300);
     expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "reply to the new question");
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
+  it.each(["idle", "working"])("leaves %s startup debt to an incoming Slack turn that is still in setup", async (status) => {
+    const statePath = join(dir, "state.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    state.threads["default|C1:1.0"].context_sent = false;
+    writeFileSync(statePath, JSON.stringify(state));
+    writeFileSync(join(dir, "pending-turns.json"), JSON.stringify([{ pane_id: "w1:p1", started_at: new Date().toISOString() }]));
+    mocks.live = liveSession(oldPath, status);
+    let release!: (value: ThreadMessage[]) => void;
+    let sending!: Promise<void>;
+    mocks.history.mockImplementationOnce(() => new Promise<ThreadMessage[]>(resolve => { release = resolve; }));
+    mocks.start.mockImplementationOnce(async () => {
+      // The socket accepts a message before startup's pending-turn resumption.
+      sending = mocks.client!.onUserMessage(thread, "U1", "new question during startup", "2.0");
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    expect(mocks.history).toHaveBeenCalledOnce();
+    mocks.live = liveSession(oldPath, "idle");
+    appendFileSync(oldPath, message("unrelated answer during startup"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+    expect(JSON.parse(readFileSync(statePath, "utf8")).marked["w1:p1"].ts).toBe("2.0");
+    release([]);
+    await sending;
+    appendFileSync(oldPath, message("answer to the new startup question"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "answer to the new startup question");
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
 
