@@ -1037,6 +1037,11 @@ export class AgentCommunicator {
     this.remember(prompt.trim() || this.lastInput);
   }
 
+  /** Raw logged prompt for correlating a late-named session with a sent turn. */
+  getLastLoggedPrompt(): string {
+    return this.reader.lastPrompt?.().trim() ?? "";
+  }
+
   /**
    * The question just submitted in the pane, read before there is any answer
    * to it. Used to announce a turn as it starts, so a long one is not fifteen

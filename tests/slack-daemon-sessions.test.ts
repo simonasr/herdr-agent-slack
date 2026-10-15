@@ -158,7 +158,7 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
   });
 
-  it("clears the latest asking thread, not the thread that created a shared reader", async () => {
+  it.each(["stale final", "!last"])("clears the latest asking thread when replacement is discovered by %s", async (discovery) => {
     const statePath = join(dir, "state.json");
     const state = JSON.parse(readFileSync(statePath, "utf8"));
     state.threads["default|C1:2.0"] = { ...state.threads["default|C1:1.0"], thread_ts: "2.0" };
@@ -169,7 +169,12 @@ describe("Slack daemon — session replacement in the same pane", () => {
     await mocks.client!.onUserMessage(latest, "U1", "latest question", "3.0");
     mocks.live = liveSession(sessionFile("new.jsonl", "unrelated history"), "idle");
     mocks.status.mockClear();
-    old.opts.emit({ type: "final", text: "old answer", source: "delta", reason: "idle" });
+    if (discovery === "!last") {
+      await mocks.client!.onUserMessage(thread, "U1", "!last", "4.0");
+      mocks.post.mockClear(); // The explicit readback is not an automatic final.
+    } else {
+      old.opts.emit({ type: "final", text: "old answer", source: "delta", reason: "idle" });
+    }
     await flush();
     expect(mocks.status).toHaveBeenCalledWith(latest, "");
     expect(mocks.status).not.toHaveBeenCalledWith(thread, "");
