@@ -463,6 +463,51 @@ describe("ObserveLoopController — final payload fallback", () => {
 });
 
 describe("ObserveLoopController — same-poll proof priority", () => {
+  it.each([null, "stale confirmed answer"])("ignores a pre-input observation (%s) and resets stability", async staleProof => {
+    let resolve!: (proof: string | null) => void;
+    let calls = 0;
+    const query = new Promise<string | null>(r => { resolve = r; });
+    const env = makeEnv({
+      snapshots: ["old answer", "old answer", "old answer", "old answer\nsecond answer"],
+      finalPayload: "full-turn", stabilityMs: 1_000,
+      completedOutput: () => ++calls === 1 ? query : null,
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    env.clock.advance(1_000); // the previous output is already stable
+    expect(env.step()).toBe(true);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(calls).toBe(1);
+
+    env.controller.markUserInput(); // another dispatch during the observation
+    env.clock.advance(5_000);
+    resolve(staleProof);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(0);
+    expect(env.step()).toBe(true);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(0);
+    await env.drive();
+    await run;
+    expect(env.events.filter(event => event.type === "final")).toMatchObject([
+      { text: "second answer", reason: "idle" },
+    ]);
+  });
+
+  it("resets old stability when a new input arrives during sleep", async () => {
+    const env = makeEnv({ snapshots: ["old answer"], stabilityMs: 1_000 });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    env.clock.advance(1_000);
+    env.controller.markUserInput();
+    expect(env.step()).toBe(true);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(0);
+    await env.drive();
+    await run;
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(1);
+  });
+
   it("does not count slow failed proof lookup as stability for newly observed partial output", async () => {
     let resolve!: (proof: string | null) => void;
     let calls = 0;
@@ -502,6 +547,7 @@ describe("ObserveLoopController — same-poll proof priority", () => {
     env.step();
     for (let i = 0; i < 10; i++) await Promise.resolve();
     expect(entered).toBe(true);
+    env.controller.markUserInput(); // stale input must not outrank abort/ceiling
     if (reason === "aborted") env.controller.abort();
     env.clock.advance(1_000); // abort also wins when both become eligible
     resolve("confirmed answer that must not be delivered");
