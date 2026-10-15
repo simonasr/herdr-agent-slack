@@ -1805,6 +1805,9 @@ export async function startSlackDaemon(
     }
     const byId = new Map(panes.map((pane) => [pane.pane_id, pane]));
     for (const paneId of owed) {
+      // A message accepted during socket startup supersedes this debt. Its
+      // setup owns both observation and settlement until the prompt is sent.
+      if (startingTurns.has(paneId)) continue;
       const binding = bindingForPane(paneId);
       const pane = byId.get(paneId);
       if (!binding || !pane) { pendingTurns.close(paneId); continue; }
