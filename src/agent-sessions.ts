@@ -963,12 +963,17 @@ export class AgentCommunicator {
         "AgentCommunicator.sendInput requires a paneId — use createAgentCommunicator()"
       );
     }
+    this.retainSubmittedPrompt(text);
+    sendText(this.paneId, text);
+  }
+
+  /** Adopt a prompt already sent to this session, without sending it again. */
+  retainSubmittedPrompt(text: string): void {
     this.lastInput = text;
     this.externalTurn = false;
     this.remember(text);
     this.sentTexts.push(text);
     if (this.sentTexts.length > 8) this.sentTexts.shift();
-    sendText(this.paneId, text);
   }
 
   /**
