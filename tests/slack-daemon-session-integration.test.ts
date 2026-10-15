@@ -128,6 +128,29 @@ describe("Slack session routing — real observe loops", () => {
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
 
+  it("waits for a replacement Codex id's rollout instead of permanently scraping", async () => {
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-codex-old.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "codex-old" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "replacement question", "2.0");
+    mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "codex-new" } };
+    mocks.screen = "unrelated terminal history";
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear(); // Explicit readbacks are not automatic answers.
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    writeFileSync(join(sessions, "rollout-codex-new.jsonl"), JSON.stringify({
+      type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "text", text: "full replacement answer" }] },
+    }) + "\n");
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "full replacement answer");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
   it.each(["session-a", "session-b"])("checks a prompt-resolved deferred reader against the first reported identity %s", async (reported) => {
     appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
     mocks.live = { ...liveSession(oldPath, "idle"), agent: "claude", agent_session: undefined, cwd: dir };
