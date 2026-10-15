@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   status: vi.fn(async () => {}),
   history: vi.fn(async (): Promise<ThreadMessage[]> => []),
   start: vi.fn(async () => {}),
+  stop: vi.fn(async () => {}),
 }));
 
 vi.mock("node:os", async (original) => ({
@@ -41,7 +42,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
     threadHistory = mocks.history;
     rename = vi.fn(async () => {});
     start = mocks.start;
-    stop = vi.fn(async () => {});
+    stop = mocks.stop;
     post = mocks.post;
     setStatus = mocks.status;
     react = vi.fn(async () => {});
@@ -129,25 +130,33 @@ describe("Slack session routing — real observe loops", () => {
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
 
-  it("waits for a replacement Codex id's rollout instead of permanently scraping", async () => {
-    const sessions = join(dir, ".codex", "sessions");
+  it.each((["codex", "claude"] as const).flatMap(agent =>
+    ["", "replacement question", "a genuine terminal question"].map(loggedPrompt => ({ agent, loggedPrompt })),
+  ))("waits for a replacement $agent transcript without re-quoting a sent prompt, logged=$loggedPrompt", async ({ agent, loggedPrompt }) => {
+    const sessions = agent === "codex" ? join(dir, ".codex", "sessions") : join(dir, ".claude", "projects", "project");
+    const sessionPath = (id: string) => join(sessions, agent === "codex" ? `rollout-${id}.jsonl` : `${id}.jsonl`);
     mkdirSync(sessions, { recursive: true });
-    writeFileSync(join(sessions, "rollout-codex-old.jsonl"), "");
-    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "codex-old" } };
+    writeFileSync(sessionPath("reader-old"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent, agent_session: { kind: "id", id: "reader-old" } };
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await mocks.client!.onUserMessage(thread, "U1", "replacement question", "2.0");
-    mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "codex-new" } };
+    mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "reader-new" } };
     mocks.screen = "unrelated terminal history";
     await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
     mocks.post.mockClear(); // Explicit readbacks are not automatic answers.
     await vi.advanceTimersByTimeAsync(300);
     expect(mocks.post).not.toHaveBeenCalled();
-    writeFileSync(join(sessions, "rollout-codex-new.jsonl"), JSON.stringify({
-      type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "text", text: "full replacement answer" }] },
-    }) + "\n");
+    writeFileSync(sessionPath("reader-new"), [
+      ...(loggedPrompt ? [{ role: "user", text: loggedPrompt }] : []),
+      { role: "assistant", text: "full replacement answer" },
+    ].map(({ role, text }) => JSON.stringify(agent === "codex" ? {
+      type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
+    } : { type: role, message: { role, content: role === "user" ? text : [{ type: "text", text }] } })).join("\n") + "\n");
     mocks.live = { ...mocks.live!, agent_status: "idle" };
     await vi.advanceTimersByTimeAsync(300);
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "full replacement answer");
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread,
+      loggedPrompt === "a genuine terminal question"
+        ? "> a genuine terminal question\n\nfull replacement answer" : "full replacement answer");
     expect(sendText).toHaveBeenCalledTimes(1);
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
@@ -493,6 +502,40 @@ describe("Slack session routing — real observe loops", () => {
       ["w1:p1", "first before replacement"], ["w1:p1", "second after replacement"],
     ]);
     if (shutdown) expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
+  it.each(["dispatched", "restored", "delivered"])("preserves only owed debt when a follow-up is canceled during shutdown, prior=%s", async (prior) => {
+    mocks.live = liveSession(oldPath, "working");
+    if (prior === "restored") {
+      writeFileSync(join(dir, "pending-turns.json"), JSON.stringify([{ pane_id: "w1:p1", started_at: new Date().toISOString() }]));
+    }
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    if (prior !== "restored") await mocks.client!.onUserMessage(thread, "U1", "already dispatched", "2.0");
+    expect(sendText).toHaveBeenCalledTimes(prior === "restored" ? 0 : 1);
+    if (prior === "delivered") {
+      appendFileSync(oldPath, message("first question answered"));
+      mocks.live = liveSession(oldPath, "idle");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "first question answered");
+      expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    }
+    let releaseStatus!: () => void;
+    let releaseStop!: () => void;
+    mocks.status.mockImplementationOnce(() => new Promise<void>(resolve => { releaseStatus = resolve; }));
+    const followup = mocks.client!.onUserMessage(thread, "U1", "unsent follow-up", "2.1");
+    await vi.advanceTimersByTimeAsync(0);
+    mocks.stop.mockImplementationOnce(() => new Promise<void>(resolve => { releaseStop = resolve; }));
+    const stopping = daemon.stop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mocks.stop).toHaveBeenCalledOnce();
+    releaseStatus();
+    await followup;
+    const owed = JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"));
+    releaseStop();
+    await stopping;
+    daemon = undefined;
+    expect(vi.mocked(sendText).mock.calls).toEqual(prior === "restored" ? [] : [["w1:p1", "already dispatched"]]);
+    expect(owed).toEqual(prior === "delivered" ? [] : [expect.objectContaining({ pane_id: "w1:p1" })]);
   });
 
   it("does not let a failed setup release a later dispatch ahead of an older one", async () => {

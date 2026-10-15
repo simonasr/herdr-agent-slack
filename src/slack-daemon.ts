@@ -473,6 +473,12 @@ export async function startSlackDaemon(
    * the thread waiting forever.
    */
   const pendingTurns = new PendingTurnLog(join(statePath, "pending-turns.json"), log);
+  /** Positively known unsent debt; restored ledger entries are conservatively owed. */
+  const setupOnlyTurns = new Set<string>();
+  const closePendingTurn = (paneId: string): void => {
+    setupOnlyTurns.delete(paneId);
+    pendingTurns.close(paneId);
+  };
   /** The bot a binding posts through. Bindings only exist for configured bots. */
   const botOf = (binding: ThreadBinding): Bot => bots.get(binding.bot) as Bot;
   /** Every binding in a thread, one per bot at most. */
@@ -599,7 +605,7 @@ export async function startSlackDaemon(
     const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
     if (isCurrent()) {
       turnStartedAt.delete(paneId);
-      pendingTurns.close(paneId);
+      closePendingTurn(paneId);
     }
     if (event.duplicate) {
       log.info("suppressed a repeat of the last answer", { paneId });
@@ -824,7 +830,7 @@ export async function startSlackDaemon(
   /** Release a cancelled turn without posting anything from its retired reader. */
   const abandonTurn = (binding: ThreadBinding): void => {
     const paneId = binding.pane_id;
-    pendingTurns.close(paneId);
+    closePendingTurn(paneId);
     turnStartedAt.delete(paneId);
     announcedPrompt.delete(paneId);
     const mark = state.marked[paneId];
@@ -889,7 +895,12 @@ export async function startSlackDaemon(
     // terminal, and must not be announced as such when the turn is adopted.
     // The communicator seals an idle pane's last question itself; a working
     // one it cannot tell apart from a terminal turn — the ledger can.
-    if (pendingTurns.isOpen(binding.pane_id)) communicator.sealAnsweredPrompt();
+    if (pendingTurns.isOpen(binding.pane_id)) {
+      communicator.sealAnsweredPrompt();
+      // A deferred log may not reveal this sent prompt until after adoption.
+      // Remember it without assuming it anchors the replacement's answer.
+      if (pendingPrompt) communicator.markDelivered(pendingPrompt);
+    }
     const agentOptions = {
       paneId: binding.pane_id,
       communicator,
@@ -1011,6 +1022,7 @@ export async function startSlackDaemon(
     // Adopted means the thread is following it; losing it to a restart is
     // the same silence as losing a question asked in the thread.
     pendingTurns.open(paneId);
+    setupOnlyTurns.delete(paneId);
     const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
     // Say what was asked now, rather than when the answer lands: a turn can
     // run for a quarter of an hour.
@@ -1286,6 +1298,7 @@ export async function startSlackDaemon(
       await bot.client.setStatus(thread, "is working…");
       await markWorking(bot, paneId, thread.channel, messageTs);
       log.info("turn started", { bot: bot.name, paneId, label: binding.label, thread: threadKey(thread) });
+      if (!pendingTurns.isOpen(paneId)) setupOnlyTurns.add(paneId);
       pendingTurns.open(paneId);
       await dismissBlockingDialog(paneId);
       const framed = await withThreadContext(binding, thread, text, messageTs);
@@ -1295,7 +1308,11 @@ export async function startSlackDaemon(
         let agent = paneAgentFor(binding);
         while (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
           cancelFinalRetry(agent);
-          if (await agent.handleMessage(framed) !== false) { sent = true; break; }
+          if (await agent.handleMessage(framed) !== false) {
+            sent = true;
+            setupOnlyTurns.delete(paneId);
+            break;
+          }
           // Replacement can cancel queued input before it reaches the pane.
           // Transfer only an unsent prompt, never a dispatched or unbound one.
           const replacement = agents.get(paneId);
@@ -1304,8 +1321,9 @@ export async function startSlackDaemon(
         }
       }
       // A canceled last setup owns no future answer. Never release a later
-      // question's ledger, status or reaction while clearing this one.
-      if (!sent && turnOwners.get(paneId) === owner && startingTurns.get(paneId) === 1) {
+      // question's state, or a prior dispatched/recovered debt during shutdown.
+      if (!sent && (!stopping || setupOnlyTurns.has(paneId))
+        && turnOwners.get(paneId) === owner && startingTurns.get(paneId) === 1) {
         abandonTurn(bindingForPane(paneId) ?? binding);
       }
     } finally {
@@ -1866,9 +1884,9 @@ export async function startSlackDaemon(
       if (startingTurns.has(paneId)) continue;
       const binding = bindingForPane(paneId);
       const pane = byId.get(paneId);
-      if (!binding || !pane) { pendingTurns.close(paneId); continue; }
+      if (!binding || !pane) { closePendingTurn(paneId); continue; }
       if (pane.status === "working") {
-        paneAgentFor(binding).noteExternalTurn();
+        if (paneAgentFor(binding).noteExternalTurn()) setupOnlyTurns.delete(paneId);
         log.info("resumed a turn a restart interrupted", { paneId });
         continue;
       }
@@ -1877,14 +1895,14 @@ export async function startSlackDaemon(
       // would hand over everything it has, and every handoff in it.
       if (!agent.canIsolateLastAnswer()) {
         log.warn("an answer is owed but the reader cannot isolate it; not replaying the log", { paneId });
-        pendingTurns.close(paneId);
+        closePendingTurn(paneId);
         continue;
       }
       const owed = agent.getLastAnswer();
       // Already sent before the restart: the ledger was simply not closed in time.
       if (!owed.trim() || state.delivered[paneId] === digest(owed)) {
         log.info("the answer owed was delivered before the restart", { paneId });
-        pendingTurns.close(paneId);
+        closePendingTurn(paneId);
         continue;
       }
       try {
