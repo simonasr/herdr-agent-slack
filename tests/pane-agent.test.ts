@@ -1239,6 +1239,40 @@ describe("PaneAgent — asynchronous metadata and turn ownership", () => {
     expect(e.agent.isLoopActive()).toBe(false);
   });
 
+  it.each([
+    ["final", "stop"], ["final", "dispose"],
+    ["stream", "stop"], ["stream", "dispose"],
+  ] as const)("retains drained output when %s-mode %s aborts", async (mode, action) => {
+    let transcript = "";
+    const observation = deferred<AgentInfo | null>();
+    const e = completionEnv({ mode,
+      reader: { kind: "pi-jsonl", read: () => transcript },
+      metadata: (info, call) => call === (mode === "final" ? 17 : 16) ? observation.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "partial answer";
+    for (let i = 0; i < 16; i++) await e.tick();
+    expect(e.metadataCalls()).toBe(mode === "final" ? 17 : 16);
+    expect(e.finals()).toHaveLength(0);
+
+    const drain = vi.spyOn(e.comm, "getNewOutput");
+    transcript += "\nlate suffix";
+    observation.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(drain).toHaveBeenCalledTimes(1);
+    expect(drain).toHaveReturnedWith(expect.stringContaining("late suffix"));
+    expect(e.finals()).toHaveLength(0);
+
+    e.agent[action]();
+    await e.tick();
+    expect(drain).toHaveBeenCalledTimes(1); // cancellation must not read again
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+    expect(e.finals().map(event => event.text.trim()))
+      .toEqual([mode === "final" ? "partial answer\nlate suffix" : "late suffix"]);
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["partial answer"]); // no post-cancellation delta
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
   it.each([true, false])("uses revalidated working status for ordinary settling (evidence=%s)", async evidence => {
     const e = completionEnv({ metadata: (info, call) => {
       if (call !== 18) return info;

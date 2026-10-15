@@ -342,6 +342,11 @@ export class ObserveLoopController {
 
         // Honour an abort that arrived during the sleep.
         if (this.aborted) {
+          // Preserve already-consumed output without reading or streaming again.
+          if (resumed) {
+            turnText += turnText ? `\n${resumed}` : resumed;
+            lastDeltaText = resumed;
+          }
           this.emitFinal("aborted", lastDeltaText, turnText);
           return;
         }
