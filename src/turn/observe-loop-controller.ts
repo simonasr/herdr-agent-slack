@@ -427,6 +427,14 @@ export class ObserveLoopController {
           completionConfirmed: completed !== null && completed.trim().length > 0,
         };
         if (shouldStop(state)) {
+          // A stable fallback can grow while metadata is pending. Drain it
+          // before settling, then use the normal next tick to emit the suffix
+          // and restart stability. Proven completions and timer-only follows
+          // retain their existing stop rules.
+          if (this.waitUntilIdle && !state.completionConfirmed) {
+            resumed = this.communicator.getNewOutput();
+            if (resumed) continue;
+          }
           // Distinguish "idle" vs "deadline" in the final reason. The
           // single rule: if waitUntilIdle is true, the idle gate was
           // required, so the reason is "idle". Otherwise the timer

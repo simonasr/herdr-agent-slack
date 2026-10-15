@@ -1215,6 +1215,30 @@ describe("PaneAgent — asynchronous metadata and turn ownership", () => {
     expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["ask"]);
   });
 
+  it.each(["final", "stream"] as const)("drains a late ordinary-idle suffix without losing %s-mode output", async mode => {
+    let transcript = "";
+    const observation = deferred<AgentInfo | null>();
+    const e = completionEnv({ mode,
+      reader: { kind: "pi-jsonl", read: () => transcript },
+      metadata: (info, call) => call === (mode === "final" ? 17 : 16) ? observation.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "partial answer";
+    for (let i = 0; i < 16; i++) await e.tick(); // partial is now stable for 30s
+    expect(e.metadataCalls()).toBe(mode === "final" ? 17 : 16);
+    expect(e.finals()).toHaveLength(0);
+    transcript += "\nlate suffix";
+    observation.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(true);
+    for (let i = 0; i < 16; i++) await e.tick();
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["partial answer", "late suffix"]);
+    expect(e.finals().map(event => event.text.trim()))
+      .toEqual([mode === "final" ? "partial answer\nlate suffix" : "late suffix"]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
   it.each([true, false])("uses revalidated working status for ordinary settling (evidence=%s)", async evidence => {
     const e = completionEnv({ metadata: (info, call) => {
       if (call !== 18) return info;
