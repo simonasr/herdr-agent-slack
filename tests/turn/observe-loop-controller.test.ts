@@ -42,10 +42,12 @@ const noopLogger = {
  * returns the next snapshot from the array, or the last element if
  * exhausted. This models an agent that keeps appending to a pane.
  */
-function makeFakeReader(snapshots: string[]) {
+function makeFakeReader(snapshots: string[], isolateLastAnswer = true) {
   let i = 0;
   const reader: AgentOutputReader & { calls: number; append(extra: string[]): void } = {
     kind: "fake",
+    // Most fallback tests model a reader that can isolate one answer.
+    ...(isolateLastAnswer ? { lastAnswer: () => reader.read(4000) } : {}),
     calls: 0,
     append(extra: string[]) {
       snapshots.push(...extra);
@@ -81,10 +83,11 @@ function makeEnv(opts: {
   finalPayload?: "last-delta" | "full-turn";
   completedOutput?: () => string | null | Promise<string | null>;
   maxTurnMs?: number;
+  isolateLastAnswer?: boolean;
 }) {
   const progressIntervalMs = opts.progressIntervalMs ?? 100;
   const stabilityMs = opts.stabilityMs ?? 100;
-  const reader = makeFakeReader(opts.snapshots);
+  const reader = makeFakeReader(opts.snapshots, opts.isolateLastAnswer);
   const communicator = new AgentCommunicator(reader, noopLogger);
   const events: OutputEvent[] = [];
   const pending: Array<() => void> = [];
@@ -160,6 +163,39 @@ describe("ObserveLoopController — deadline state", () => {
 
     env.controller.updateDeadline(null);
     expect(env.controller.hasDeadline()).toBe(false);
+  });
+});
+
+describe("ObserveLoopController — cumulative history is not a fallback answer", () => {
+  it.each(["full-turn", "last-delta"] as const)("does not replay history in %s mode", async (finalPayload) => {
+    const env = makeEnv({
+      snapshots: ["old unrelated answer\n\nolder conversation"],
+      isolateLastAnswer: false,
+      finalPayload,
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    expect(env.events.filter(e => e.type === "final")).toEqual([
+      { type: "final", text: "", reason: "idle", source: "snapshot" },
+    ]);
+    expect(env.events.filter(e => e.type === "delta")).toEqual([]);
+  });
+
+  it("still delivers newly appended output from a cumulative reader", async () => {
+    const env = makeEnv({
+      snapshots: ["old unrelated answer", "old unrelated answer\n\nnew reply"],
+      isolateLastAnswer: false,
+      finalPayload: "full-turn",
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    const finals = env.events.filter(e => e.type === "final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text.trim()).toBe("new reply");
   });
 });
 

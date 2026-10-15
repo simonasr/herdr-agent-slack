@@ -505,8 +505,8 @@ export class ObserveLoopController {
    *      consumer suppressed the deltas), `lastDeltaText` otherwise (a
    *      durable recap of content already streamed). Neither is truncated:
    *      the consumer owns splitting for its transport.
-   *   2. Otherwise call communicator.getLatestOutput() — a readback
-   *      that does NOT mutate diff state.
+   *   2. Otherwise read back the screen or an isolated structured answer,
+   *      never cumulative history. This does NOT mutate diff state.
    *   3. Truncate the fallback to MAX_CHUNK_TOTAL with an ellipsis
    *      prefix so Telegram never sees an over-long message.
    *
@@ -538,12 +538,12 @@ export class ObserveLoopController {
       text = observed;
     } else {
       source = "snapshot";
-      // A structured reader's whole output is the whole conversation; its
-      // last answer is the most the fallback may hand over. A screen is
-      // read back whole, as before, and cleaned by the consumer.
+      // Some structured readers expose only cumulative assistant history,
+      // even through getLastAnswer(). Never replay that history as a reply
+      // when this turn produced no output. Screens retain their readback.
       const latest = this.communicator.readerKind === "scrape"
         ? this.communicator.getLatestOutput()
-        : this.communicator.getLastAnswer();
+        : this.communicator.canIsolateLastAnswer() ? this.communicator.getLastAnswer() : "";
       if (latest.trim().length === 0) {
         text = "";
       } else if (this.finalPayload === "full-turn") {
