@@ -308,7 +308,22 @@ export function getAgentInfo(target: string): AgentInfo | null {
   } catch {
     return null;
   }
-  const endpointAfter = socketIdentity(socketPath);
+  return parseAgentInfo(raw, target, endpointBefore, socketIdentity(socketPath));
+}
+
+/** Nonblocking metadata for input preparation and observe-loop polling. */
+export async function getAgentInfoAsync(target: string): Promise<AgentInfo | null> {
+  const socketPath = process.env.HERDR_SOCKET_PATH;
+  const endpointBefore = socketIdentity(socketPath);
+  try {
+    const raw = await execHerdrAsync(["agent", "get", target], 30_000);
+    return parseAgentInfo(raw, target, endpointBefore, socketIdentity(socketPath));
+  } catch {
+    return null;
+  }
+}
+
+function parseAgentInfo(raw: string, target: string, endpointBefore: string | undefined, endpointAfter: string | undefined): AgentInfo | null {
   let parsed: any;
   try {
     parsed = JSON.parse(raw);

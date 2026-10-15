@@ -139,7 +139,7 @@ export interface PaneAgentOptions {
    */
   isAgentBusy?: () => boolean;
   /** Optional fresh Herdr metadata; absent suppliers retain settling. */
-  getCompletionInfo?: () => AgentInfo | null;
+  getCompletionInfo?: () => AgentInfo | null | Promise<AgentInfo | null>;
   /** Optional. Production leaves this unset. */
   deps?: PaneAgentDeps;
 }
@@ -160,21 +160,29 @@ export interface PaneAgentOptions {
 export class PaneAgent {
   private loop: ObserveLoopController | null = null;
   private turnGeneration = 0;
+  private inputEpoch = 0;
+  private inputTail: Promise<void> = Promise.resolve();
+  private pendingInputs = 0;
+  private disposed = false;
   private fastTurn: { generation: number; baseline: CompletionSample; latest: CompletionSample; read: () => string | null } | null = null;
 
-  private sample(): CompletionSample | null {
+  private async metadata(): Promise<AgentInfo | null> {
     try {
-      return completionSample(this.opts.getCompletionInfo?.() ?? null, this.opts.paneId);
+      return await this.opts.getCompletionInfo?.() ?? null;
     } catch {
       return null;
     }
   }
 
+  private async sample(): Promise<CompletionSample | null> {
+    return completionSample(await this.metadata(), this.opts.paneId);
+  }
+
   /** A bad observation disables this turn, never just this poll. */
-  private completedOutput(generation: number): string | null {
+  private async completedOutput(generation: number, info: AgentInfo | null): Promise<string | null> {
     const turn = this.fastTurn;
     if (!turn || turn.generation !== generation) return null;
-    const current = this.sample();
+    const current = completionSample(info, this.opts.paneId);
     if (!current || !sameIdentity(turn.baseline, current) ||
         current.state < turn.latest.state ||
         (turn.latest.completion !== null &&
@@ -189,7 +197,9 @@ export class PaneAgent {
     let text: string | null;
     try { text = turn.read(); } catch { text = null; }
     if (this.fastTurn !== turn || this.turnGeneration !== generation || !text?.trim()) return null;
-    const after = this.sample();
+    const after = await this.sample();
+    // An input or stop may have replaced the proof while metadata was pending.
+    if (this.fastTurn !== turn || this.turnGeneration !== generation) return null;
     if (!after || !sameIdentity(current, after) || !settled(after.status) ||
         after.state !== current.state || after.completion !== current.completion) {
       this.fastTurn = null;
@@ -226,11 +236,11 @@ export class PaneAgent {
   }
 
   /**
-   * True when an observe loop is currently running. Public so the
-   * daemon (and tests) can inspect liveness without polling internals.
+   * True while input is being prepared or an observe loop is running.
+   * Pending input must not be adopted as an unrelated terminal turn.
    */
   isLoopActive(): boolean {
-    return this.loop !== null;
+    return this.loop !== null || this.pendingInputs > 0;
   }
 
   /**
@@ -241,34 +251,58 @@ export class PaneAgent {
   }
 
   /**
-   * A user message arrived. Always forwards the input to the pane.
+   * A user message arrived. Prepares metadata without blocking and forwards
+   * input in arrival order, unless stop/dispose cancels it before dispatch.
+   * The returned promise resolves after dispatch (or cancellation).
    * If no loop is active, starts one with deadline=null and
    * waitUntilIdle=true (idle-based stop). If a loop is already active
    * (turn in flight, follow in flight, …), just marks waitUntilIdle on
    * it — the deadline gate (if any) is preserved untouched so a
    * follow timer keeps ticking through user messages.
    */
-  handleMessage(text: string): void {
-    // Invalidate before dispatch, including a reentrant message from a reader callback.
+  handleMessage(text: string): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    // Invalidate on arrival, not after queued metadata or reader callbacks.
     const generation = ++this.turnGeneration;
     this.fastTurn = null;
-    if (!this.loop && this.opts.config.outputMode === "final") {
-      const baseline = this.sample();
-      if (baseline && settled(baseline.status)) {
-        const read = this.opts.communicator.captureCompletedResponse(text, baseline.session);
-        const after = this.sample();
-        if (read && after && sameIdentity(baseline, after) &&
-            after.state === baseline.state && after.completion === baseline.completion &&
-            settled(after.status) && this.turnGeneration === generation && !this.loop) {
-          this.fastTurn = { generation, baseline, latest: after, read };
+    if (!this.opts.getCompletionInfo) {
+      this.dispatchInput(text);
+      return Promise.resolve();
+    }
+    const epoch = this.inputEpoch;
+    this.pendingInputs++;
+    const prepared = this.inputTail.then(async () => {
+      const active = () => !this.disposed && this.inputEpoch === epoch;
+      if (!active()) return;
+      if (!this.loop && generation === this.turnGeneration && this.opts.config.outputMode === "final") {
+        const baseline = await this.sample();
+        if (!active()) return;
+        if (baseline && settled(baseline.status) && generation === this.turnGeneration && !this.loop) {
+          const read = this.opts.communicator.captureCompletedResponse(text, baseline.session);
+          // Unsupported readers have nothing to revalidate.
+          if (read && active() && generation === this.turnGeneration && !this.loop) {
+            const after = await this.sample();
+            if (after && sameIdentity(baseline, after) &&
+                after.state === baseline.state && after.completion === baseline.completion &&
+                settled(after.status) && active() && generation === this.turnGeneration && !this.loop) {
+              this.fastTurn = { generation, baseline, latest: after, read };
+            }
+          }
         }
       }
-    }
+      if (active()) this.dispatchInput(text);
+    }).finally(() => {
+      if (this.inputEpoch === epoch) this.pendingInputs--;
+    });
+    // A failed send must not prevent later queued messages from being processed.
+    this.inputTail = prepared.catch(() => {});
+    return prepared;
+  }
+
+  private dispatchInput(text: string): void {
     this.opts.communicator.sendInput(text);
-    // Whatever started this turn, it is the user's now: their answer must be
-    // delivered even if it repeats what the pane said a moment ago.
+    // Whatever started this turn, it is the user's now.
     this.externalTurn = false;
-    if (this.turnGeneration !== generation) this.fastTurn = null;
     if (this.loop) {
       this.loop.markUserInput();
       return;
@@ -292,7 +326,7 @@ export class PaneAgent {
    * adopted turn from one that was already being followed.
    */
   noteExternalTurn(): boolean {
-    if (this.loop) return false;
+    if (this.disposed || this.isLoopActive()) return false;
     this.opts.communicator.beginExternalTurn();
     this.externalTurn = true;
     this.startLoop({ deadline: null, waitUntilIdle: true });
@@ -352,14 +386,14 @@ export class PaneAgent {
    * Also the place where a turn that outran `maxTurnMs` is continued rather
    * than reported. See the `"ceiling"` branch.
    */
-  private forward(event: OutputEvent): void {
+  private forward(event: OutputEvent, agentBusy?: boolean): void {
     if (event.type !== "final") {
       this.opts.emit(event);
       return;
     }
     const external = this.externalTurn;
     this.externalTurn = false;
-    this.fastTurn = null;
+    // Proof cleanup belongs to the controller's identity-guarded done hook.
     // `maxTurnMs` expiring is this loop's own guarantee of termination, not
     // the agent finishing. When herdr still reports the pane working, the turn
     // is simply longer than the ceiling: reporting a half-written answer would
@@ -370,7 +404,7 @@ export class PaneAgent {
     // `/follow` window that outlives the ceiling is not worth the bookkeeping,
     // and continuing on the idle gate is the right default for a turn that is
     // demonstrably still running.
-    if (event.reason === "ceiling" && this.opts.isAgentBusy?.()) {
+    if (event.reason === "ceiling" && (agentBusy ?? this.opts.isAgentBusy?.())) {
       this.externalTurn = external;
       this.startLoop({ deadline: null, waitUntilIdle: true });
       return;
@@ -422,6 +456,7 @@ export class PaneAgent {
    * honours the "wait for idle" gate on the message turn.
    */
   enableFollow(deadline: number): void {
+    if (this.disposed) return;
     if (this.loop) {
       this.loop.updateDeadline(deadline);
       return;
@@ -452,6 +487,9 @@ export class PaneAgent {
    * No-op when no loop is active.
    */
   stop(): void {
+    this.inputEpoch++;
+    this.pendingInputs = 0;
+    this.inputTail = Promise.resolve();
     this.turnGeneration++;
     this.fastTurn = null;
     if (!this.loop) return;
@@ -482,13 +520,8 @@ export class PaneAgent {
    * pane and dispose() only at daemon shutdown.
    */
   dispose(): void {
-    this.turnGeneration++;
-    this.fastTurn = null;
-    if (!this.loop) return;
-    const loop = this.loop;
-    this.loop = null;
-    loop.abort();
-    void loop.done;
+    this.disposed = true;
+    this.stop();
   }
 
   /**
@@ -505,6 +538,9 @@ export class PaneAgent {
     waitUntilIdle: boolean;
     fast?: boolean;
   }): void {
+    // A follow/adoption/continuation replaces observation intent too, even if
+    // it finishes before an older asynchronous ceiling check comes back.
+    if (!opts.fast) this.turnGeneration++;
     const generation = this.turnGeneration;
     if (!opts.fast || this.fastTurn?.generation !== generation) this.fastTurn = null;
     const fast = this.fastTurn;
@@ -518,7 +554,21 @@ export class PaneAgent {
 
     const controller = factory({
       communicator: this.opts.communicator,
-      emit: (event) => this.forward(event),
+      emit: (event) => {
+        if (event.type === "final" && event.reason === "ceiling" && this.opts.getCompletionInfo) {
+          // Ceiling continuation also needs fresh metadata, without blocking or
+          // restarting a turn that was stopped/replaced while the query ran.
+          const intent = this.turnGeneration;
+          void this.metadata().then(info => {
+            if (!this.disposed && this.turnGeneration === intent &&
+                (this.loop === controller || this.loop === null)) {
+              this.forward(event, info?.agent_status === "working");
+            }
+          });
+        } else {
+          this.forward(event);
+        }
+      },
       sleep,
       now,
       progressIntervalMs: this.opts.config.progressIntervalMs,
@@ -527,7 +577,13 @@ export class PaneAgent {
       // the turn's only delivery and has to carry all of it.
       finalPayload: this.opts.config.outputMode === "final" ? "full-turn" : "last-delta",
       isAgentBusy: this.opts.isAgentBusy,
-      completedOutput: fast ? () => this.completedOutput(generation) : undefined,
+      observe: this.opts.getCompletionInfo ? async () => {
+        const info = await this.metadata();
+        return {
+          agentBusy: info?.agent_status === "working",
+          completedOutput: fast ? await this.completedOutput(generation, info) : null,
+        };
+      } : undefined,
       maxTurnMs: this.opts.config.maxTotalWaitS * 1000,
     });
     controller.updateDeadline(opts.deadline);

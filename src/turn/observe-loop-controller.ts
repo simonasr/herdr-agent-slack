@@ -159,8 +159,9 @@ export interface ObserveLoopControllerDeps {
    * Defaults to "no opinion" — the stability window decides alone.
    */
   isAgentBusy?: () => boolean;
-  /** Fresh full-turn proof for this poll only; null retains ordinary settling. */
-  completedOutput?: () => string | null;
+  /** One metadata observation shared by busy and completion checks for this poll. */
+  observe?: () => { agentBusy: boolean; completedOutput: string | null } |
+    Promise<{ agentBusy: boolean; completedOutput: string | null }>;
   /**
    * Optional hard ceiling on one turn, in ms. Guarantees termination even if
    * `isAgentBusy` never goes false (a wedged agent, or a stale herdr status).
@@ -190,7 +191,7 @@ export class ObserveLoopController {
   private readonly formatWorkingTick: (elapsedMs: number) => string;
   private readonly finalPayload: "last-delta" | "full-turn";
   private readonly isAgentBusy: () => boolean;
-  private readonly completedOutput: () => string | null;
+  private readonly observe: NonNullable<ObserveLoopControllerDeps["observe"]>;
   private readonly maxTurnMs: number | null;
 
   /**
@@ -236,7 +237,7 @@ export class ObserveLoopController {
       ((elapsedMs) => `⏳ Working (${Math.floor(elapsedMs / 1000)}s).`);
     this.finalPayload = deps.finalPayload ?? "last-delta";
     this.isAgentBusy = deps.isAgentBusy ?? (() => false);
-    this.completedOutput = deps.completedOutput ?? (() => null);
+    this.observe = deps.observe ?? (() => ({ agentBusy: this.isAgentBusy(), completedOutput: null }));
     this.maxTurnMs = deps.maxTurnMs ?? null;
     this.done = new Promise<void>((resolve) => {
       this.resolveDone = resolve;
@@ -378,10 +379,9 @@ export class ObserveLoopController {
           this.emitFinal("ceiling", lastDeltaText, turnText);
           return;
         }
-        const agentBusy = this.isAgentBusy();
         // No proof survives a poll: a follow deadline can be added or a
         // session can be replaced while the same controller is running.
-        const completed = this.completedOutput();
+        const { agentBusy, completedOutput: completed } = await this.observe();
         if (this.aborted) {
           this.emitFinal("aborted", lastDeltaText, turnText);
           return;
@@ -392,7 +392,8 @@ export class ObserveLoopController {
           return;
         }
         const state: StopState = {
-          now: checkedAt,
+          // Query latency is not evidence that newly observed output settled.
+          now,
           lastChangeAt,
           stabilityMs: this.stabilityMs,
           deadline: this.deadline,
