@@ -444,6 +444,9 @@ export async function startSlackDaemon(
   }
 
   const agents = new Map<string, PaneAgent>();
+  let stopping = false;
+  /** Dispatch order survives reader replacement, unlike each agent's input queue. */
+  const inputDispatches = new Map<string, Promise<void>>();
   /** Invalidates in-flight settlement when even the same session gets a new turn. */
   const turnOwners = new Map<string, object>();
   const agentSessions = new WeakMap<PaneAgent, string | undefined>();
@@ -1256,7 +1259,18 @@ export async function startSlackDaemon(
     messageTs: string,
   ): Promise<void> => {
     const paneId = binding.pane_id;
-    turnOwners.set(paneId, {});
+    const owner = {};
+    turnOwners.set(paneId, owner);
+    // Reserve arrival order before any asynchronous Slack setup. Even a setup
+    // failure must not let later inputs overtake an earlier pending dispatch.
+    const previousDispatch = inputDispatches.get(paneId) ?? Promise.resolve();
+    let releaseDispatch!: () => void;
+    const finished = new Promise<void>(resolve => { releaseDispatch = resolve; });
+    const dispatch = previousDispatch.then(() => finished);
+    inputDispatches.set(paneId, dispatch);
+    void dispatch.then(() => {
+      if (inputDispatches.get(paneId) === dispatch) inputDispatches.delete(paneId);
+    });
     startingTurns.set(paneId, (startingTurns.get(paneId) ?? 0) + 1);
     try {
       // Do not let a withheld previous final settle this question while Slack
@@ -1275,13 +1289,30 @@ export async function startSlackDaemon(
       pendingTurns.open(paneId);
       await dismissBlockingDialog(paneId);
       const framed = await withThreadContext(binding, thread, text, messageTs);
-      const agent = paneAgentFor(binding);
-      cancelFinalRetry(agent);
-      await agent.handleMessage(framed);
+      await previousDispatch;
+      let sent = false;
+      if (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
+        let agent = paneAgentFor(binding);
+        while (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
+          cancelFinalRetry(agent);
+          if (await agent.handleMessage(framed) !== false) { sent = true; break; }
+          // Replacement can cancel queued input before it reaches the pane.
+          // Transfer only an unsent prompt, never a dispatched or unbound one.
+          const replacement = agents.get(paneId);
+          if (!replacement || replacement === agent) break;
+          agent = replacement;
+        }
+      }
+      // A canceled last setup owns no future answer. Never release a later
+      // question's ledger, status or reaction while clearing this one.
+      if (!sent && turnOwners.get(paneId) === owner && startingTurns.get(paneId) === 1) {
+        abandonTurn(bindingForPane(paneId) ?? binding);
+      }
     } finally {
       const remaining = (startingTurns.get(paneId) ?? 1) - 1;
       if (remaining > 0) startingTurns.set(paneId, remaining);
       else startingTurns.delete(paneId);
+      releaseDispatch();
     }
   };
 
@@ -1997,6 +2028,7 @@ export async function startSlackDaemon(
 
   return {
     stop: async () => {
+      stopping = true;
       clearInterval(heartbeat);
       clearInterval(idleSweep);
       paneWatcher.stop();
