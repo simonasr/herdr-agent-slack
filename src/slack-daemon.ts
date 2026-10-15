@@ -814,6 +814,14 @@ export async function startSlackDaemon(
       && (!liveIdentity || (knownIdentity === liveIdentity && (!readerIdentity || readerIdentity === liveIdentity)))))) {
       return existing;
     }
+    // Codex can publish its first id before writing the rollout. Keep the
+    // unresolved structured reader: a fresh selection would scrape forever.
+    if (existing && source?.name === "codex" && liveInfo?.agent === "codex"
+      && !knownIdentity && !readerIdentity && liveInfo.agent_session?.kind === "id"
+      && source.communicator.readerKind === "codex-jsonl") {
+      agentSessions.set(existing, liveIdentity);
+      return existing;
+    }
     let firstRead = true;
     const communicator = createAgentCommunicator({
       paneId: binding.pane_id,
