@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createLogger, type Logger } from "./logger.js";
 import { createAgentOutputReader } from "./readers/registry.js";
+import type { CompletedReaderTurn } from "./readers/types.js";
 import { sendText } from "./herdr-client.js";
 import {
   SENT_TAIL_MAX,
@@ -280,6 +281,9 @@ export interface AgentOutputReader {
   lastPrompt?(): string;
   /** The answer to that question alone, rather than the cumulative log. */
   lastAnswer?(): string;
+  /** Optional proof of a complete appended turn. A supplied expected session
+   *  must match the selected reader's actual source or capture returns null. */
+  captureTurn?(expectedSession?: AgentSessionRef): (() => CompletedReaderTurn | null) | null;
   /**
    * The text is the model's own, byte for byte. A screen carries TUI chrome
    * and so, it turns out, does OpenCode's log; those go through the pane
@@ -917,6 +921,24 @@ export class AgentCommunicator {
    */
   getLatestOutput(): string {
     return this.getAgentOutput(4000);
+  }
+
+  /** Pure pre-dispatch capture: does not consume or seed ordinary diff output. */
+  captureCompletedResponse(input: string, expectedSession?: AgentSessionRef): (() => string | null) | null {
+    try {
+      const read = this.reader.captureTurn?.(expectedSession);
+      if (!read || !input.trim()) return null;
+      return () => {
+        try {
+          const turn = read();
+          return turn && matchesPrompt(turn.prompt, input) && turn.text.trim() ? turn.text : null;
+        } catch {
+          return null;
+        }
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**

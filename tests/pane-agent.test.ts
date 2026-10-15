@@ -54,6 +54,7 @@ import {
 } from "../src/turn/observe-loop-controller.js";
 import { PaneAgent } from "../src/pane-agent.js";
 import type { Config } from "../src/config.js";
+import type { AgentInfo } from "../src/herdr-client.js";
 
 const noopLogger = { info() {}, warn() {}, error() {}, debug() {} };
 
@@ -779,5 +780,988 @@ describe("PaneAgent — getLastOutput", () => {
 
     // After /last, a getNewOutput call still finds nothing new.
     expect(env.comm.getNewOutput()).toBe("");
+  });
+});
+
+async function flushMicrotasks() {
+  for (let i = 0; i < 30; i++) await Promise.resolve();
+}
+
+/** Metadata and reader are independent: neither one alone can close a turn. */
+function completionEnv(opts: {
+  mode?: "final" | "stream"; capture?: boolean; sync?: boolean; maxTotalWaitS?: number;
+  reader?: AgentOutputReader;
+  metadata?: (info: AgentInfo | null, call: number) => AgentInfo | null | Promise<AgentInfo | null>;
+} = {}) {
+  let info: AgentInfo | null = {
+    agent: "pi", agent_status: "idle", pane_id: "w1:p1", tab_id: "t", workspace_id: "w",
+    agent_session: { kind: "path", path: "/tmp/session.jsonl" },
+    completion_evidence: {
+      terminal_id: "terminal", state_change_seq: 0, completion_seq: null,
+      screen_detection_skipped: true, launch_pending: false, endpoint_identity: "[socket:1]",
+    },
+  };
+  let answer: string | null = null;
+  let mismatched = false;
+  let throwInfo = false;
+  let metadataCalls = 0;
+  let captured = 0;
+  let sent = 0;
+  const reader: AgentOutputReader = opts.reader ?? {
+    kind: "pi-jsonl",
+    read: () => "old answer", // deliberately stale snapshot/anchor
+    lastPrompt: () => "old prompt",
+    lastAnswer: () => "old answer",
+    captureTurn: opts.capture === false ? undefined : (expected) => {
+      if (expected && (expected.kind !== "path" || expected.path !== "/tmp/session.jsonl")) return null;
+      captured++;
+      const boundary = sent;
+      return () => sent > boundary && answer ? { prompt: mismatched ? "old prompt" : "ask", text: answer } : null;
+    },
+  };
+  const comm = new AgentCommunicator(reader, noopLogger, "w1:p1");
+  const actualSend = comm.sendInput.bind(comm);
+  vi.spyOn(comm, "sendInput").mockImplementation((text) => {
+    sent++;
+    actualSend(text);
+    if (opts.sync) {
+      answer = "new synchronous answer";
+      complete();
+    }
+  });
+  const events: OutputEvent[] = [];
+  const pending: Array<() => void> = [];
+  let now = 0;
+  const config = makeConfig({ outputMode: opts.mode ?? "final", progressIntervalMs: 2000,
+    stabilityWindowMs: 30000, ...(opts.maxTotalWaitS === undefined ? {} : { maxTotalWaitS: opts.maxTotalWaitS }) });
+  const agent = new PaneAgent({
+    paneId: "w1:p1", communicator: comm, config,
+    getCompletionInfo: () => {
+      metadataCalls++;
+      if (throwInfo) throw new Error("metadata unavailable");
+      return opts.metadata ? opts.metadata(info, metadataCalls) : info;
+    },
+    isAgentBusy: () => info?.agent_status === "working",
+    emit: (event) => events.push(event),
+    deps: { now: () => now, sleep: () => new Promise<void>(resolve => pending.push(resolve)) },
+  });
+  function change(fields: Partial<AgentInfo> & { completion_evidence?: AgentInfo["completion_evidence"] }) {
+    info = info && { ...info, ...fields, completion_evidence: {
+      ...info.completion_evidence!, ...fields.completion_evidence,
+    } };
+  }
+  function complete(state = 8) {
+    change({ agent_status: "idle", completion_evidence: { ...info!.completion_evidence!, state_change_seq: state, completion_seq: state } });
+  }
+  async function tick() {
+    expect(pending.length).toBeGreaterThan(0);
+    now += 2000;
+    pending.shift()!();
+    await flushMicrotasks();
+  }
+  return {
+    agent, comm, events, change, complete, tick, setAnswer: (text: string | null) => { answer = text; },
+    setInfo: (value: AgentInfo | null) => { info = value; },
+    getInfo: () => info!, captured: () => captured, sent: () => sent,
+    metadataCalls: () => metadataCalls,
+    mismatch: () => { mismatched = true; }, throwMetadata: () => { throwInfo = true; },
+    restoreMetadata: () => { throwInfo = false; },
+    finals: () => events.filter(e => e.type === "final"),
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+describe("PaneAgent — asynchronous metadata and turn ownership", () => {
+  it("delivers both answers when a new input arrives during the ceiling decision", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    let prompt = "first";
+    let answer = "";
+    let transcript = "";
+    const e = completionEnv({ maxTotalWaitS: 1,
+      reader: { kind: "pi-jsonl", read: () => transcript,
+        lastPrompt: () => prompt, lastAnswer: () => answer },
+      metadata: (info, call) => call === 2 ? ceiling.promise : info });
+    await e.agent.handleMessage("first");
+    answer = transcript = "first answer";
+    await e.tick();
+    expect(e.metadataCalls()).toBe(2);
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["first answer"]);
+
+    const dispatch = vi.mocked(e.comm.sendInput).getMockImplementation()!;
+    const finalsAtDispatch: number[] = [];
+    vi.mocked(e.comm.sendInput).mockImplementation(text => {
+      finalsAtDispatch.push(e.finals().length);
+      dispatch(text);
+    });
+    const second = e.agent.handleMessage("second");
+    await flushMicrotasks();
+    const sentWhileDeciding = e.sent();
+    ceiling.resolve(e.getInfo());
+    await second;
+    prompt = "second";
+    answer = "second answer";
+    transcript += "\n" + answer;
+    await e.tick();
+
+    // Final-only consumers suppressed the first delta. A later final must not
+    // be mistaken for recovery of the preceding controller's lost payload.
+    expect(e.finals().map(event => event.text)).toEqual(["first answer", "second answer"]);
+    expect(sentWhileDeciding).toBe(1);
+    expect(finalsAtDispatch).toEqual([1]);
+    expect(e.sent()).toBe(2);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it.each([
+    { anchored: true, partial: "first part" },
+    { anchored: false, partial: "first part" },
+    { anchored: true, partial: "" },
+    { anchored: false, partial: "" },
+  ])("drains idle ceiling output before queued input (anchored=$anchored, partial='$partial')", async ({ anchored, partial }) => {
+    const ceiling = deferred<AgentInfo | null>();
+    let prompt = "first";
+    let answer = "";
+    let transcript = "";
+    const e = completionEnv({ maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => transcript,
+        ...(anchored ? { lastPrompt: () => prompt, lastAnswer: () => answer } : {}) },
+      metadata: (info, call) => call === 2 ? ceiling.promise : info });
+    await e.agent.handleMessage("first");
+    answer = transcript = partial;
+    await e.tick();
+    expect(e.metadataCalls()).toBe(2);
+    expect(e.finals()).toHaveLength(0);
+
+    answer = transcript = partial ? `${partial}\nlate suffix` : "late suffix";
+    const second = e.agent.handleMessage("second");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    ceiling.resolve(e.getInfo());
+    await second;
+    const firstAnswer = answer;
+    expect(e.finals()).toMatchObject([{ text: firstAnswer, source: "delta" }]);
+    expect(e.sent()).toBe(2);
+
+    prompt = "second";
+    answer = "second answer";
+    transcript += "\n" + answer;
+    await e.tick();
+    expect(e.finals().map(event => event.text)).toEqual([firstAnswer, "second answer"]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it.each(["stop", "dispose"] as const)("honors %s reentrancy during the idle ceiling drain", async action => {
+    const ceiling = deferred<AgentInfo | null>();
+    let draining = false;
+    let transcript = "";
+    const e = completionEnv({ maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => {
+        if (draining) e.agent[action]();
+        return transcript;
+      } },
+      metadata: (info, call) => call === 2 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "partial";
+    await e.tick();
+    const next = e.agent.handleMessage("canceled");
+    await flushMicrotasks();
+    draining = true;
+    transcript += "\nsuffix";
+    ceiling.resolve(e.getInfo());
+    await next;
+    expect(e.finals()).toHaveLength(0);
+    expect(e.sent()).toBe(1);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it("keeps an idle ceiling suffix that was not streamed in the refreshed final", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    let transcript = "";
+    const e = completionEnv({ mode: "stream", maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => transcript },
+      metadata: (info, call) => call === 1 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "streamed part";
+    await e.tick();
+    transcript += "\nlate suffix";
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["streamed part"]);
+    expect(e.finals().map(event => event.text.trim())).toEqual(["late suffix"]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it("falls back after an asynchronous metadata rejection and still sends once", async () => {
+    const e = completionEnv({ metadata: () => Promise.reject(new Error("unavailable")) });
+    await e.agent.handleMessage("ask");
+    expect(e.sent()).toBe(1);
+    expect(e.captured()).toBe(0);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("uses nonblocking fresh metadata to continue a working pane at the ceiling", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    expect(e.metadataCalls()).toBe(3);
+    expect(e.finals()).toHaveLength(0);
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+  });
+
+  it("does not restart a stopped pane when ceiling metadata arrives late", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    expect(e.metadataCalls()).toBe(3);
+    e.agent.stop();
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(false);
+    expect(e.finals()).toHaveLength(0);
+  });
+
+  it.each(["idle", "working"])("applies follow after the %s ceiling outcome without replacing it", async (status) => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: status });
+    await e.tick();
+    expect(e.metadataCalls()).toBe(3);
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.agent.noteExternalTurn()).toBe(false);
+    e.agent.enableFollow(10_000);
+    expect(e.agent.isFollowing()).toBe(true);
+    expect(e.finals()).toHaveLength(0);
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.agent.isFollowing()).toBe(true);
+    expect(e.finals()).toHaveLength(status === "idle" ? 1 : 0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals().at(-1)).toMatchObject({ reason: "aborted" });
+  });
+
+  it.each(["idle", "working"])("honors unfollow during the %s ceiling decision", async (status) => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: status });
+    await e.tick();
+    e.agent.enableFollow(10_000);
+    e.agent.disableFollow();
+    expect(e.agent.isFollowing()).toBe(false);
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isFollowing()).toBe(false);
+    expect(e.agent.isLoopActive()).toBe(status === "working");
+    expect(e.finals()).toHaveLength(status === "idle" ? 1 : 0);
+    if (status === "working") {
+      e.agent.stop();
+      await e.tick();
+    }
+  });
+
+  it.each(["final", "stream"] as const)("preserves %s-mode diff-only output across busy ceiling decisions", async (mode) => {
+    const ceiling = deferred<AgentInfo | null>();
+    let transcript = "";
+    const e = completionEnv({ mode, maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => transcript },
+      metadata: (info, call) => call === (mode === "final" ? 2 : 1) ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    transcript = "before ceiling";
+    await e.tick();
+    transcript += "\nduring decision";
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.finals()).toHaveLength(0);
+    transcript += "\nafter continuation";
+    await e.tick(); // still busy: carry output through another ceiling
+    expect(e.finals()).toHaveLength(0);
+    transcript += "\nfinished";
+    e.change({ agent_status: "idle" });
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+    expect(e.finals()[0]!.reason).toBe("ceiling");
+    if (mode === "final") {
+      expect(e.finals()[0]!.text).toBe("before ceiling\nduring decision\nafter continuation\nfinished");
+    } else {
+      expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+        .toEqual(["before ceiling", "during decision\nafter continuation", "finished"]);
+    }
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it.each(["idle", "working"])("queues arrivals in order behind the %s ceiling outcome", async (status) => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: status });
+    await e.tick();
+    const second = e.agent.handleMessage("second");
+    const third = e.agent.handleMessage("third");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    expect(e.agent.isLoopActive()).toBe(true);
+    ceiling.resolve(e.getInfo());
+    await Promise.all([second, third]);
+    expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text))
+      .toEqual(["ask", "second", "third"]);
+    expect(e.finals()).toHaveLength(status === "idle" ? 1 : 0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["stop", "dispose"] as const)("%s cancels input queued behind a ceiling decision", async (action) => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    const canceled = e.agent.handleMessage("canceled");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    e.agent[action]();
+    expect(e.agent.isLoopActive()).toBe(false);
+    ceiling.resolve(e.getInfo());
+    await canceled;
+    expect(e.sent()).toBe(1);
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it("does not make post-stop input wait for the canceled ceiling decision", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    const oldWorking = e.getInfo();
+    e.agent.stop();
+    e.change({ agent_status: "idle" });
+    await e.agent.handleMessage("fresh");
+    expect(e.sent()).toBe(2);
+    ceiling.resolve(oldWorking);
+    await flushMicrotasks();
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(true);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+  });
+
+  it("releases queued input after ceiling metadata rejects", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3
+        ? ceiling.promise.then(() => { throw new Error("metadata unavailable"); }) : info });
+    await e.agent.handleMessage("ask");
+    await e.tick();
+    const next = e.agent.handleMessage("next");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    ceiling.resolve(null);
+    await next;
+    expect(e.finals()).toMatchObject([{ reason: "ceiling" }]);
+    expect(e.sent()).toBe(2);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("lets a new message proceed after stop without waiting for canceled preparation", async () => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const canceled = e.agent.handleMessage("canceled");
+    await flushMicrotasks();
+    e.agent.stop();
+    await e.agent.handleMessage("ask");
+    expect(e.sent()).toBe(1);
+    expect(e.captured()).toBe(1);
+    baseline.resolve(null);
+    await canceled;
+    e.setAnswer("new turn");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "idle", text: "new turn" }]);
+    expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["ask"]);
+  });
+
+  it.each(["final", "stream"] as const)("drains a late ordinary-idle suffix without losing %s-mode output", async mode => {
+    let transcript = "";
+    const observation = deferred<AgentInfo | null>();
+    const e = completionEnv({ mode,
+      reader: { kind: "pi-jsonl", read: () => transcript },
+      metadata: (info, call) => call === (mode === "final" ? 17 : 16) ? observation.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "partial answer";
+    for (let i = 0; i < 16; i++) await e.tick(); // partial is now stable for 30s
+    expect(e.metadataCalls()).toBe(mode === "final" ? 17 : 16);
+    expect(e.finals()).toHaveLength(0);
+    transcript += "\nlate suffix";
+    observation.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(true);
+    for (let i = 0; i < 16; i++) await e.tick();
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["partial answer", "late suffix"]);
+    expect(e.finals().map(event => event.text.trim()))
+      .toEqual([mode === "final" ? "partial answer\nlate suffix" : "late suffix"]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it.each([
+    ["final", "stop"], ["final", "dispose"],
+    ["stream", "stop"], ["stream", "dispose"],
+  ] as const)("retains drained output when %s-mode %s aborts", async (mode, action) => {
+    let transcript = "";
+    const observation = deferred<AgentInfo | null>();
+    const e = completionEnv({ mode,
+      reader: { kind: "pi-jsonl", read: () => transcript },
+      metadata: (info, call) => call === (mode === "final" ? 17 : 16) ? observation.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "partial answer";
+    for (let i = 0; i < 16; i++) await e.tick();
+    expect(e.metadataCalls()).toBe(mode === "final" ? 17 : 16);
+    expect(e.finals()).toHaveLength(0);
+
+    const drain = vi.spyOn(e.comm, "getNewOutput");
+    transcript += "\nlate suffix";
+    observation.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(drain).toHaveBeenCalledTimes(1);
+    expect(drain).toHaveReturnedWith(expect.stringContaining("late suffix"));
+    expect(e.finals()).toHaveLength(0);
+
+    e.agent[action]();
+    await e.tick();
+    expect(drain).toHaveBeenCalledTimes(1); // cancellation must not read again
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+    expect(e.finals().map(event => event.text.trim()))
+      .toEqual([mode === "final" ? "partial answer\nlate suffix" : "late suffix"]);
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["partial answer"]); // no post-cancellation delta
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it.each([true, false])("uses revalidated working status for ordinary settling (evidence=%s)", async evidence => {
+    const e = completionEnv({ metadata: (info, call) => {
+      if (call !== 18) return info;
+      const latest = { ...info!, agent_status: "working", completion_evidence: evidence ? {
+        ...info!.completion_evidence!, state_change_seq: 9,
+      } : undefined };
+      e.setInfo(latest);
+      return latest;
+    } });
+    await e.agent.handleMessage("ask");
+    for (let i = 0; i < 14; i++) await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.setAnswer("candidate from the completed state");
+    e.complete();
+    await e.tick(); // 30s: ordinary fallback is stable; revalidation is call 18
+    expect(e.metadataCalls()).toBe(18);
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(true);
+    await e.tick(); // working must keep the fallback watcher alive too
+    expect(e.finals()).toHaveLength(0);
+    e.change({ agent_status: "idle" });
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "idle" }]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it("shares one poll sample and only revalidates after a reader candidate", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.metadataCalls()).toBe(2);
+    await e.tick(); // no completion, no reader candidate
+    expect(e.metadataCalls()).toBe(3);
+    e.complete();
+    await e.tick(); // metadata complete, but no persisted reader output
+    expect(e.metadataCalls()).toBe(4);
+    e.setAnswer("ready");
+    await e.tick();
+    expect(e.metadataCalls()).toBe(6); // shared observation + fresh post-reader check
+    expect(e.finals()).toMatchObject([{ text: "ready", reason: "idle" }]);
+  });
+
+  it("skips the second pre-dispatch sample when capture has no proof", async () => {
+    const e = completionEnv({ capture: false });
+    await e.agent.handleMessage("ask");
+    expect(e.metadataCalls()).toBe(1);
+    expect(e.sent()).toBe(1);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("queues input in arrival order and invalidates proof before preparation finishes", async () => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const first = e.agent.handleMessage("ask");
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.agent.noteExternalTurn()).toBe(false);
+    const second = e.agent.handleMessage("second");
+    expect(e.sent()).toBe(0);
+    baseline.resolve(e.getInfo());
+    await Promise.all([first, second]);
+    expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["ask", "second"]);
+    expect(e.captured()).toBe(0);
+    e.setAnswer("must settle normally");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["stop", "dispose"] as const)("%s cancels all pending input before dispatch", async action => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const first = e.agent.handleMessage("ask");
+    await flushMicrotasks();
+    const second = e.agent.handleMessage("second");
+    e.agent[action]();
+    expect(e.agent.isLoopActive()).toBe(false);
+    baseline.resolve(e.getInfo());
+    await Promise.all([first, second]);
+    expect(e.sent()).toBe(0);
+    expect(e.captured()).toBe(0);
+    expect(e.finals()).toHaveLength(0);
+    if (action === "dispose") {
+      await e.agent.handleMessage("after disposal");
+      e.agent.enableFollow(60_000);
+      expect(e.sent()).toBe(0);
+      expect(e.agent.isLoopActive()).toBe(false);
+    }
+  });
+
+  it("preserves follow/unfollow while preparation is in flight without arming proof", async () => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const input = e.agent.handleMessage("ask");
+    await flushMicrotasks();
+    e.agent.enableFollow(60_000);
+    baseline.resolve(e.getInfo());
+    await input;
+    expect(e.agent.isFollowing()).toBe(true);
+    expect(e.captured()).toBe(0);
+    e.agent.disableFollow();
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0); // user input retained the idle gate
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("invalidates proof immediately while a poll's metadata is pending", async () => {
+    const poll = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 3 ? poll.promise : info });
+    await e.agent.handleMessage("ask");
+    e.setAnswer("old turn proof");
+    e.complete();
+    await e.tick(); // enters suspended metadata
+    await e.agent.handleMessage("second");
+    poll.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.sent()).toBe(2);
+    expect(e.finals()).toHaveLength(0);
+    expect(e.metadataCalls()).toBe(3); // no post-reader query for invalid proof
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("does not let an old aborted final erase a new turn's proof", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    e.agent.stop();
+    await e.agent.handleMessage("ask");
+    e.setAnswer("new answer");
+    e.complete();
+    await e.tick(); // old controller's aborted final arrives after new capture
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }, { reason: "idle", text: "new answer" }]);
+  });
+
+  it("rejects stale post-reader revalidation without clearing replacement proof", async () => {
+    const revalidation = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 4 ? revalidation.promise : info });
+    await e.agent.handleMessage("ask");
+    e.setAnswer("old candidate");
+    e.complete();
+    await e.tick(); // suspended after reading the candidate
+    expect(e.metadataCalls()).toBe(4);
+    e.agent.stop();
+    await e.agent.handleMessage("ask");
+    revalidation.resolve(null);
+    await flushMicrotasks();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+    e.setAnswer("new answer");
+    e.complete(16);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }, { reason: "idle", text: "new answer" }]);
+  });
+});
+
+describe("PaneAgent — completion-aware final polling", () => {
+  it("delivers a fresh full turn at the next 2s poll, with no historical output", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("current full turn\nsecond line");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toEqual([{ type: "final", text: "current full turn\nsecond line", reason: "idle", source: "delta" }]);
+    expect(e.sent()).toBe(1);
+  });
+
+  it("rejects a cached old reader when current metadata already names a new session", async () => {
+    const e = completionEnv();
+    e.change({ agent_session: { kind: "path", path: "/tmp/new-session.jsonl" } });
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(0); // wrong selected source cannot affirm current metadata
+    e.setAnswer("stale reader answer");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("captures a copied source before dispatch, not a mutable metadata session", async () => {
+    const e = completionEnv();
+    const capture = vi.spyOn(e.comm, "captureCompletedResponse");
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    const source = capture.mock.calls[0]?.[1];
+    expect(source).toEqual({ kind: "path", path: "/tmp/session.jsonl" });
+    expect(source).not.toBe(e.getInfo().agent_session);
+    (e.getInfo().agent_session as { kind: "path"; path: string }).path = "/tmp/new-session.jsonl";
+    expect(source).toEqual({ kind: "path", path: "/tmp/session.jsonl" });
+    e.setAnswer("stale reader answer");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("does not swallow completion that lands synchronously during sendInput and before seed", async () => {
+    const e = completionEnv({ sync: true });
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "new synchronous answer", source: "delta" }]);
+  });
+
+  it("accepts a missed working status and a large state counter gap, not stale idle", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    e.setAnswer("new");
+    e.change({ agent_status: "done" }); // presentation change, not a new completion
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.complete(500);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "new", reason: "idle" }]);
+  });
+
+  it("rejects a complete old/mismatched user boundary instead of replaying it", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("old answer");
+    e.mismatch();
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("a metadata read error disables the fast path for the rest of the turn", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.throwMetadata();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.restoreMetadata();
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("waits for persisted current-request output even after fresh metadata", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.setAnswer("persisted later");
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "persisted later" }]);
+  });
+
+  it("does not arm unsupported readers, absent metadata, or non-final mode", async () => {
+    for (const opts of [{ capture: false }, { mode: "stream" as const }, {}]) {
+      const e = completionEnv(opts);
+      if (!Object.keys(opts).length) e.setInfo(null);
+      await e.agent.handleMessage("ask");
+      expect(e.captured()).toBe(0);
+      e.setAnswer("ready");
+      if (e.getInfo()) e.complete();
+      await e.tick();
+      expect(e.finals()).toHaveLength(0);
+      e.agent.stop();
+      await e.tick();
+    }
+  });
+
+  it("does not arm when evidence is absent or the session is empty", async () => {
+    for (const invalid of ["evidence", "session"] as const) {
+      const e = completionEnv();
+      if (invalid === "evidence") e.setInfo({ ...e.getInfo(), completion_evidence: undefined });
+      else e.change({ agent_session: { kind: "path", path: "" } });
+      await e.agent.handleMessage("ask");
+      expect(e.captured()).toBe(0);
+      e.setAnswer("ready");
+      await e.tick();
+      expect(e.finals()).toHaveLength(0);
+      e.agent.stop();
+      await e.tick();
+    }
+  });
+
+  it("does not arm if metadata changes during capture, and rejects old prompt output", async () => {
+    const e = completionEnv();
+    const original = e.comm.captureCompletedResponse.bind(e.comm);
+    vi.spyOn(e.comm, "captureCompletedResponse").mockImplementation(text => {
+      const read = original(text);
+      e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 1 } });
+      return read;
+    });
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("old");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["working", "blocked", "unknown"])("never affirms %s status", async status => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("ready");
+    e.complete();
+    e.change({ agent_status: status });
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["screen", "launch"])("requires full authority, not %s", async flag => {
+    const e = completionEnv();
+    e.change({ completion_evidence: { ...e.getInfo().completion_evidence!,
+      ...(flag === "screen" ? { screen_detection_skipped: false } : { launch_pending: true }) } });
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(0);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["agent", "pane_id", "terminal_id", "agent_session", "endpoint_identity", "regression", "missing"])(
+    "permanently disables fast completion after %s replacement or regression", async field => {
+      const e = completionEnv();
+      if (field === "regression") e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 2 } });
+      await e.agent.handleMessage("ask");
+      expect(e.captured()).toBe(1);
+      const prior = e.getInfo();
+      if (field === "agent") e.change({ agent: "omp" });
+      if (field === "pane_id") e.change({ pane_id: "other" });
+      if (field === "agent_session") e.change({ agent_session: { kind: "path", path: "/other" } });
+      if (field === "terminal_id") e.change({ completion_evidence: { ...prior.completion_evidence!, terminal_id: "other" } });
+      if (field === "endpoint_identity") e.change({ completion_evidence: { ...prior.completion_evidence!, endpoint_identity: "other" } });
+      if (field === "regression") e.change({ completion_evidence: { ...prior.completion_evidence!, state_change_seq: 0, completion_seq: null } });
+      if (field === "missing") e.setInfo(null);
+      // For regression, first establish an observed counter above baseline.
+      await e.tick();
+      e.setInfo(prior);
+      e.setAnswer("ready");
+      e.complete();
+      await e.tick();
+      expect(e.finals()).toHaveLength(0);
+      e.agent.stop();
+      await e.tick();
+    },
+  );
+
+  it("disables the turn after an observed completion counter regresses", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.complete(8);
+    await e.tick(); // no output yet; remember completion 8
+    expect(e.finals()).toHaveLength(0);
+    e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 9, completion_seq: 7 } });
+    await e.tick();
+    e.setAnswer("ready");
+    e.complete(10);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("invalidates a turn before a second input, including one from readiness extraction", async () => {
+    const e = completionEnv();
+    const original = e.comm.captureCompletedResponse.bind(e.comm);
+    vi.spyOn(e.comm, "captureCompletedResponse").mockImplementation(text => {
+      const read = original(text);
+      return read && (() => { e.agent.handleMessage("second"); return read(); });
+    });
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("stale proof");
+    e.complete();
+    await e.tick();
+    expect(e.sent()).toBe(2);
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+    expect(e.finals()[0]).toMatchObject({ reason: "aborted" });
+  });
+
+  it("rechecks metadata after extraction and permanently rejects a changed candidate", async () => {
+    const e = completionEnv();
+    const original = e.comm.captureCompletedResponse.bind(e.comm);
+    vi.spyOn(e.comm, "captureCompletedResponse").mockImplementation(text => {
+      const read = original(text);
+      return read && (() => { const result = read(); e.complete(9); return result; });
+    });
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.complete(10);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("coalesces a normal second message permanently into fallback, without resending", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    await e.agent.handleMessage("second");
+    expect(e.sent()).toBe(2);
+    e.setAnswer("new");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+  });
+
+  it.each(["stop", "dispose"] as const)("%s invalidates proof and emits only an aborted final", async action => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("ready");
+    e.complete();
+    e.agent[action]();
+    expect(e.finals()).toHaveLength(0);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+  });
+
+  it("a follow-only loop stays fallback-only when it receives a new input", async () => {
+    const e = completionEnv();
+    e.agent.enableFollow(60_000);
+    await e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(0);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("preserves one final per distinct user boundary even when answers have equal bytes", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    e.setAnswer("same");
+    e.complete(8);
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+    await Promise.resolve(); // done auto-clears the old controller
+    await e.agent.handleMessage("ask");
+    e.complete(80);
+    await e.tick();
+    expect(e.finals()).toHaveLength(2);
+    expect(e.finals().map(f => f.text)).toEqual(["same", "same"]);
+    expect(e.sent()).toBe(2);
+  });
+
+  it("holds a future follow deadline and revalidates proof at the deadline", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    e.agent.enableFollow(6000);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "ready", reason: "idle" }]);
   });
 });

@@ -28,7 +28,7 @@ import { SlackClient, isDirectMessage, type SlackThread, type ThreadMessage } fr
 import { formatForSlack } from "./slack-format.js";
 import { cleanPaneDelta, cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { createAgentCommunicator, findClaudeSessionByPrompt } from "./agent-sessions.js";
-import { closeTab, createTab, getAgents, getAgentInfo, readPane, renameAgent, renameTab, sendKeys, startAgent } from "./herdr-client.js";
+import { closeTab, createTab, getAgents, getAgentInfo, getAgentInfoAsync, readPane, renameAgent, renameTab, sendKeys, startAgent } from "./herdr-client.js";
 import type { AgentSessionRef } from "./herdr-client.js";
 import { PaneAgent } from "./pane-agent.js";
 import { PaneWatcher } from "./turn/pane-watcher.js";
@@ -793,7 +793,7 @@ export async function startSlackDaemon(
       paneId: binding.pane_id,
       communicator,
       config: cfg,
-      isAgentBusy: () => getAgentInfo(binding.pane_id)?.agent_status === "working",
+      getCompletionInfo: () => getAgentInfoAsync(binding.pane_id),
       emit: (event) => {
         // The agent is the pane's; the thread is whichever asked last. It is
         // looked up now, not when this agent was built — the binding that
@@ -1107,7 +1107,7 @@ export async function startSlackDaemon(
     log.info("turn started", { bot: bot.name, paneId: binding.pane_id, label: binding.label, thread: threadKey(thread) });
     pendingTurns.open(binding.pane_id);
     await dismissBlockingDialog(binding.pane_id);
-    paneAgentFor(binding).handleMessage(await withThreadContext(binding, thread, text, messageTs));
+    await paneAgentFor(binding).handleMessage(await withThreadContext(binding, thread, text, messageTs));
   };
 
   /**

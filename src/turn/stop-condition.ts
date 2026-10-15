@@ -53,6 +53,8 @@ export interface StopState {
    * alone.
    */
   agentBusy?: boolean;
+  /** Current-poll completion plus reader proof, never retained between polls. */
+  completionConfirmed?: boolean;
 }
 
 /**
@@ -71,7 +73,7 @@ export function isDeadlineReached(state: StopState): boolean {
  */
 export function isIdle(state: StopState): boolean {
   if (state.agentBusy) return false;
-  return state.now - state.lastChangeAt >= state.stabilityMs;
+  return state.completionConfirmed === true || state.now - state.lastChangeAt >= state.stabilityMs;
 }
 
 /**

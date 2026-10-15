@@ -40,8 +40,8 @@ relay_terminal_turns = true   # deliver turns started in the pane itself
 
 # --- Turn machinery (in any [slack…] section) ---
 progress_interval_ms = 15000  # how often the pane is polled during a turn
-stability_window_ms = 30000   # min ms a scraped pane must stay unchanged before
-                              # a turn is declared final
+stability_window_ms = 30000   # fallback: min ms output must stay unchanged
+                              # before a turn is declared final
 max_total_wait_s = 1800       # ceiling on one observe loop
 
 [slack.channels]              # per channel, the pane its threads use — see below
@@ -178,9 +178,11 @@ This applies equally to Codex JSONL, Pi/OMP JSONL, and screen-scraped agents. Lo
 
 ### stability_window_ms
 
-For the screen-scrape fallback (such as OpenCode), this is the minimum time in milliseconds the pane must remain unchanged before the turn coordinator considers the response final. Default: `30000` (30 seconds).
+The minimum time in milliseconds selected output must remain unchanged before ordinary polling considers the response final. Default: `30000` (30 seconds). This applies to session-log readers as well as screen scraping; a reported busy agent still prevents idle completion.
 
-Independent from `progress_interval_ms` so you can tune polling cadence and stability window separately. Increase if herdr reports `idle` while the agent is still streaming a long tool's output and you see truncated responses; decrease for snappier handoffs when your agent is well-behaved. Has no effect on Codex/Pi/OMP (those use session logs).
+In `"final"` mode, an eligible new chat request can bypass this window on the next poll when fresh Herdr completion metadata agrees with a complete answer anchored to that request and session. Pi/OMP JSONL readers currently provide this readiness proof. Unsupported metadata/readers, coalesced inputs, recovered or externally adopted turns, and uncertain evidence retain ordinary settling. Follow deadlines and stop/ceiling behavior are unchanged; there are no event-driven wakeups yet.
+
+Independent from `progress_interval_ms`, so polling cadence and stability can be tuned separately. Increase this window if fallback responses are truncated; decrease it for snappier fallback handoffs.
 
 ## Environment variables
 
