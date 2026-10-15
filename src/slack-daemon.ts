@@ -444,7 +444,7 @@ export async function startSlackDaemon(
   }
 
   const agents = new Map<string, PaneAgent>();
-  /** Invalidates in-flight deliveries when even the same session gets a new turn. */
+  /** Invalidates in-flight settlement when even the same session gets a new turn. */
   const turnOwners = new Map<string, object>();
   const agentSessions = new WeakMap<PaneAgent, string | undefined>();
   const agentSources = new WeakMap<PaneAgent, { name?: string; communicator: ReturnType<typeof createAgentCommunicator> }>();
@@ -586,21 +586,21 @@ export async function startSlackDaemon(
   ): Promise<void> => {
     const paneId = binding.pane_id;
     const turn = turnOwners.get(paneId);
-    // Refreshes can retire the reader even during delivery. Recheck both the
-    // agent and turn after every await; an already-dispatched post cannot be
-    // recalled, but it must not settle or send more output for its successor.
-    const isCurrent = (): boolean => {
-      if (agents.get(paneId) !== owner || turnOwners.get(paneId) !== turn || startingTurns.has(paneId)) return false;
-      return paneAgentFor(binding) === owner && turnOwners.get(paneId) === turn;
-    };
-    if (!isCurrent()) return;
+    const duringSetup = startingTurns.has(paneId);
+    // A new session retires the answer, but a same-session follow-up must
+    // not truncate it. Only settlement belongs exclusively to the old turn.
+    const canPost = (): boolean => agents.get(paneId) === owner && paneAgentFor(binding) === owner;
+    const isCurrent = (): boolean => !duringSetup && !startingTurns.has(paneId)
+      && turnOwners.get(paneId) === turn && canPost() && turnOwners.get(paneId) === turn;
+    if (!canPost()) return;
     const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
-    turnStartedAt.delete(paneId);
-    // Settle only after the delivery lookup has confirmed ownership.
-    pendingTurns.close(paneId);
+    if (isCurrent()) {
+      turnStartedAt.delete(paneId);
+      pendingTurns.close(paneId);
+    }
     if (event.duplicate) {
       log.info("suppressed a repeat of the last answer", { paneId });
-      await botOf(binding).client.setStatus(thread, "");
+      if (isCurrent()) await botOf(binding).client.setStatus(thread, "");
       return;
     }
     // Accumulated turn output has already been through the snapshot filters;
@@ -646,7 +646,7 @@ export async function startSlackDaemon(
       // approval, a choice — which only the terminal can answer. That is
       // worth a message; show what it is asking.
       const stuck = getAgentInfo(binding.pane_id)?.agent_status === "blocked" ? paneTail(binding.pane_id) : "";
-      if (!isCurrent()) return;
+      if (!canPost()) return;
       if (stuck) {
         await bot.client.post(
           thread,
@@ -660,7 +660,7 @@ export async function startSlackDaemon(
       // answer to whatever was said last.
       if (!awaited) {
         log.info("a turn of the pane's own ended with nothing to say", { paneId: binding.pane_id });
-        await bot.client.setStatus(thread, "");
+        if (isCurrent()) await bot.client.setStatus(thread, "");
         return;
       }
       await bot.client.post(thread, `${note}✅ Done (no output).`);
@@ -672,25 +672,28 @@ export async function startSlackDaemon(
     const asked = event.prompt?.trim() ?? "";
     // Not twice: a question announced when the turn started is already above.
     const alreadyShown = asked.length > 0 && announcedPrompt.get(binding.pane_id) === asked;
-    if (alreadyShown) announcedPrompt.delete(binding.pane_id);
+    if (alreadyShown && isCurrent()) announcedPrompt.delete(binding.pane_id);
     const quoted = asked && !alreadyShown ? `${quoteForSlack(asked)}\n\n` : "";
     const prefix = note + quoted + (event.reason === "aborted" ? "🛑 Stopped.\n\n" : "");
     let lastTs = "";
     for (const [index, message] of messages.entries()) {
-      if (!isCurrent()) return;
+      if (!canPost()) return;
       lastTs = await bot.client.post(thread, (index === 0 ? prefix : "") + message.text) || lastTs;
     }
-    if (!isCurrent()) return;
-    if (lastTs) state.last_answer[binding.pane_id] = { channel: thread.channel, ts: lastTs };
-    state.delivered[binding.pane_id] = digest(event.text);
-    persist();
-    await markDone(bot, binding.pane_id, thread, isCurrent);
-    if (!isCurrent()) return;
+    if (isCurrent()) {
+      if (lastTs) state.last_answer[binding.pane_id] = { channel: thread.channel, ts: lastTs };
+      state.delivered[binding.pane_id] = digest(event.text);
+      persist();
+      await markDone(bot, binding.pane_id, thread, isCurrent);
+    }
+    if (!canPost()) return;
     log.info("answer delivered", { bot: bot.name, paneId: binding.pane_id, messages: messages.length });
-    if (requestedFiles.length > 0) await deliverRequestedFiles(binding, thread, requestedFiles, isCurrent);
+    // These are dispatched operations: once started, finish their files or
+    // command/spawn/brief sequence rather than strand a partial side effect.
+    if (requestedFiles.length > 0) await deliverRequestedFiles(binding, thread, requestedFiles);
     for (const handoff of handoffs) {
-      if (!isCurrent()) return;
-      await handOff(bot, thread, handoff, binding.pane_id, isCurrent).catch((err) =>
+      if (!canPost()) return;
+      await handOff(bot, thread, handoff, binding.pane_id).catch((err) =>
         log.error("handoff failed", { from: bot.name, to: handoff.bot, message: String(err) }),
       );
     }
@@ -704,8 +707,7 @@ export async function startSlackDaemon(
    * until a person speaks, because two agents can hand work to each other
    * forever.
    */
-  const handOff = async (from: Bot, thread: SlackThread, handoff: Handoff, handoffFromPane?: string, isCurrent: () => boolean = () => true): Promise<void> => {
-    if (!isCurrent()) return;
+  const handOff = async (from: Bot, thread: SlackThread, handoff: Handoff, handoffFromPane?: string): Promise<void> => {
     const to = bots.get(handoff.bot);
     if (!to) return;
     const key = threadKey(thread);
@@ -713,7 +715,6 @@ export async function startSlackDaemon(
       // Addressed to itself: `!bind`, `!spawn` — the pane moving its own
       // thread. Prose to itself would only come straight back.
       for (const line of handoff.lines) {
-        if (!isCurrent()) return;
         if (!line.startsWith("!")) continue;
         log.info("self-command", { bot: from.name, thread: key, line });
         await handleCommand(from, thread, state.threads[bindingKey(from.name, thread)], line, state.last_user[key] ?? "", from);
@@ -749,16 +750,14 @@ export async function startSlackDaemon(
     const onBehalfOf = state.last_user[key] ?? "";
     const prompt: string[] = [];
     for (const line of handoff.lines) {
-      if (!isCurrent()) return;
       if (line.startsWith("!")) {
         await handleCommand(to, thread, state.threads[bindingKey(to.name, thread)], line, onBehalfOf, from);
       } else if (line) {
         prompt.push(line);
       }
     }
-    if (!isCurrent() || prompt.length === 0) return;
+    if (prompt.length === 0) return;
     const binding = state.threads[bindingKey(to.name, thread)] ?? await autoBind(to, thread, onBehalfOf);
-    if (!isCurrent()) return;
     if (!binding) {
       await to.client.post(
         thread,
@@ -784,19 +783,15 @@ export async function startSlackDaemon(
     binding: ThreadBinding,
     thread: SlackThread,
     requested: string[],
-    isCurrent: () => boolean,
   ): Promise<void> => {
-    if (!isCurrent()) return;
     const client = botOf(binding).client;
     const cwd = getAgentInfo(binding.pane_id)?.cwd;
-    if (!isCurrent()) return;
     if (!cwd) {
       await client.post(thread, "Could not send files: this pane has no working directory.");
       return;
     }
     const notes: string[] = [];
     for (const candidate of requested.slice(0, MAX_SENT_FILES)) {
-      if (!isCurrent()) return;
       const verdict = resolveInsideCwd(cwd, candidate);
       if (!verdict.ok) { notes.push(`⚠️ ${candidate} — ${verdict.reason}`); continue; }
       let size: number;
@@ -820,7 +815,7 @@ export async function startSlackDaemon(
     if (requested.length > MAX_SENT_FILES) {
       notes.push(`⚠️ ${requested.length - MAX_SENT_FILES} more not sent — ${MAX_SENT_FILES} per turn.`);
     }
-    if (notes.length && isCurrent()) await client.post(thread, notes.join("\n"));
+    if (notes.length) await client.post(thread, notes.join("\n"));
   };
 
   /** Release a cancelled turn without posting anything from its retired reader. */
