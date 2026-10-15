@@ -87,6 +87,7 @@ describe("Codex pane that has no session yet", () => {
       logger,
     });
     expect(reader.kind).toBe("codex-jsonl");
+    expect(reader.session).toBeUndefined();
     expect(reader.read(100)).toBe("");
     // The first prompt: herdr learns the id, and the rollout appears.
     const id = `late-${Date.now()}`;
@@ -97,7 +98,13 @@ describe("Codex pane that has no session yet", () => {
       payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "from rollout" }] },
     }) + "\n");
     session = { kind: "id", id };
+    // Metadata alone does not pin the reader; resolving the on-disk log does.
+    expect(reader.session).toBeUndefined();
     expect(reader.read(100)).toBe("from rollout");
+    expect(reader.session).toEqual({ kind: "id", id });
+    session = { kind: "id", id: "replacement" };
+    expect(reader.read(100)).toBe("from rollout");
+    expect(reader.session).toEqual({ kind: "id", id });
   });
 
   it("still scrapes when nobody can ask herdr again", () => {

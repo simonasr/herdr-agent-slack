@@ -453,7 +453,7 @@ export async function startSlackDaemon(
     clearTimeout(finalRetries.get(agent));
     finalRetries.delete(agent);
   };
-  const sessionIdentity = (info: AgentInfo | null): string | undefined => {
+  const sessionIdentity = (info: Pick<AgentInfo, "agent" | "agent_session"> | null): string | undefined => {
     const ref = info?.agent_session;
     return ref ? JSON.stringify([info.agent, ref.kind, ref.kind === "path" ? ref.path : ref.id]) : undefined;
   };
@@ -827,7 +827,10 @@ export async function startSlackDaemon(
     // A genuine deferred reader can retain its first answer. A reader chosen
     // without metadata may instead be a scrape: upgrade it when the registry
     // now selects a structured source, rather than merely labelling it known.
+    const readerIdentity = source?.name
+      ? sessionIdentity({ agent: source.name, agent_session: source.communicator.readerSession }) : undefined;
     if (existing && source && !knownIdentity && (!source.name || source.name === liveInfo?.agent)
+      && (!readerIdentity || readerIdentity === liveIdentity)
       && source.communicator.readerKind === communicator.readerKind) {
       source.name = liveInfo?.agent;
       if (liveIdentity) agentSessions.set(existing, liveIdentity);
