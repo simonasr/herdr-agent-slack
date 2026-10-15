@@ -1215,6 +1215,32 @@ describe("PaneAgent — asynchronous metadata and turn ownership", () => {
     expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["ask"]);
   });
 
+  it.each([true, false])("uses revalidated working status for ordinary settling (evidence=%s)", async evidence => {
+    const e = completionEnv({ metadata: (info, call) => {
+      if (call !== 18) return info;
+      const latest = { ...info!, agent_status: "working", completion_evidence: evidence ? {
+        ...info!.completion_evidence!, state_change_seq: 9,
+      } : undefined };
+      e.setInfo(latest);
+      return latest;
+    } });
+    await e.agent.handleMessage("ask");
+    for (let i = 0; i < 14; i++) await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.setAnswer("candidate from the completed state");
+    e.complete();
+    await e.tick(); // 30s: ordinary fallback is stable; revalidation is call 18
+    expect(e.metadataCalls()).toBe(18);
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(true);
+    await e.tick(); // working must keep the fallback watcher alive too
+    expect(e.finals()).toHaveLength(0);
+    e.change({ agent_status: "idle" });
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "idle" }]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
   it("shares one poll sample and only revalidates after a reader candidate", async () => {
     const e = completionEnv();
     await e.agent.handleMessage("ask");
