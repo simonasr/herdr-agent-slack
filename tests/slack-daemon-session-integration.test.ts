@@ -119,6 +119,30 @@ describe("Slack session routing — real observe loops", () => {
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
 
+  it.each([false, true])("respects disabled terminal relaying on replacement, pending Slack turn=%s", async (pending) => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
+    mocks.live = liveSession(oldPath, "idle");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "1.1");
+    if (pending) await mocks.client!.onUserMessage(thread, "U1", "a Slack question", "2.0");
+    const replacement = join(dir, "replacement.jsonl");
+    writeFileSync(replacement, message("replacement history"));
+    mocks.live = liveSession(replacement);
+    mocks.post.mockClear();
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "replacement history");
+    mocks.post.mockClear();
+    appendFileSync(replacement, message("replacement answer"));
+    mocks.live = liveSession(replacement, "idle");
+    await vi.advanceTimersByTimeAsync(5_000);
+    if (pending) {
+      expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "replacement answer");
+      expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    } else {
+      expect(mocks.post).not.toHaveBeenCalled();
+    }
+  });
+
   it.each(["unreachable", "Pi without session"])("upgrades a scrape reader created with %s metadata instead of replaying its screen", async (missing) => {
     appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
     mocks.live = missing === "unreachable" ? null : { ...liveSession(oldPath, "idle"), agent_session: undefined };

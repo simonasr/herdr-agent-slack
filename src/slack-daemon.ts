@@ -963,6 +963,9 @@ export async function startSlackDaemon(
   const adoptExternalTurn = (paneId: string): boolean => {
     // Slack owns setup until handleMessage starts observation with its prompt.
     if (startingTurns.has(paneId)) return false;
+    // Readbacks must not opt into terminal relaying, but an existing Slack
+    // question still needs to follow the replacement when the watcher is off.
+    if (!cfg.relayTerminalTurns && !pendingTurns.isOpen(paneId)) return false;
     const binding = bindingForPane(paneId);
     if (!binding) return false;
     const agent = paneAgentFor(binding);
