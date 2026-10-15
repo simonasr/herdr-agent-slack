@@ -457,6 +457,11 @@ export async function startSlackDaemon(
     const ref = info?.agent_session;
     return ref ? JSON.stringify([info.agent, ref.kind, ref.kind === "path" ? ref.path : ref.id]) : undefined;
   };
+  const readerIdentityOf = (agent: PaneAgent): string | undefined => {
+    const source = agentSources.get(agent);
+    return source?.name
+      ? sessionIdentity({ agent: source.name, agent_session: source.communicator.readerSession }) : undefined;
+  };
   /**
    * Questions asked in a thread that have not been answered yet. Read at
    * startup, so a daemon that died mid-turn pays its debt rather than leaving
@@ -802,9 +807,11 @@ export async function startSlackDaemon(
     const liveIdentity = sessionIdentity(liveInfo);
     const knownIdentity = existing ? agentSessions.get(existing) : undefined;
     const source = existing ? agentSources.get(existing) : undefined;
+    const readerIdentity = existing ? readerIdentityOf(existing) : undefined;
     // An outage is not replacement. A confirmed agent-kind change is, even
     // before the new agent has acquired its session identifier.
-    if (existing && (!liveInfo || (source?.name === liveInfo.agent && (!liveIdentity || knownIdentity === liveIdentity)))) {
+    if (existing && (!liveInfo || (source?.name === liveInfo.agent
+      && (!liveIdentity || (knownIdentity === liveIdentity && (!readerIdentity || readerIdentity === liveIdentity)))))) {
       return existing;
     }
     let firstRead = true;
@@ -827,8 +834,6 @@ export async function startSlackDaemon(
     // A genuine deferred reader can retain its first answer. A reader chosen
     // without metadata may instead be a scrape: upgrade it when the registry
     // now selects a structured source, rather than merely labelling it known.
-    const readerIdentity = source?.name
-      ? sessionIdentity({ agent: source.name, agent_session: source.communicator.readerSession }) : undefined;
     if (existing && source && !knownIdentity && (!source.name || source.name === liveInfo?.agent)
       && (!readerIdentity || readerIdentity === liveIdentity)
       && source.communicator.readerKind === communicator.readerKind) {
@@ -862,7 +867,9 @@ export async function startSlackDaemon(
         const live = getAgentInfo(binding.pane_id);
         const identity = sessionIdentity(live);
         const known = agentSessions.get(agent);
-        if ((identity && identity !== known) || (live && agentSources.get(agent)?.name !== live.agent)) {
+        const pinned = readerIdentityOf(agent);
+        if ((identity && (identity !== known || (pinned && pinned !== identity)))
+          || (live && agentSources.get(agent)?.name !== live.agent)) {
           // Refresh here too: Slack-driven turns still need invalidation
           // when terminal-turn polling is disabled, including an initial
           // scrape that must upgrade rather than accept the first identity.

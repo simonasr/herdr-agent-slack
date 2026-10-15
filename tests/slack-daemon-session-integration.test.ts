@@ -154,6 +154,35 @@ describe("Slack session routing — real observe loops", () => {
     }
   });
 
+  it("rejects a deferred reader that pins a different session after metadata was already recorded", async () => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "claude", agent_session: undefined, cwd: dir };
+    const disposed = vi.spyOn(PaneAgent.prototype, "dispose");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "a unique question before metadata resolves", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "later-b" } };
+    // B is named before its transcript exists, so the original reader is unresolved.
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "2.1");
+    mocks.post.mockClear();
+    const projects = join(dir, ".claude", "projects", dir.replace(/[^A-Za-z0-9]/g, "-"));
+    mkdirSync(projects, { recursive: true });
+    const turn = (question: string, answer: string) =>
+      JSON.stringify({ type: "user", message: { role: "user", content: question } }) + "\n"
+      + JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: answer }] } }) + "\n";
+    writeFileSync(join(projects, "earlier-a.jsonl"), turn(prompt, "retired answer from A"));
+    mocks.live = { ...mocks.live!, agent_session: undefined };
+    await vi.advanceTimersByTimeAsync(300);
+    writeFileSync(join(projects, "later-b.jsonl"), turn("unrelated question", "current answer from B"));
+    mocks.live = { ...mocks.live!, agent_status: "idle", agent_session: { kind: "id", id: "later-b" } };
+    // Delivery itself must revalidate the pinned identity, even without a watcher.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post).not.toHaveBeenCalled();
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "current answer from B");
+    expect(disposed).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("respects disabled terminal relaying on replacement, pending Slack turn=%s", async (pending) => {
     appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
     mocks.live = liveSession(oldPath, "idle");
