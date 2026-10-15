@@ -100,11 +100,18 @@ afterEach(async () => {
 });
 
 describe("Slack session routing — real observe loops", () => {
-  it("keeps a deferred reader and its first answer when initial session metadata arrives", async () => {
+  it.each([false, true])("keeps a deferred reader and its first answer, metadata before rollout=%s", async (metadataFirst) => {
     mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: undefined };
     const disposed = vi.spyOn(PaneAgent.prototype, "dispose");
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await mocks.client!.onUserMessage(thread, "U1", "first question", "2.0");
+    if (metadataFirst) {
+      mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "first-session" } };
+      mocks.screen = "old terminal history must not become an answer";
+      await vi.advanceTimersByTimeAsync(300);
+      expect(disposed).not.toHaveBeenCalled();
+      expect(mocks.post).not.toHaveBeenCalled();
+    }
     const sessions = join(dir, ".codex", "sessions");
     mkdirSync(sessions, { recursive: true });
     writeFileSync(join(sessions, "rollout-first-session.jsonl"), [
@@ -113,7 +120,7 @@ describe("Slack session routing — real observe loops", () => {
     ].map(({ role, text }) => JSON.stringify({
       type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
     })).join("\n") + "\n");
-    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "first-session" } };
+    mocks.live = { ...mocks.live!, agent_status: "idle", agent_session: { kind: "id", id: "first-session" } };
     await vi.advanceTimersByTimeAsync(300);
     expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "the complete first answer");
     await vi.advanceTimersByTimeAsync(5_000);
