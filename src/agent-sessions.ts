@@ -268,6 +268,8 @@ export function findClaudeSessionByPrompt(cwd: string | undefined, prompts: Iter
 export interface AgentOutputReader {
   /** Short identifier for logs ("scrape", "jsonl", "opencode-db"). */
   readonly kind: string;
+  /** The session actually selected by a deferred structured reader, if resolved. */
+  readonly session?: AgentSessionRef;
   /**
    * Return the latest output for this pane. Empty string when nothing is
    * available. Implementations MUST NOT throw; runtime read errors MUST
@@ -752,6 +754,10 @@ export class AgentCommunicator {
    */
   get readerKind(): string {
     return this.reader.kind;
+  }
+  /** The pinned session, not merely the latest metadata seen by its resolver. */
+  get readerSession(): AgentSessionRef {
+    return this.reader.session;
   }
   /** Whether the reader's text is the model's own, needing no pane filters. */
   get verbatim(): boolean {

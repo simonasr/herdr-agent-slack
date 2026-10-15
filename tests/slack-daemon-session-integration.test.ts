@@ -50,6 +50,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
 // PaneAgent, ObserveLoopController and the Pi reader are all real here.
 import { startSlackDaemon } from "../src/slack-daemon.js";
 import { PaneAgent } from "../src/pane-agent.js";
+import { sendText } from "../src/herdr-client.js";
 
 let dir: string;
 let oldPath: string;
@@ -117,6 +118,40 @@ describe("Slack session routing — real observe loops", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(disposed).not.toHaveBeenCalled();
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
+  it.each(["session-a", "session-b"])("checks a prompt-resolved deferred reader against the first reported identity %s", async (reported) => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "claude", agent_session: undefined, cwd: dir };
+    const disposed = vi.spyOn(PaneAgent.prototype, "dispose");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "a unique question for the deferred Claude reader", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    const projects = join(dir, ".claude", "projects", dir.replace(/[^A-Za-z0-9]/g, "-"));
+    mkdirSync(projects, { recursive: true });
+    const claudeTurn = (question: string, answer: string) =>
+      JSON.stringify({ type: "user", message: { role: "user", content: question } }) + "\n"
+      + JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: answer }] } }) + "\n";
+    const sessionA = join(projects, "session-a.jsonl");
+    writeFileSync(sessionA, claudeTurn(prompt, "answer from session A"));
+    mocks.live = { ...mocks.live!, agent_status: "working" };
+    // Resolve and cache A by prompt while herdr still has no session identity.
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    writeFileSync(join(projects, "session-b.jsonl"), claudeTurn("unrelated question", "answer from session B"));
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: reported } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, reported === "session-a" ? "answer from session A" : "answer from session B");
+    expect(disposed).toHaveBeenCalledTimes(reported === "session-a" ? 0 : 1);
+    mocks.post.mockClear();
+    appendFileSync(sessionA, claudeTurn("retired follow-up", "later output from session A"));
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    await vi.advanceTimersByTimeAsync(300);
+    if (reported === "session-b") {
+      expect(mocks.post).not.toHaveBeenCalledWith(thread, expect.stringContaining("session A"));
+    } else {
+      expect(mocks.post).toHaveBeenCalled();
+    }
   });
 
   it.each([false, true])("respects disabled terminal relaying on replacement, pending Slack turn=%s", async (pending) => {
