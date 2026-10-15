@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   panes: [] as Array<{ opts: PaneAgentOptions; dispose: ReturnType<typeof vi.fn>; active: boolean }>,
   post: vi.fn(async () => "answer-ts"),
   status: vi.fn(async () => {}),
+  react: vi.fn(async () => true),
 }));
 
 vi.mock("../src/herdr-client.js", async (original) => ({
@@ -30,7 +31,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
     stop = vi.fn(async () => {});
     post = mocks.post;
     setStatus = mocks.status;
-    react = vi.fn(async () => {});
+    react = mocks.react;
     unreact = vi.fn(async () => {});
     threadHistory = vi.fn(async () => []);
   },
@@ -57,6 +58,7 @@ vi.mock("../src/pane-agent.js", () => ({
 }));
 
 import { startSlackDaemon } from "../src/slack-daemon.js";
+import { getAgentInfo } from "../src/herdr-client.js";
 
 const thread = { channel: "C1", threadTs: "1.0" };
 let dir: string;
@@ -140,6 +142,65 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(mocks.panes).toHaveLength(2);
     expect(mocks.panes[1].active).toBe(status === "working");
     expect(mocks.post).toHaveBeenCalledWith(thread, "current answer");
+  });
+
+  it("rejects an old final when the delivery lookup discovers replacement", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const old = mocks.panes[0];
+    const original = mocks.live;
+    mocks.live = liveSession(sessionFile("new.jsonl", "replacement output"));
+    vi.mocked(getAgentInfo).mockImplementationOnce(() => original);
+    mocks.post.mockClear();
+    old.opts.emit({ type: "final", text: "retired output", source: "delta", reason: "idle" });
+    await flush();
+    expect(old.dispose).toHaveBeenCalledOnce();
+    expect(mocks.panes[1].active).toBe(true);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+  });
+
+  it.each(["replacement", "same session"])("stops a suspended old delivery from settling a new turn in %s", async (change) => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "old question", "2.0");
+    const old = mocks.panes[0];
+    let release!: (ts: string) => void;
+    mocks.post.mockClear();
+    mocks.post.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    // Enough prose to require multiple Slack posts. Only the in-flight one
+    // may survive replacement; remaining chunks and settlement must stop.
+    old.opts.emit({ type: "final", text: "old answer line\n".repeat(1500), source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledOnce();
+    if (change === "replacement") mocks.live = liveSession(sessionFile("new.jsonl", "replacement history"));
+    await mocks.client!.onUserMessage(thread, "U1", "new question", "3.0");
+    expect(mocks.panes.at(-1)!.active).toBe(true);
+    mocks.react.mockClear();
+    release("old-answer-ts");
+    await flush();
+    expect(mocks.post).toHaveBeenCalledOnce();
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    expect(state.marked["w1:p1"].ts).toBe("3.0");
+    expect(state.last_answer["w1:p1"]).toBeUndefined();
+    expect(state.delivered["w1:p1"]).toBeUndefined();
+    expect(mocks.react).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+  });
+
+  it("does not add a done reaction if a new turn starts while the old working reaction is removed", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "old question", "2.0");
+    let release!: (ok: boolean) => void;
+    mocks.react.mockImplementationOnce(() => new Promise<boolean>(resolve => { release = resolve; }));
+    mocks.panes[0].opts.emit({ type: "final", text: "old answer", source: "delta", reason: "idle" });
+    await flush();
+    expect(release).toBeTypeOf("function");
+    await mocks.client!.onUserMessage(thread, "U1", "new question", "3.0");
+    mocks.react.mockClear();
+    release(true);
+    await flush();
+    expect(mocks.react).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked["w1:p1"].ts).toBe("3.0");
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
   });
 
   it("withholds old output as soon as the live session changes, before the next tick", async () => {
