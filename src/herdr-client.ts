@@ -1,5 +1,5 @@
 import { spawnSync, spawn, type ChildProcess } from "./child-process.js";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { PaneInfo } from "./types.js";
@@ -208,6 +208,15 @@ export function readPane(paneId: string, lines: number): string {
   ]);
 }
 
+interface CompletionEvidence {
+  terminal_id: string;
+  state_change_seq: number;
+  completion_seq: number | null;
+  screen_detection_skipped: boolean;
+  launch_pending: boolean;
+  endpoint_identity: string;
+}
+
 export interface AgentInfo {
   agent: string;
   agent_status: string;
@@ -215,8 +224,75 @@ export interface AgentInfo {
   tab_id: string;
   workspace_id: string;
   agent_session?: AgentSessionRef;
+  /** Validated metadata only; not proof that a request or its output completed. */
+  completion_evidence?: CompletionEvidence;
   /** The pane's working directory. Roots `/file` path resolution. */
   cwd?: string;
+}
+
+function socketIdentity(path: string | undefined): string | undefined {
+  if (!path) return undefined;
+  try {
+    const stat = statSync(path, { bigint: true });
+    if (!stat.isSocket()) return undefined;
+    return `${stat.dev}:${stat.ino}:${stat.ctimeNs}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function nonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function safeCounter(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function completionEvidence(agent: any, endpointIdentity: string): CompletionEvidence | undefined {
+  if (
+    !nonemptyString(agent?.terminal_id) ||
+    !nonemptyString(agent?.agent) ||
+    !nonemptyString(agent?.pane_id) ||
+    !safeCounter(agent?.state_change_seq)
+  ) {
+    return undefined;
+  }
+
+  const session = agent.agent_session;
+  if (!session || typeof session !== "object" || Array.isArray(session) || !nonemptyString(session.value)) {
+    return undefined;
+  }
+  if (session.kind !== "path" && session.kind !== "id") return undefined;
+
+  const rawCompletion = agent.completion_seq;
+  let completionSeq: number | null = null;
+  if (rawCompletion !== undefined && rawCompletion !== null) {
+    if (
+      !safeCounter(rawCompletion) ||
+      rawCompletion === 0 ||
+      rawCompletion > agent.state_change_seq
+    ) {
+      return undefined;
+    }
+    completionSeq = rawCompletion;
+  }
+
+  if (
+    (agent.screen_detection_skipped !== undefined && typeof agent.screen_detection_skipped !== "boolean") ||
+    (agent.launch_pending !== undefined && typeof agent.launch_pending !== "boolean")
+  ) {
+    return undefined;
+  }
+
+  return {
+    terminal_id: agent.terminal_id,
+    state_change_seq: agent.state_change_seq,
+    completion_seq: completionSeq,
+    screen_detection_skipped: agent.screen_detection_skipped ?? false,
+    launch_pending: agent.launch_pending ?? false,
+    endpoint_identity: endpointIdentity,
+  };
 }
 
 /**
@@ -224,12 +300,30 @@ export interface AgentInfo {
  * Returns the parsed agent_info object or null if not found / not an agent.
  */
 export function getAgentInfo(target: string): AgentInfo | null {
+  const socketPath = process.env.HERDR_SOCKET_PATH;
+  const endpointBefore = socketIdentity(socketPath);
   let raw: string;
   try {
     raw = execHerdrJson(["agent", "get", target]);
   } catch {
     return null;
   }
+  return parseAgentInfo(raw, target, endpointBefore, socketIdentity(socketPath));
+}
+
+/** Nonblocking metadata for input preparation and observe-loop polling. */
+export async function getAgentInfoAsync(target: string): Promise<AgentInfo | null> {
+  const socketPath = process.env.HERDR_SOCKET_PATH;
+  const endpointBefore = socketIdentity(socketPath);
+  try {
+    const raw = await execHerdrAsync(["agent", "get", target], 30_000);
+    return parseAgentInfo(raw, target, endpointBefore, socketIdentity(socketPath));
+  } catch {
+    return null;
+  }
+}
+
+function parseAgentInfo(raw: string, target: string, endpointBefore: string | undefined, endpointAfter: string | undefined): AgentInfo | null {
   let parsed: any;
   try {
     parsed = JSON.parse(raw);
@@ -245,7 +339,7 @@ export function getAgentInfo(target: string): AgentInfo | null {
   } else if (s && s.kind === "id" && typeof s.value === "string") {
     session = { kind: "id", id: s.value };
   }
-  return {
+  const info: AgentInfo = {
     agent: a.agent ?? "?",
     agent_status: a.agent_status ?? "unknown",
     pane_id: String(a.pane_id ?? target),
@@ -254,6 +348,11 @@ export function getAgentInfo(target: string): AgentInfo | null {
     agent_session: session,
     cwd: typeof a.foreground_cwd === "string" ? a.foreground_cwd : undefined,
   };
+  if (endpointBefore && endpointBefore === endpointAfter) {
+    const evidence = completionEvidence(a, endpointBefore);
+    if (evidence) info.completion_evidence = evidence;
+  }
+  return info;
 }
 
 export function spawnDaemon(args: string[], herdrBinPath?: string): ChildProcess {

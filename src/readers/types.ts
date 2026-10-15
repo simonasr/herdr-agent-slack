@@ -1,6 +1,11 @@
 import type { AgentSessionRef, SqliteDriver, OpenCodeReadOptions } from "../agent-sessions.js";
 import type { Logger } from "../logger.js";
 
+export interface CompletedReaderTurn {
+  prompt: string;
+  text: string;
+}
+
 export interface AgentOutputReader {
   readonly kind: string;
   read(maxLines: number): string;
@@ -11,6 +16,9 @@ export interface AgentOutputReader {
   lastPrompt?(): string;
   /** The answer to that question alone, rather than the cumulative log. */
   lastAnswer?(): string;
+  /** Capture an append-only boundary; when supplied, the expected session must
+   *  match this reader's actual source or capture returns null. */
+  captureTurn?(expectedSession?: AgentSessionRef): (() => CompletedReaderTurn | null) | null;
   /**
    * The text is the model's own, byte for byte. A screen carries TUI chrome
    * and so, it turns out, does OpenCode's log; those go through the pane

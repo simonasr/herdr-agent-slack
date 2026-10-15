@@ -154,11 +154,21 @@ export interface ObserveLoopControllerDeps {
    */
   finalPayload?: "last-delta" | "full-turn";
   /**
+   * A ceiling continuation shares the communicator's existing diff baseline.
+   * Carry its undelivered full-turn output and retain the first read as new
+   * output instead of treating it as historical seed. Empty string resumes
+   * without carrying old output (streaming consumers already received it).
+   */
+  initialOutput?: string;
+  /**
    * Optional. Whether the agent is still working, per herdr. When it returns
    * true the idle gate cannot close, so a long quiet turn is not cut short.
    * Defaults to "no opinion" — the stability window decides alone.
    */
   isAgentBusy?: () => boolean;
+  /** One metadata observation shared by busy and completion checks for this poll. */
+  observe?: () => { agentBusy: boolean; completedOutput: string | null } |
+    Promise<{ agentBusy: boolean; completedOutput: string | null }>;
   /**
    * Optional hard ceiling on one turn, in ms. Guarantees termination even if
    * `isAgentBusy` never goes false (a wedged agent, or a stale herdr status).
@@ -187,8 +197,11 @@ export class ObserveLoopController {
   private readonly formatDelta: (chunk: string, elapsedMs: number) => string;
   private readonly formatWorkingTick: (elapsedMs: number) => string;
   private readonly finalPayload: "last-delta" | "full-turn";
+  private readonly initialOutput: string | undefined;
   private readonly isAgentBusy: () => boolean;
+  private readonly observe: NonNullable<ObserveLoopControllerDeps["observe"]>;
   private readonly maxTurnMs: number | null;
+  private ceilingOutput: { lastDeltaText: string; turnText: string } | null = null;
 
   /**
    * Stop-condition gates. `deadline=null` means "always reached" (used
@@ -203,6 +216,7 @@ export class ObserveLoopController {
    */
   private deadline: number | null = null;
   private waitUntilIdle: boolean = false;
+  private inputRevision = 0;
 
   /**
    * Abort latch. When non-null, the loop short-circuits to the final
@@ -232,7 +246,9 @@ export class ObserveLoopController {
       deps.formatWorkingTick ??
       ((elapsedMs) => `⏳ Working (${Math.floor(elapsedMs / 1000)}s).`);
     this.finalPayload = deps.finalPayload ?? "last-delta";
+    this.initialOutput = deps.initialOutput;
     this.isAgentBusy = deps.isAgentBusy ?? (() => false);
+    this.observe = deps.observe ?? (() => ({ agentBusy: this.isAgentBusy(), completedOutput: null }));
     this.maxTurnMs = deps.maxTurnMs ?? null;
     this.done = new Promise<void>((resolve) => {
       this.resolveDone = resolve;
@@ -246,8 +262,8 @@ export class ObserveLoopController {
    *
    * The very first action inside the loop is a single
    * `communicator.getNewOutput()` call which seeds the communicator's
-   * baseline. No event is emitted for that seed — the user has been
-   * watching the pane live and replaying would duplicate content.
+   * baseline. Fresh loops emit no event for that seed, avoiding historical
+   * replay. Ceiling continuations retain it as output from the ongoing turn.
    */
   start(): Promise<void> {
     if (this.started) return this.started;
@@ -272,11 +288,12 @@ export class ObserveLoopController {
   }
 
   /**
-   * A user message arrived during this turn. Toggles the idle gate on
-   * so the loop drains once the agent settles — even if a follow
-   * deadline is armed. Idempotent: calling twice is the same as once.
+   * A user message arrived during this turn. Enables the idle gate and
+   * invalidates observations/stability from before this dispatch, even when
+   * the idle gate was already enabled or a follow deadline is armed.
    */
   markUserInput(): void {
+    this.inputRevision++;
     this.waitUntilIdle = true;
   }
 
@@ -298,40 +315,51 @@ export class ObserveLoopController {
    */
   private async run(): Promise<void> {
     try {
-      // Baseline seed: one call to the communicator returns "" because
-      // it's the first call (and seeds `sentTail`). We deliberately do
-      // NOT treat this as an emission — historical content must never
-      // be replayed as "new".
+      // Fresh loops ignore their seed so history is not replayed. A ceiling
+      // continuation inherits the diff baseline: output since the last poll
+      // is new, even if it appeared while the busy/idle decision was pending.
       const seeded = this.communicator.getNewOutput();
-      void seeded; // baseline; intentionally ignored
+      let resumed = this.initialOutput === undefined ? "" : seeded;
 
       const startedAt = this.now();
       // lastChangeAt anchors the stability window. It is bumped every
       // time we observe unseen content; left untouched while the pane
       // is stable so the stability window can elapse.
       let lastChangeAt = startedAt;
+      let inputRevision = this.inputRevision;
       // lastDeltaText remembers the most recent non-empty chunk we
       // emitted as a delta. The final payload falls back to this when
       // the pane goes idle — it's the most recent content the user has
       // already seen on Telegram and acts as a durable recap.
-      let lastDeltaText = "";
+      let lastDeltaText = this.initialOutput ?? "";
       // turnText accumulates every byte of unseen output observed during
       // this turn, before chunking. It is the `finalPayload: "full-turn"`
       // payload — the complete answer for consumers that suppress deltas.
-      let turnText = "";
+      let turnText = this.initialOutput ?? "";
 
       while (true) {
         await this.sleep(this.progressIntervalMs);
 
         // Honour an abort that arrived during the sleep.
         if (this.aborted) {
+          // Preserve already-consumed output without reading or streaming again.
+          if (resumed) {
+            turnText += turnText ? `\n${resumed}` : resumed;
+            lastDeltaText = resumed;
+          }
           this.emitFinal("aborted", lastDeltaText, turnText);
           return;
         }
 
         const now = this.now();
+        if (inputRevision !== this.inputRevision) {
+          inputRevision = this.inputRevision;
+          lastChangeAt = now;
+        }
         const elapsedMs = now - startedAt;
-        const unseen = this.communicator.getNewOutput();
+        const fresh = this.communicator.getNewOutput();
+        const unseen = resumed && fresh ? `${resumed}\n${fresh}` : resumed || fresh;
+        resumed = "";
 
         if (unseen.length > 0) {
           turnText += turnText ? `\n${unseen}` : unseen;
@@ -374,15 +402,44 @@ export class ObserveLoopController {
           this.emitFinal("ceiling", lastDeltaText, turnText);
           return;
         }
+        // No proof survives a poll: a follow deadline can be added or a
+        // session can be replaced while the same controller is running.
+        const { agentBusy, completedOutput: completed } = await this.observe();
+        if (this.aborted) {
+          this.emitFinal("aborted", lastDeltaText, turnText);
+          return;
+        }
+        const checkedAt = this.now();
+        if (this.maxTurnMs !== null && checkedAt - startedAt >= this.maxTurnMs) {
+          this.emitFinal("ceiling", lastDeltaText, turnText);
+          return;
+        }
+        // Input dispatched during the query invalidates ordinary settling as
+        // well as completion proof. Abort and ceiling still take priority.
+        if (inputRevision !== this.inputRevision) {
+          inputRevision = this.inputRevision;
+          lastChangeAt = checkedAt;
+          continue;
+        }
         const state: StopState = {
+          // Query latency is not evidence that newly observed output settled.
           now,
           lastChangeAt,
           stabilityMs: this.stabilityMs,
           deadline: this.deadline,
           waitUntilIdle: this.waitUntilIdle,
-          agentBusy: this.isAgentBusy(),
+          agentBusy,
+          completionConfirmed: completed !== null && completed.trim().length > 0,
         };
         if (shouldStop(state)) {
+          // A stable fallback can grow while metadata is pending. Drain it
+          // before settling, then use the normal next tick to emit the suffix
+          // and restart stability. Proven completions and timer-only follows
+          // retain their existing stop rules.
+          if (this.waitUntilIdle && !state.completionConfirmed) {
+            resumed = this.communicator.getNewOutput();
+            if (resumed) continue;
+          }
           // Distinguish "idle" vs "deadline" in the final reason. The
           // single rule: if waitUntilIdle is true, the idle gate was
           // required, so the reason is "idle". Otherwise the timer
@@ -392,7 +449,7 @@ export class ObserveLoopController {
           const reason: "idle" | "deadline" = this.waitUntilIdle
             ? "idle"
             : "deadline";
-          this.emitFinal(reason, lastDeltaText, turnText);
+          this.emitFinal(reason, lastDeltaText, turnText, completed ?? undefined);
           return;
         }
       }
@@ -423,6 +480,23 @@ export class ObserveLoopController {
   }
 
   /**
+   * Rebuild an owned ceiling final after asynchronous busy/idle revalidation.
+   * Queued input must not change the prompt or diff baseline until this read.
+   */
+  refreshCeilingFinal(event: Extract<OutputEvent, { type: "final" }>): Extract<OutputEvent, { type: "final" }> {
+    const output = this.ceilingOutput;
+    if (event.reason !== "ceiling" || !output) return event;
+    this.ceilingOutput = null;
+    const unseen = this.communicator.getNewOutput();
+    if (unseen) {
+      output.turnText += output.turnText ? `\n${unseen}` : unseen;
+      // This suffix was never streamed, so the refreshed final must carry it.
+      output.lastDeltaText = unseen;
+    }
+    return this.buildFinal("ceiling", output.lastDeltaText, output.turnText);
+  }
+
+  /**
    * Build and emit the single terminal event.
    *
    * Payload rule:
@@ -443,10 +517,21 @@ export class ObserveLoopController {
     reason: "idle" | "deadline" | "ceiling" | "aborted",
     lastDeltaText: string,
     turnText: string,
+    confirmed?: string,
   ): void {
-    const observed = this.finalPayload === "full-turn"
+    if (reason === "ceiling") this.ceilingOutput = { lastDeltaText, turnText };
+    this.emit(this.buildFinal(reason, lastDeltaText, turnText, confirmed));
+  }
+
+  private buildFinal(
+    reason: "idle" | "deadline" | "ceiling" | "aborted",
+    lastDeltaText: string,
+    turnText: string,
+    confirmed?: string,
+  ): Extract<OutputEvent, { type: "final" }> {
+    const observed = confirmed ?? (this.finalPayload === "full-turn"
       ? this.turnPayload(turnText, lastDeltaText)
-      : lastDeltaText;
+      : lastDeltaText);
     let text: string;
     let source: "delta" | "snapshot" = "delta";
     if (observed.trim().length > 0) {
@@ -476,6 +561,6 @@ export class ObserveLoopController {
             : latest;
       }
     }
-    this.emit({ type: "final", text, reason, source });
+    return { type: "final", text, reason, source };
   }
 }

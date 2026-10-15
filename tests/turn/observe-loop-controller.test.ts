@@ -79,6 +79,8 @@ function makeEnv(opts: {
   formatDelta?: (chunk: string, elapsedMs: number) => string;
   formatWorkingTick?: (elapsedMs: number) => string;
   finalPayload?: "last-delta" | "full-turn";
+  completedOutput?: () => string | null | Promise<string | null>;
+  maxTurnMs?: number;
 }) {
   const progressIntervalMs = opts.progressIntervalMs ?? 100;
   const stabilityMs = opts.stabilityMs ?? 100;
@@ -108,6 +110,8 @@ function makeEnv(opts: {
     formatDelta: opts.formatDelta,
     formatWorkingTick: opts.formatWorkingTick,
     finalPayload: opts.finalPayload,
+    observe: opts.completedOutput ? async () => ({ agentBusy: false, completedOutput: await opts.completedOutput!() }) : undefined,
+    maxTurnMs: opts.maxTurnMs,
   });
 
   return {
@@ -455,6 +459,149 @@ describe("ObserveLoopController — final payload fallback", () => {
     expect(finals).toHaveLength(1);
     // Final payload must be capped to MAX_CHUNK_TOTAL.
     expect(finals[0]?.text.length).toBeLessThanOrEqual(MAX_CHUNK_TOTAL);
+  });
+});
+
+describe("ObserveLoopController — same-poll proof priority", () => {
+  it.each([null, "stale confirmed answer"])("ignores a pre-input observation (%s) and resets stability", async staleProof => {
+    let resolve!: (proof: string | null) => void;
+    let calls = 0;
+    const query = new Promise<string | null>(r => { resolve = r; });
+    const env = makeEnv({
+      snapshots: ["old answer", "old answer", "old answer", "old answer\nsecond answer"],
+      finalPayload: "full-turn", stabilityMs: 1_000,
+      completedOutput: () => ++calls === 1 ? query : null,
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    env.clock.advance(1_000); // the previous output is already stable
+    expect(env.step()).toBe(true);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(calls).toBe(1);
+
+    env.controller.markUserInput(); // another dispatch during the observation
+    env.clock.advance(5_000);
+    resolve(staleProof);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(0);
+    expect(env.step()).toBe(true);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(0);
+    await env.drive();
+    await run;
+    expect(env.events.filter(event => event.type === "final")).toMatchObject([
+      { text: "second answer", reason: "idle" },
+    ]);
+  });
+
+  it("resets old stability when a new input arrives during sleep", async () => {
+    const env = makeEnv({ snapshots: ["old answer"], stabilityMs: 1_000 });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    env.clock.advance(1_000);
+    env.controller.markUserInput();
+    expect(env.step()).toBe(true);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(0);
+    await env.drive();
+    await run;
+    expect(env.events.filter(event => event.type === "final")).toHaveLength(1);
+  });
+
+  it("does not count slow failed proof lookup as stability for newly observed partial output", async () => {
+    let resolve!: (proof: string | null) => void;
+    let calls = 0;
+    const query = new Promise<string | null>(r => { resolve = r; });
+    const env = makeEnv({
+      snapshots: ["old", "old\npartial", "old\npartial\nfinished"],
+      finalPayload: "full-turn", stabilityMs: 1_000,
+      completedOutput: () => ++calls === 1 ? query : null,
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    env.step();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(e => e.type === "delta").map(e => e.text.trim())).toEqual(["partial"]);
+    env.clock.advance(5_000); // metadata latency, not observed output stability
+    resolve(null);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(env.events.filter(e => e.type === "final")).toHaveLength(0);
+    await env.drive();
+    await run;
+    expect(env.events.filter(e => e.type === "final")).toMatchObject([
+      { text: "partial\nfinished", reason: "idle" },
+    ]);
+  });
+
+  it.each(["aborted", "ceiling"] as const)("retains %s priority across an awaited metadata query", async reason => {
+    let resolve!: (proof: string | null) => void;
+    let entered = false;
+    const query = new Promise<string | null>(r => { resolve = r; });
+    const env = makeEnv({
+      snapshots: ["fallback answer"], finalPayload: "full-turn", stabilityMs: 30_000,
+      maxTurnMs: 1_000,
+      completedOutput: () => { entered = true; return query; },
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    env.step();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(entered).toBe(true);
+    env.controller.markUserInput(); // stale input must not outrank abort/ceiling
+    if (reason === "aborted") env.controller.abort();
+    env.clock.advance(1_000); // abort also wins when both become eligible
+    resolve("confirmed answer that must not be delivered");
+    await run;
+    expect(env.events.filter(e => e.type === "final")).toEqual([
+      { type: "final", text: "fallback answer", reason, source: "snapshot" },
+    ]);
+  });
+  it("lets an abort during proof extraction override the confirmed payload", async () => {
+    let proofCalls = 0;
+    const env = makeEnv({
+      snapshots: ["fallback answer"],
+      finalPayload: "full-turn",
+      stabilityMs: 30_000,
+      completedOutput: () => {
+        proofCalls++;
+        env.controller.abort();
+        return "confirmed answer that must not be delivered";
+      },
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    expect(proofCalls).toBe(0);
+    expect(env.step()).toBe(true);
+    await run;
+    expect(proofCalls).toBe(1);
+    expect(env.events.filter(event => event.type === "final")).toEqual([
+      { type: "final", text: "fallback answer", reason: "aborted", source: "snapshot" },
+    ]);
+  });
+
+  it("lets a ceiling reached during proof extraction override the confirmed payload", async () => {
+    let proofCalls = 0;
+    const env = makeEnv({
+      snapshots: ["fallback answer"],
+      finalPayload: "full-turn",
+      stabilityMs: 30_000,
+      maxTurnMs: 1_000,
+      completedOutput: () => {
+        proofCalls++;
+        env.clock.advance(1_000);
+        return "confirmed answer that must not be delivered";
+      },
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    expect(env.clock.now()).toBe(0);
+    expect(env.step()).toBe(true); // 100ms: the initial ceiling check cannot end the loop
+    await run;
+    expect(proofCalls).toBe(1);
+    expect(env.clock.now()).toBe(1_100);
+    expect(env.events.filter(event => event.type === "final")).toEqual([
+      { type: "final", text: "fallback answer", reason: "ceiling", source: "snapshot" },
+    ]);
   });
 });
 
