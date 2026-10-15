@@ -185,34 +185,40 @@ export class PaneAgent {
     return completionSample(await this.metadata(), this.opts.paneId);
   }
 
-  /** A bad observation disables this turn, never just this poll. */
-  private async completedOutput(generation: number, info: AgentInfo | null): Promise<string | null> {
+  /** A bad observation disables this turn's proof, never just this poll. */
+  private async observeCompletion(generation: number, info: AgentInfo | null): Promise<{
+    agentBusy: boolean; completedOutput: string | null;
+  }> {
+    const observed = { agentBusy: info?.agent_status === "working", completedOutput: null };
     const turn = this.fastTurn;
-    if (!turn || turn.generation !== generation) return null;
+    if (!turn || turn.generation !== generation) return observed;
     const current = completionSample(info, this.opts.paneId);
     if (!current || !sameIdentity(turn.baseline, current) ||
         current.state < turn.latest.state ||
         (turn.latest.completion !== null &&
           (current.completion === null || current.completion < turn.latest.completion))) {
       this.fastTurn = null;
-      return null;
+      return observed;
     }
-    if (this.fastTurn !== turn || this.turnGeneration !== generation) return null;
+    if (this.fastTurn !== turn || this.turnGeneration !== generation) return observed;
     turn.latest = current;
     if (!settled(current.status) || current.completion !== current.state ||
-        current.state <= turn.baseline.state) return null;
+        current.state <= turn.baseline.state) return observed;
     let text: string | null;
     try { text = turn.read(); } catch { text = null; }
-    if (this.fastTurn !== turn || this.turnGeneration !== generation || !text?.trim()) return null;
-    const after = await this.sample();
+    if (this.fastTurn !== turn || this.turnGeneration !== generation || !text?.trim()) return observed;
+    const afterInfo = await this.metadata();
+    const after = completionSample(afterInfo, this.opts.paneId);
+    // Busy status belongs to the freshest read even when its proof is invalid.
+    const revalidated = { agentBusy: afterInfo?.agent_status === "working", completedOutput: null };
     // An input or stop may have replaced the proof while metadata was pending.
-    if (this.fastTurn !== turn || this.turnGeneration !== generation) return null;
+    if (this.fastTurn !== turn || this.turnGeneration !== generation) return revalidated;
     if (!after || !sameIdentity(current, after) || !settled(after.status) ||
         after.state !== current.state || after.completion !== current.completion) {
       this.fastTurn = null;
-      return null;
+      return revalidated;
     }
-    return this.fastTurn === turn && this.turnGeneration === generation ? text : null;
+    return { ...revalidated, completedOutput: text };
   }
   /**
    * Whether the turn under way was started in the pane rather than the chat.
@@ -619,13 +625,9 @@ export class PaneAgent {
       finalPayload: this.opts.config.outputMode === "final" ? "full-turn" : "last-delta",
       initialOutput: opts.initialOutput,
       isAgentBusy: this.opts.isAgentBusy,
-      observe: this.opts.getCompletionInfo ? async () => {
-        const info = await this.metadata();
-        return {
-          agentBusy: info?.agent_status === "working",
-          completedOutput: fast ? await this.completedOutput(generation, info) : null,
-        };
-      } : undefined,
+      observe: this.opts.getCompletionInfo
+        ? async () => this.observeCompletion(generation, await this.metadata())
+        : undefined,
       maxTurnMs: this.opts.config.maxTotalWaitS * 1000,
     });
     controller.updateDeadline(opts.deadline);
