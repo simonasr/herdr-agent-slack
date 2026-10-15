@@ -11,6 +11,7 @@ import {
   herdrBin,
   resetHerdrBinCache,
   getAgentInfo,
+  getAgentInfoAsync,
 } from "../src/herdr-client.js";
 
 describe("herdrBin resolution", () => {
@@ -145,7 +146,7 @@ describe("getAgentInfo", () => {
     else process.env[name] = value;
   }
 
-  function configureCli(stdout: string, options: { exitCode?: number; replaceSocket?: boolean } = {}): void {
+  function configureCli(stdout: string, options: { exitCode?: number; replaceSocket?: boolean; delayMs?: number } = {}): void {
     writeFileSync(configPath, JSON.stringify({ stdout, ...options, socketPath }));
   }
 
@@ -191,7 +192,7 @@ describe("getAgentInfo", () => {
     configPath = join(tmpDir, "cli-config.json");
     argsPath = join(tmpDir, "cli-args.json");
     socketPath = join(tmpDir, "herdr.sock");
-    const executable = `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst net = require("node:net");\nconst config = JSON.parse(fs.readFileSync(${JSON.stringify(configPath)}, "utf8"));\nfs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)));\nconst finish = () => process.stdout.write(config.stdout, () => process.exit(config.exitCode ?? 0));\nif (config.replaceSocket) {\n  fs.renameSync(config.socketPath, config.socketPath + ".previous");\n  const server = net.createServer();\n  server.once("error", () => process.exit(2));\n  server.listen(config.socketPath, finish);\n} else finish();\n`;
+    const executable = `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst net = require("node:net");\nconst config = JSON.parse(fs.readFileSync(${JSON.stringify(configPath)}, "utf8"));\nfs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)));\nconst finish = () => setTimeout(() => process.stdout.write(config.stdout, () => process.exit(config.exitCode ?? 0)), config.delayMs ?? 0);\nif (config.replaceSocket) {\n  fs.renameSync(config.socketPath, config.socketPath + ".previous");\n  const server = net.createServer();\n  server.once("error", () => process.exit(2));\n  server.listen(config.socketPath, finish);\n} else finish();\n`;
     writeFileSync(fakeBin, executable);
     chmodSync(fakeBin, 0o755);
     process.env.HERDR_BIN_PATH = fakeBin;
@@ -209,6 +210,56 @@ describe("getAgentInfo", () => {
     restoreEnv("HERDR_BIN_PATH", originalBinEnv);
     restoreEnv("HERDR_SOCKET_PATH", originalSocketEnv);
     resetHerdrBinCache();
+  });
+
+  it("fetches metadata with a real asynchronous child without blocking event-loop timers", async () => {
+    await startSocket();
+    configureCli(JSON.stringify({ result: { agent: validAgent({
+      state_change_seq: 8, completion_seq: 8, screen_detection_skipped: true, launch_pending: false,
+    }) } }), { delayMs: 200 });
+    let settled = false;
+    const query = getAgentInfoAsync(target).then(info => { settled = true; return info; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(settled).toBe(false); // would fail if agent get used spawnSync
+    const info = await query;
+    expect(info).toMatchObject({
+      agent: "pi", pane_id: target, agent_session: { kind: "path", path: "/sessions/current.jsonl" },
+      completion_evidence: {
+        endpoint_identity: socketIdentity(socketPath), state_change_seq: 8, completion_seq: 8,
+        screen_detection_skipped: true, launch_pending: false,
+      },
+    });
+    expect(JSON.parse(readFileSync(argsPath, "utf8"))).toEqual(["agent", "get", target]);
+  });
+
+  it("withholds asynchronous evidence after endpoint replacement", async () => {
+    await startSocket();
+    configureCli(JSON.stringify({ result: { agent: validAgent() } }), { replaceSocket: true });
+    const info = await getAgentInfoAsync(target);
+    expect(info).toMatchObject({ agent: "pi", pane_id: target });
+    expect(info).not.toHaveProperty("completion_evidence");
+  });
+
+  it("keeps asynchronous metadata but no proof for an unavailable endpoint", async () => {
+    const info = await getAgentInfoAsync(target);
+    expect(info).toMatchObject({ agent: "pi", pane_id: target });
+    expect(info).not.toHaveProperty("completion_evidence");
+  });
+
+  it.each([
+    ["CLI failure", JSON.stringify({ result: { agent: { agent: "pi" } } }), 1],
+    ["malformed JSON", "not json", 0],
+    ["missing agent", JSON.stringify({ result: {} }), 0],
+  ])("returns null for asynchronous %s", async (_label, stdout, exitCode) => {
+    configureCli(stdout, { exitCode });
+    expect(await getAgentInfoAsync(target)).toBeNull();
+  });
+
+  it("returns null for asynchronous process launch failure", async () => {
+    // Cache an existing path, then remove it to exercise spawn's error event.
+    herdrBin();
+    rmSync(fakeBin);
+    expect(await getAgentInfoAsync(target)).toBeNull();
   });
 
   it("returns ordinary metadata and exact normalized evidence for a stable socket", async () => {

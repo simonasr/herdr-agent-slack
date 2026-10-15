@@ -783,8 +783,15 @@ describe("PaneAgent — getLastOutput", () => {
   });
 });
 
+async function flushMicrotasks() {
+  for (let i = 0; i < 30; i++) await Promise.resolve();
+}
+
 /** Metadata and reader are independent: neither one alone can close a turn. */
-function completionEnv(opts: { mode?: "final" | "stream"; capture?: boolean; sync?: boolean } = {}) {
+function completionEnv(opts: {
+  mode?: "final" | "stream"; capture?: boolean; sync?: boolean; maxTotalWaitS?: number;
+  metadata?: (info: AgentInfo | null, call: number) => AgentInfo | null | Promise<AgentInfo | null>;
+} = {}) {
   let info: AgentInfo | null = {
     agent: "pi", agent_status: "idle", pane_id: "w1:p1", tab_id: "t", workspace_id: "w",
     agent_session: { kind: "path", path: "/tmp/session.jsonl" },
@@ -796,6 +803,7 @@ function completionEnv(opts: { mode?: "final" | "stream"; capture?: boolean; syn
   let answer: string | null = null;
   let mismatched = false;
   let throwInfo = false;
+  let metadataCalls = 0;
   let captured = 0;
   let sent = 0;
   const reader: AgentOutputReader = {
@@ -823,10 +831,15 @@ function completionEnv(opts: { mode?: "final" | "stream"; capture?: boolean; syn
   const events: OutputEvent[] = [];
   const pending: Array<() => void> = [];
   let now = 0;
-  const config = makeConfig({ outputMode: opts.mode ?? "final", progressIntervalMs: 2000, stabilityWindowMs: 30000 });
+  const config = makeConfig({ outputMode: opts.mode ?? "final", progressIntervalMs: 2000,
+    stabilityWindowMs: 30000, ...(opts.maxTotalWaitS === undefined ? {} : { maxTotalWaitS: opts.maxTotalWaitS }) });
   const agent = new PaneAgent({
     paneId: "w1:p1", communicator: comm, config,
-    getCompletionInfo: () => { if (throwInfo) throw new Error("metadata unavailable"); return info; },
+    getCompletionInfo: () => {
+      metadataCalls++;
+      if (throwInfo) throw new Error("metadata unavailable");
+      return opts.metadata ? opts.metadata(info, metadataCalls) : info;
+    },
     isAgentBusy: () => info?.agent_status === "working",
     emit: (event) => events.push(event),
     deps: { now: () => now, sleep: () => new Promise<void>(resolve => pending.push(resolve)) },
@@ -843,23 +856,247 @@ function completionEnv(opts: { mode?: "final" | "stream"; capture?: boolean; syn
     expect(pending.length).toBeGreaterThan(0);
     now += 2000;
     pending.shift()!();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushMicrotasks();
   }
   return {
     agent, comm, events, change, complete, tick, setAnswer: (text: string | null) => { answer = text; },
     setInfo: (value: AgentInfo | null) => { info = value; },
     getInfo: () => info!, captured: () => captured, sent: () => sent,
+    metadataCalls: () => metadataCalls,
     mismatch: () => { mismatched = true; }, throwMetadata: () => { throwInfo = true; },
     restoreMetadata: () => { throwInfo = false; },
     finals: () => events.filter(e => e.type === "final"),
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+describe("PaneAgent — asynchronous metadata and turn ownership", () => {
+  it("falls back after an asynchronous metadata rejection and still sends once", async () => {
+    const e = completionEnv({ metadata: () => Promise.reject(new Error("unavailable")) });
+    await e.agent.handleMessage("ask");
+    expect(e.sent()).toBe(1);
+    expect(e.captured()).toBe(0);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("uses nonblocking fresh metadata to continue a working pane at the ceiling", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    expect(e.metadataCalls()).toBe(3);
+    expect(e.finals()).toHaveLength(0);
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+  });
+
+  it("does not restart a stopped pane when ceiling metadata arrives late", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    expect(e.metadataCalls()).toBe(3);
+    e.agent.stop();
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(false);
+    expect(e.finals()).toHaveLength(0);
+  });
+
+  it("does not revive an old ceiling after a replacement follow has already finished", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    expect(e.metadataCalls()).toBe(3);
+    const oldWorking = e.getInfo();
+    e.change({ agent_status: "idle" });
+    e.agent.enableFollow(3_000);
+    await e.tick();
+    expect(e.agent.isLoopActive()).toBe(false);
+    expect(e.finals()).toHaveLength(1);
+    ceiling.resolve(oldWorking);
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(false);
+    expect(e.finals()).toHaveLength(1);
+  });
+
+  it("lets a new message proceed after stop without waiting for canceled preparation", async () => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const canceled = e.agent.handleMessage("canceled");
+    await flushMicrotasks();
+    e.agent.stop();
+    await e.agent.handleMessage("ask");
+    expect(e.sent()).toBe(1);
+    expect(e.captured()).toBe(1);
+    baseline.resolve(null);
+    await canceled;
+    e.setAnswer("new turn");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "idle", text: "new turn" }]);
+    expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["ask"]);
+  });
+
+  it("shares one poll sample and only revalidates after a reader candidate", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    expect(e.metadataCalls()).toBe(2);
+    await e.tick(); // no completion, no reader candidate
+    expect(e.metadataCalls()).toBe(3);
+    e.complete();
+    await e.tick(); // metadata complete, but no persisted reader output
+    expect(e.metadataCalls()).toBe(4);
+    e.setAnswer("ready");
+    await e.tick();
+    expect(e.metadataCalls()).toBe(6); // shared observation + fresh post-reader check
+    expect(e.finals()).toMatchObject([{ text: "ready", reason: "idle" }]);
+  });
+
+  it("skips the second pre-dispatch sample when capture has no proof", async () => {
+    const e = completionEnv({ capture: false });
+    await e.agent.handleMessage("ask");
+    expect(e.metadataCalls()).toBe(1);
+    expect(e.sent()).toBe(1);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("queues input in arrival order and invalidates proof before preparation finishes", async () => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const first = e.agent.handleMessage("ask");
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.agent.noteExternalTurn()).toBe(false);
+    const second = e.agent.handleMessage("second");
+    expect(e.sent()).toBe(0);
+    baseline.resolve(e.getInfo());
+    await Promise.all([first, second]);
+    expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["ask", "second"]);
+    expect(e.captured()).toBe(0);
+    e.setAnswer("must settle normally");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["stop", "dispose"] as const)("%s cancels all pending input before dispatch", async action => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const first = e.agent.handleMessage("ask");
+    await flushMicrotasks();
+    const second = e.agent.handleMessage("second");
+    e.agent[action]();
+    expect(e.agent.isLoopActive()).toBe(false);
+    baseline.resolve(e.getInfo());
+    await Promise.all([first, second]);
+    expect(e.sent()).toBe(0);
+    expect(e.captured()).toBe(0);
+    expect(e.finals()).toHaveLength(0);
+    if (action === "dispose") {
+      await e.agent.handleMessage("after disposal");
+      e.agent.enableFollow(60_000);
+      expect(e.sent()).toBe(0);
+      expect(e.agent.isLoopActive()).toBe(false);
+    }
+  });
+
+  it("preserves follow/unfollow while preparation is in flight without arming proof", async () => {
+    const baseline = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 1 ? baseline.promise : info });
+    const input = e.agent.handleMessage("ask");
+    await flushMicrotasks();
+    e.agent.enableFollow(60_000);
+    baseline.resolve(e.getInfo());
+    await input;
+    expect(e.agent.isFollowing()).toBe(true);
+    expect(e.captured()).toBe(0);
+    e.agent.disableFollow();
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0); // user input retained the idle gate
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("invalidates proof immediately while a poll's metadata is pending", async () => {
+    const poll = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 3 ? poll.promise : info });
+    await e.agent.handleMessage("ask");
+    e.setAnswer("old turn proof");
+    e.complete();
+    await e.tick(); // enters suspended metadata
+    await e.agent.handleMessage("second");
+    poll.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.sent()).toBe(2);
+    expect(e.finals()).toHaveLength(0);
+    expect(e.metadataCalls()).toBe(3); // no post-reader query for invalid proof
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("does not let an old aborted final erase a new turn's proof", async () => {
+    const e = completionEnv();
+    await e.agent.handleMessage("ask");
+    e.agent.stop();
+    await e.agent.handleMessage("ask");
+    e.setAnswer("new answer");
+    e.complete();
+    await e.tick(); // old controller's aborted final arrives after new capture
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }, { reason: "idle", text: "new answer" }]);
+  });
+
+  it("rejects stale post-reader revalidation without clearing replacement proof", async () => {
+    const revalidation = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === 4 ? revalidation.promise : info });
+    await e.agent.handleMessage("ask");
+    e.setAnswer("old candidate");
+    e.complete();
+    await e.tick(); // suspended after reading the candidate
+    expect(e.metadataCalls()).toBe(4);
+    e.agent.stop();
+    await e.agent.handleMessage("ask");
+    revalidation.resolve(null);
+    await flushMicrotasks();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+    e.setAnswer("new answer");
+    e.complete(16);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }, { reason: "idle", text: "new answer" }]);
+  });
+});
+
 describe("PaneAgent — completion-aware final polling", () => {
   it("delivers a fresh full turn at the next 2s poll, with no historical output", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.setAnswer("current full turn\nsecond line");
     e.complete();
@@ -871,7 +1108,7 @@ describe("PaneAgent — completion-aware final polling", () => {
   it("rejects a cached old reader when current metadata already names a new session", async () => {
     const e = completionEnv();
     e.change({ agent_session: { kind: "path", path: "/tmp/new-session.jsonl" } });
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(0); // wrong selected source cannot affirm current metadata
     e.setAnswer("stale reader answer");
     e.complete();
@@ -884,7 +1121,7 @@ describe("PaneAgent — completion-aware final polling", () => {
   it("captures a copied source before dispatch, not a mutable metadata session", async () => {
     const e = completionEnv();
     const capture = vi.spyOn(e.comm, "captureCompletedResponse");
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     const source = capture.mock.calls[0]?.[1];
     expect(source).toEqual({ kind: "path", path: "/tmp/session.jsonl" });
@@ -901,7 +1138,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("does not swallow completion that lands synchronously during sendInput and before seed", async () => {
     const e = completionEnv({ sync: true });
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     await e.tick();
     expect(e.finals()).toMatchObject([{ text: "new synchronous answer", source: "delta" }]);
@@ -909,7 +1146,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("accepts a missed working status and a large state counter gap, not stale idle", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     e.setAnswer("new");
     e.change({ agent_status: "done" }); // presentation change, not a new completion
     await e.tick();
@@ -921,7 +1158,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("rejects a complete old/mismatched user boundary instead of replaying it", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.setAnswer("old answer");
     e.mismatch();
@@ -934,7 +1171,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("a metadata read error disables the fast path for the rest of the turn", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.throwMetadata();
     await e.tick();
@@ -950,7 +1187,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("waits for persisted current-request output even after fresh metadata", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     e.complete();
     await e.tick();
     expect(e.finals()).toHaveLength(0);
@@ -963,7 +1200,7 @@ describe("PaneAgent — completion-aware final polling", () => {
     for (const opts of [{ capture: false }, { mode: "stream" as const }, {}]) {
       const e = completionEnv(opts);
       if (!Object.keys(opts).length) e.setInfo(null);
-      e.agent.handleMessage("ask");
+      await e.agent.handleMessage("ask");
       expect(e.captured()).toBe(0);
       e.setAnswer("ready");
       if (e.getInfo()) e.complete();
@@ -979,7 +1216,7 @@ describe("PaneAgent — completion-aware final polling", () => {
       const e = completionEnv();
       if (invalid === "evidence") e.setInfo({ ...e.getInfo(), completion_evidence: undefined });
       else e.change({ agent_session: { kind: "path", path: "" } });
-      e.agent.handleMessage("ask");
+      await e.agent.handleMessage("ask");
       expect(e.captured()).toBe(0);
       e.setAnswer("ready");
       await e.tick();
@@ -997,7 +1234,7 @@ describe("PaneAgent — completion-aware final polling", () => {
       e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 1 } });
       return read;
     });
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.setAnswer("old");
     e.complete();
@@ -1009,7 +1246,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it.each(["working", "blocked", "unknown"])("never affirms %s status", async status => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.setAnswer("ready");
     e.complete();
@@ -1024,7 +1261,7 @@ describe("PaneAgent — completion-aware final polling", () => {
     const e = completionEnv();
     e.change({ completion_evidence: { ...e.getInfo().completion_evidence!,
       ...(flag === "screen" ? { screen_detection_skipped: false } : { launch_pending: true }) } });
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(0);
     e.setAnswer("ready");
     e.complete();
@@ -1038,7 +1275,7 @@ describe("PaneAgent — completion-aware final polling", () => {
     "permanently disables fast completion after %s replacement or regression", async field => {
       const e = completionEnv();
       if (field === "regression") e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 2 } });
-      e.agent.handleMessage("ask");
+      await e.agent.handleMessage("ask");
       expect(e.captured()).toBe(1);
       const prior = e.getInfo();
       if (field === "agent") e.change({ agent: "omp" });
@@ -1062,7 +1299,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("disables the turn after an observed completion counter regresses", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.complete(8);
     await e.tick(); // no output yet; remember completion 8
@@ -1084,7 +1321,7 @@ describe("PaneAgent — completion-aware final polling", () => {
       const read = original(text);
       return read && (() => { e.agent.handleMessage("second"); return read(); });
     });
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.setAnswer("stale proof");
     e.complete();
@@ -1104,7 +1341,7 @@ describe("PaneAgent — completion-aware final polling", () => {
       const read = original(text);
       return read && (() => { const result = read(); e.complete(9); return result; });
     });
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.setAnswer("ready");
     e.complete();
@@ -1119,9 +1356,9 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("coalesces a normal second message permanently into fallback, without resending", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
-    e.agent.handleMessage("second");
+    await e.agent.handleMessage("second");
     expect(e.sent()).toBe(2);
     e.setAnswer("new");
     e.complete();
@@ -1134,7 +1371,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it.each(["stop", "dispose"] as const)("%s invalidates proof and emits only an aborted final", async action => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(1);
     e.setAnswer("ready");
     e.complete();
@@ -1147,7 +1384,7 @@ describe("PaneAgent — completion-aware final polling", () => {
   it("a follow-only loop stays fallback-only when it receives a new input", async () => {
     const e = completionEnv();
     e.agent.enableFollow(60_000);
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     expect(e.captured()).toBe(0);
     e.setAnswer("ready");
     e.complete();
@@ -1159,13 +1396,13 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("preserves one final per distinct user boundary even when answers have equal bytes", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     e.setAnswer("same");
     e.complete(8);
     await e.tick();
     expect(e.finals()).toHaveLength(1);
     await Promise.resolve(); // done auto-clears the old controller
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     e.complete(80);
     await e.tick();
     expect(e.finals()).toHaveLength(2);
@@ -1175,7 +1412,7 @@ describe("PaneAgent — completion-aware final polling", () => {
 
   it("holds a future follow deadline and revalidates proof at the deadline", async () => {
     const e = completionEnv();
-    e.agent.handleMessage("ask");
+    await e.agent.handleMessage("ask");
     e.agent.enableFollow(6000);
     e.setAnswer("ready");
     e.complete();
