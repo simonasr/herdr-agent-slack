@@ -918,6 +918,86 @@ describe("PaneAgent — asynchronous metadata and turn ownership", () => {
     expect(e.agent.isLoopActive()).toBe(false);
   });
 
+  it.each([
+    { anchored: true, partial: "first part" },
+    { anchored: false, partial: "first part" },
+    { anchored: true, partial: "" },
+    { anchored: false, partial: "" },
+  ])("drains idle ceiling output before queued input (anchored=$anchored, partial='$partial')", async ({ anchored, partial }) => {
+    const ceiling = deferred<AgentInfo | null>();
+    let prompt = "first";
+    let answer = "";
+    let transcript = "";
+    const e = completionEnv({ maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => transcript,
+        ...(anchored ? { lastPrompt: () => prompt, lastAnswer: () => answer } : {}) },
+      metadata: (info, call) => call === 2 ? ceiling.promise : info });
+    await e.agent.handleMessage("first");
+    answer = transcript = partial;
+    await e.tick();
+    expect(e.metadataCalls()).toBe(2);
+    expect(e.finals()).toHaveLength(0);
+
+    answer = transcript = partial ? `${partial}\nlate suffix` : "late suffix";
+    const second = e.agent.handleMessage("second");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    ceiling.resolve(e.getInfo());
+    await second;
+    const firstAnswer = answer;
+    expect(e.finals()).toMatchObject([{ text: firstAnswer, source: "delta" }]);
+    expect(e.sent()).toBe(2);
+
+    prompt = "second";
+    answer = "second answer";
+    transcript += "\n" + answer;
+    await e.tick();
+    expect(e.finals().map(event => event.text)).toEqual([firstAnswer, "second answer"]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it.each(["stop", "dispose"] as const)("honors %s reentrancy during the idle ceiling drain", async action => {
+    const ceiling = deferred<AgentInfo | null>();
+    let draining = false;
+    let transcript = "";
+    const e = completionEnv({ maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => {
+        if (draining) e.agent[action]();
+        return transcript;
+      } },
+      metadata: (info, call) => call === 2 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "partial";
+    await e.tick();
+    const next = e.agent.handleMessage("canceled");
+    await flushMicrotasks();
+    draining = true;
+    transcript += "\nsuffix";
+    ceiling.resolve(e.getInfo());
+    await next;
+    expect(e.finals()).toHaveLength(0);
+    expect(e.sent()).toBe(1);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it("keeps an idle ceiling suffix that was not streamed in the refreshed final", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    let transcript = "";
+    const e = completionEnv({ mode: "stream", maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => transcript },
+      metadata: (info, call) => call === 1 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    transcript = "streamed part";
+    await e.tick();
+    transcript += "\nlate suffix";
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["streamed part"]);
+    expect(e.finals().map(event => event.text.trim())).toEqual(["late suffix"]);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
   it("falls back after an asynchronous metadata rejection and still sends once", async () => {
     const e = completionEnv({ metadata: () => Promise.reject(new Error("unavailable")) });
     await e.agent.handleMessage("ask");

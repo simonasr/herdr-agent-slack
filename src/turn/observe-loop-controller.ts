@@ -201,6 +201,7 @@ export class ObserveLoopController {
   private readonly isAgentBusy: () => boolean;
   private readonly observe: NonNullable<ObserveLoopControllerDeps["observe"]>;
   private readonly maxTurnMs: number | null;
+  private ceilingOutput: { lastDeltaText: string; turnText: string } | null = null;
 
   /**
    * Stop-condition gates. `deadline=null` means "always reached" (used
@@ -452,6 +453,23 @@ export class ObserveLoopController {
   }
 
   /**
+   * Rebuild an owned ceiling final after asynchronous busy/idle revalidation.
+   * Queued input must not change the prompt or diff baseline until this read.
+   */
+  refreshCeilingFinal(event: Extract<OutputEvent, { type: "final" }>): Extract<OutputEvent, { type: "final" }> {
+    const output = this.ceilingOutput;
+    if (event.reason !== "ceiling" || !output) return event;
+    this.ceilingOutput = null;
+    const unseen = this.communicator.getNewOutput();
+    if (unseen) {
+      output.turnText += output.turnText ? `\n${unseen}` : unseen;
+      // This suffix was never streamed, so the refreshed final must carry it.
+      output.lastDeltaText = unseen;
+    }
+    return this.buildFinal("ceiling", output.lastDeltaText, output.turnText);
+  }
+
+  /**
    * Build and emit the single terminal event.
    *
    * Payload rule:
@@ -474,6 +492,16 @@ export class ObserveLoopController {
     turnText: string,
     confirmed?: string,
   ): void {
+    if (reason === "ceiling") this.ceilingOutput = { lastDeltaText, turnText };
+    this.emit(this.buildFinal(reason, lastDeltaText, turnText, confirmed));
+  }
+
+  private buildFinal(
+    reason: "idle" | "deadline" | "ceiling" | "aborted",
+    lastDeltaText: string,
+    turnText: string,
+    confirmed?: string,
+  ): Extract<OutputEvent, { type: "final" }> {
     const observed = confirmed ?? (this.finalPayload === "full-turn"
       ? this.turnPayload(turnText, lastDeltaText)
       : lastDeltaText);
@@ -506,6 +534,6 @@ export class ObserveLoopController {
             : latest;
       }
     }
-    this.emit({ type: "final", text, reason, source });
+    return { type: "final", text, reason, source };
   }
 }
