@@ -943,7 +943,10 @@ export async function startSlackDaemon(
     // Replacement may be discovered by !last or another request before the
     // watcher ticks. Adopt here so a continuously-working turn is not lost.
     if (existing && liveInfo?.agent_status === "working") {
-      adoptExternalTurn(binding.pane_id);
+      const matchingPrompt = pendingPrompt && communicator.readerKind !== "scrape"
+        && communicator.canIsolateLastAnswer() && communicator.getLastLoggedPrompt() === pendingPrompt.trim()
+        ? pendingPrompt : undefined;
+      adoptExternalTurn(binding.pane_id, matchingPrompt);
     } else if (existing && !startingTurns.has(binding.pane_id)) {
       // A short first turn may finish before a replacement is named. Recover
       // only an isolated logged answer to the actual prompt sent through this
@@ -978,7 +981,7 @@ export async function startSlackDaemon(
   /** The question last announced for a pane, so the answer does not repeat it. */
   const announcedPrompt = new Map<string, string>();
 
-  const adoptExternalTurn = (paneId: string): boolean => {
+  const adoptExternalTurn = (paneId: string, submittedPrompt?: string): boolean => {
     // Slack owns setup until handleMessage starts observation with its prompt.
     if (startingTurns.has(paneId)) return false;
     // Readbacks must not opt into terminal relaying, but an existing Slack
@@ -987,7 +990,7 @@ export async function startSlackDaemon(
     const binding = bindingForPane(paneId);
     if (!binding) return false;
     const agent = paneAgentFor(binding);
-    if (!agent.noteExternalTurn()) return false;
+    if (!agent.noteExternalTurn(submittedPrompt)) return false;
     cancelFinalRetry(agent);
     // Adopted means the thread is following it; losing it to a restart is
     // the same silence as losing a question asked in the thread.

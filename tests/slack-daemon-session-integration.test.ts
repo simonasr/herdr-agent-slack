@@ -250,6 +250,30 @@ describe("Slack session routing — real observe loops", () => {
     expect(disposed).toHaveBeenCalledOnce();
   });
 
+  it.each([true, false])("retains the full in-flight replacement answer only for a matching Slack prompt=%s", async (matches) => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
+    const projects = join(dir, ".claude", "projects", "project");
+    mkdirSync(projects, { recursive: true });
+    writeFileSync(join(projects, "partial-old.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "claude", agent_session: { kind: "id", id: "partial-old" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "the Slack question being continued", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    const replacement = join(projects, "partial-new.jsonl");
+    const assistant = (text: string) => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } }) + "\n";
+    writeFileSync(replacement, JSON.stringify({ type: "user", message: { role: "user", content: matches ? prompt : "unrelated question" } }) + "\n" + assistant("answer prefix"));
+    mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "partial-new" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "answer prefix");
+    mocks.post.mockClear();
+    expect(sendText).toHaveBeenCalledTimes(1); // Adoption must not resend the prompt.
+    appendFileSync(replacement, assistant("answer suffix"));
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, matches ? "answer prefix\n\nanswer suffix" : "answer suffix");
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
   it.each([true, false])("recovers only a matching late-named answer, terminal watcher=%s", async (watcher) => {
     appendFileSync(join(dir, "config.toml"), `relay_terminal_turns = ${watcher}\n`);
     const sessions = join(dir, ".codex", "sessions");
