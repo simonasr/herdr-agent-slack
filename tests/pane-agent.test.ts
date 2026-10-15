@@ -54,6 +54,7 @@ import {
 } from "../src/turn/observe-loop-controller.js";
 import { PaneAgent } from "../src/pane-agent.js";
 import type { Config } from "../src/config.js";
+import type { AgentInfo } from "../src/herdr-client.js";
 
 const noopLogger = { info() {}, warn() {}, error() {}, debug() {} };
 
@@ -779,5 +780,410 @@ describe("PaneAgent — getLastOutput", () => {
 
     // After /last, a getNewOutput call still finds nothing new.
     expect(env.comm.getNewOutput()).toBe("");
+  });
+});
+
+/** Metadata and reader are independent: neither one alone can close a turn. */
+function completionEnv(opts: { mode?: "final" | "stream"; capture?: boolean; sync?: boolean } = {}) {
+  let info: AgentInfo | null = {
+    agent: "pi", agent_status: "idle", pane_id: "w1:p1", tab_id: "t", workspace_id: "w",
+    agent_session: { kind: "path", path: "/tmp/session.jsonl" },
+    completion_evidence: {
+      terminal_id: "terminal", state_change_seq: 0, completion_seq: null,
+      screen_detection_skipped: true, launch_pending: false, endpoint_identity: "[socket:1]",
+    },
+  };
+  let answer: string | null = null;
+  let mismatched = false;
+  let throwInfo = false;
+  let captured = 0;
+  let sent = 0;
+  const reader: AgentOutputReader = {
+    kind: "pi-jsonl",
+    read: () => "old answer", // deliberately stale snapshot/anchor
+    lastPrompt: () => "old prompt",
+    lastAnswer: () => "old answer",
+    captureTurn: opts.capture === false ? undefined : (expected) => {
+      if (expected && (expected.kind !== "path" || expected.path !== "/tmp/session.jsonl")) return null;
+      captured++;
+      const boundary = sent;
+      return () => sent > boundary && answer ? { prompt: mismatched ? "old prompt" : "ask", text: answer } : null;
+    },
+  };
+  const comm = new AgentCommunicator(reader, noopLogger, "w1:p1");
+  const actualSend = comm.sendInput.bind(comm);
+  vi.spyOn(comm, "sendInput").mockImplementation((text) => {
+    sent++;
+    actualSend(text);
+    if (opts.sync) {
+      answer = "new synchronous answer";
+      complete();
+    }
+  });
+  const events: OutputEvent[] = [];
+  const pending: Array<() => void> = [];
+  let now = 0;
+  const config = makeConfig({ outputMode: opts.mode ?? "final", progressIntervalMs: 2000, stabilityWindowMs: 30000 });
+  const agent = new PaneAgent({
+    paneId: "w1:p1", communicator: comm, config,
+    getCompletionInfo: () => { if (throwInfo) throw new Error("metadata unavailable"); return info; },
+    isAgentBusy: () => info?.agent_status === "working",
+    emit: (event) => events.push(event),
+    deps: { now: () => now, sleep: () => new Promise<void>(resolve => pending.push(resolve)) },
+  });
+  function change(fields: Partial<AgentInfo> & { completion_evidence?: AgentInfo["completion_evidence"] }) {
+    info = info && { ...info, ...fields, completion_evidence: {
+      ...info.completion_evidence!, ...fields.completion_evidence,
+    } };
+  }
+  function complete(state = 8) {
+    change({ agent_status: "idle", completion_evidence: { ...info!.completion_evidence!, state_change_seq: state, completion_seq: state } });
+  }
+  async function tick() {
+    expect(pending.length).toBeGreaterThan(0);
+    now += 2000;
+    pending.shift()!();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+  return {
+    agent, comm, events, change, complete, tick, setAnswer: (text: string | null) => { answer = text; },
+    setInfo: (value: AgentInfo | null) => { info = value; },
+    getInfo: () => info!, captured: () => captured, sent: () => sent,
+    mismatch: () => { mismatched = true; }, throwMetadata: () => { throwInfo = true; },
+    restoreMetadata: () => { throwInfo = false; },
+    finals: () => events.filter(e => e.type === "final"),
+  };
+}
+
+describe("PaneAgent — completion-aware final polling", () => {
+  it("delivers a fresh full turn at the next 2s poll, with no historical output", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("current full turn\nsecond line");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toEqual([{ type: "final", text: "current full turn\nsecond line", reason: "idle", source: "delta" }]);
+    expect(e.sent()).toBe(1);
+  });
+
+  it("rejects a cached old reader when current metadata already names a new session", async () => {
+    const e = completionEnv();
+    e.change({ agent_session: { kind: "path", path: "/tmp/new-session.jsonl" } });
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(0); // wrong selected source cannot affirm current metadata
+    e.setAnswer("stale reader answer");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("captures a copied source before dispatch, not a mutable metadata session", async () => {
+    const e = completionEnv();
+    const capture = vi.spyOn(e.comm, "captureCompletedResponse");
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    const source = capture.mock.calls[0]?.[1];
+    expect(source).toEqual({ kind: "path", path: "/tmp/session.jsonl" });
+    expect(source).not.toBe(e.getInfo().agent_session);
+    (e.getInfo().agent_session as { kind: "path"; path: string }).path = "/tmp/new-session.jsonl";
+    expect(source).toEqual({ kind: "path", path: "/tmp/session.jsonl" });
+    e.setAnswer("stale reader answer");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("does not swallow completion that lands synchronously during sendInput and before seed", async () => {
+    const e = completionEnv({ sync: true });
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "new synchronous answer", source: "delta" }]);
+  });
+
+  it("accepts a missed working status and a large state counter gap, not stale idle", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    e.setAnswer("new");
+    e.change({ agent_status: "done" }); // presentation change, not a new completion
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.complete(500);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "new", reason: "idle" }]);
+  });
+
+  it("rejects a complete old/mismatched user boundary instead of replaying it", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("old answer");
+    e.mismatch();
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("a metadata read error disables the fast path for the rest of the turn", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.throwMetadata();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.restoreMetadata();
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("waits for persisted current-request output even after fresh metadata", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.setAnswer("persisted later");
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "persisted later" }]);
+  });
+
+  it("does not arm unsupported readers, absent metadata, or non-final mode", async () => {
+    for (const opts of [{ capture: false }, { mode: "stream" as const }, {}]) {
+      const e = completionEnv(opts);
+      if (!Object.keys(opts).length) e.setInfo(null);
+      e.agent.handleMessage("ask");
+      expect(e.captured()).toBe(0);
+      e.setAnswer("ready");
+      if (e.getInfo()) e.complete();
+      await e.tick();
+      expect(e.finals()).toHaveLength(0);
+      e.agent.stop();
+      await e.tick();
+    }
+  });
+
+  it("does not arm when evidence is absent or the session is empty", async () => {
+    for (const invalid of ["evidence", "session"] as const) {
+      const e = completionEnv();
+      if (invalid === "evidence") e.setInfo({ ...e.getInfo(), completion_evidence: undefined });
+      else e.change({ agent_session: { kind: "path", path: "" } });
+      e.agent.handleMessage("ask");
+      expect(e.captured()).toBe(0);
+      e.setAnswer("ready");
+      await e.tick();
+      expect(e.finals()).toHaveLength(0);
+      e.agent.stop();
+      await e.tick();
+    }
+  });
+
+  it("does not arm if metadata changes during capture, and rejects old prompt output", async () => {
+    const e = completionEnv();
+    const original = e.comm.captureCompletedResponse.bind(e.comm);
+    vi.spyOn(e.comm, "captureCompletedResponse").mockImplementation(text => {
+      const read = original(text);
+      e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 1 } });
+      return read;
+    });
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("old");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["working", "blocked", "unknown"])("never affirms %s status", async status => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("ready");
+    e.complete();
+    e.change({ agent_status: status });
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["screen", "launch"])("requires full authority, not %s", async flag => {
+    const e = completionEnv();
+    e.change({ completion_evidence: { ...e.getInfo().completion_evidence!,
+      ...(flag === "screen" ? { screen_detection_skipped: false } : { launch_pending: true }) } });
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(0);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["agent", "pane_id", "terminal_id", "agent_session", "endpoint_identity", "regression", "missing"])(
+    "permanently disables fast completion after %s replacement or regression", async field => {
+      const e = completionEnv();
+      if (field === "regression") e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 2 } });
+      e.agent.handleMessage("ask");
+      expect(e.captured()).toBe(1);
+      const prior = e.getInfo();
+      if (field === "agent") e.change({ agent: "omp" });
+      if (field === "pane_id") e.change({ pane_id: "other" });
+      if (field === "agent_session") e.change({ agent_session: { kind: "path", path: "/other" } });
+      if (field === "terminal_id") e.change({ completion_evidence: { ...prior.completion_evidence!, terminal_id: "other" } });
+      if (field === "endpoint_identity") e.change({ completion_evidence: { ...prior.completion_evidence!, endpoint_identity: "other" } });
+      if (field === "regression") e.change({ completion_evidence: { ...prior.completion_evidence!, state_change_seq: 0, completion_seq: null } });
+      if (field === "missing") e.setInfo(null);
+      // For regression, first establish an observed counter above baseline.
+      await e.tick();
+      e.setInfo(prior);
+      e.setAnswer("ready");
+      e.complete();
+      await e.tick();
+      expect(e.finals()).toHaveLength(0);
+      e.agent.stop();
+      await e.tick();
+    },
+  );
+
+  it("disables the turn after an observed completion counter regresses", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.complete(8);
+    await e.tick(); // no output yet; remember completion 8
+    expect(e.finals()).toHaveLength(0);
+    e.change({ completion_evidence: { ...e.getInfo().completion_evidence!, state_change_seq: 9, completion_seq: 7 } });
+    await e.tick();
+    e.setAnswer("ready");
+    e.complete(10);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("invalidates a turn before a second input, including one from readiness extraction", async () => {
+    const e = completionEnv();
+    const original = e.comm.captureCompletedResponse.bind(e.comm);
+    vi.spyOn(e.comm, "captureCompletedResponse").mockImplementation(text => {
+      const read = original(text);
+      return read && (() => { e.agent.handleMessage("second"); return read(); });
+    });
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("stale proof");
+    e.complete();
+    await e.tick();
+    expect(e.sent()).toBe(2);
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+    expect(e.finals()[0]).toMatchObject({ reason: "aborted" });
+  });
+
+  it("rechecks metadata after extraction and permanently rejects a changed candidate", async () => {
+    const e = completionEnv();
+    const original = e.comm.captureCompletedResponse.bind(e.comm);
+    vi.spyOn(e.comm, "captureCompletedResponse").mockImplementation(text => {
+      const read = original(text);
+      return read && (() => { const result = read(); e.complete(9); return result; });
+    });
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.complete(10);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("coalesces a normal second message permanently into fallback, without resending", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.agent.handleMessage("second");
+    expect(e.sent()).toBe(2);
+    e.setAnswer("new");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+  });
+
+  it.each(["stop", "dispose"] as const)("%s invalidates proof and emits only an aborted final", async action => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(1);
+    e.setAnswer("ready");
+    e.complete();
+    e.agent[action]();
+    expect(e.finals()).toHaveLength(0);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+  });
+
+  it("a follow-only loop stays fallback-only when it receives a new input", async () => {
+    const e = completionEnv();
+    e.agent.enableFollow(60_000);
+    e.agent.handleMessage("ask");
+    expect(e.captured()).toBe(0);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it("preserves one final per distinct user boundary even when answers have equal bytes", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    e.setAnswer("same");
+    e.complete(8);
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+    await Promise.resolve(); // done auto-clears the old controller
+    e.agent.handleMessage("ask");
+    e.complete(80);
+    await e.tick();
+    expect(e.finals()).toHaveLength(2);
+    expect(e.finals().map(f => f.text)).toEqual(["same", "same"]);
+    expect(e.sent()).toBe(2);
+  });
+
+  it("holds a future follow deadline and revalidates proof at the deadline", async () => {
+    const e = completionEnv();
+    e.agent.handleMessage("ask");
+    e.agent.enableFollow(6000);
+    e.setAnswer("ready");
+    e.complete();
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ text: "ready", reason: "idle" }]);
   });
 });

@@ -79,6 +79,8 @@ function makeEnv(opts: {
   formatDelta?: (chunk: string, elapsedMs: number) => string;
   formatWorkingTick?: (elapsedMs: number) => string;
   finalPayload?: "last-delta" | "full-turn";
+  completedOutput?: () => string | null;
+  maxTurnMs?: number;
 }) {
   const progressIntervalMs = opts.progressIntervalMs ?? 100;
   const stabilityMs = opts.stabilityMs ?? 100;
@@ -108,6 +110,8 @@ function makeEnv(opts: {
     formatDelta: opts.formatDelta,
     formatWorkingTick: opts.formatWorkingTick,
     finalPayload: opts.finalPayload,
+    completedOutput: opts.completedOutput,
+    maxTurnMs: opts.maxTurnMs,
   });
 
   return {
@@ -455,6 +459,56 @@ describe("ObserveLoopController — final payload fallback", () => {
     expect(finals).toHaveLength(1);
     // Final payload must be capped to MAX_CHUNK_TOTAL.
     expect(finals[0]?.text.length).toBeLessThanOrEqual(MAX_CHUNK_TOTAL);
+  });
+});
+
+describe("ObserveLoopController — same-poll proof priority", () => {
+  it("lets an abort during proof extraction override the confirmed payload", async () => {
+    let proofCalls = 0;
+    const env = makeEnv({
+      snapshots: ["fallback answer"],
+      finalPayload: "full-turn",
+      stabilityMs: 30_000,
+      completedOutput: () => {
+        proofCalls++;
+        env.controller.abort();
+        return "confirmed answer that must not be delivered";
+      },
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    expect(proofCalls).toBe(0);
+    expect(env.step()).toBe(true);
+    await run;
+    expect(proofCalls).toBe(1);
+    expect(env.events.filter(event => event.type === "final")).toEqual([
+      { type: "final", text: "fallback answer", reason: "aborted", source: "snapshot" },
+    ]);
+  });
+
+  it("lets a ceiling reached during proof extraction override the confirmed payload", async () => {
+    let proofCalls = 0;
+    const env = makeEnv({
+      snapshots: ["fallback answer"],
+      finalPayload: "full-turn",
+      stabilityMs: 30_000,
+      maxTurnMs: 1_000,
+      completedOutput: () => {
+        proofCalls++;
+        env.clock.advance(1_000);
+        return "confirmed answer that must not be delivered";
+      },
+    });
+    env.controller.markUserInput();
+    const run = env.controller.start();
+    expect(env.clock.now()).toBe(0);
+    expect(env.step()).toBe(true); // 100ms: the initial ceiling check cannot end the loop
+    await run;
+    expect(proofCalls).toBe(1);
+    expect(env.clock.now()).toBe(1_100);
+    expect(env.events.filter(event => event.type === "final")).toEqual([
+      { type: "final", text: "fallback answer", reason: "ceiling", source: "snapshot" },
+    ]);
   });
 });
 

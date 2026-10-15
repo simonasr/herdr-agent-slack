@@ -205,6 +205,16 @@ describe("shouldStop", () => {
   });
 });
 
+describe("isIdle — confirmed completion", () => {
+  it("bypasses stability only with proof, never busy or a future deadline", () => {
+    const state = makeState({ now: 2_000, lastChangeAt: 2_000, stabilityMs: 30_000, completionConfirmed: true });
+    expect(shouldStop(state)).toBe(true);
+    expect(shouldStop({ ...state, agentBusy: true })).toBe(false);
+    expect(shouldStop({ ...state, deadline: 3_000 })).toBe(false);
+    expect(shouldStop({ ...state, completionConfirmed: false })).toBe(false);
+  });
+});
+
 describe("isIdle — herdr's busy signal", () => {
   const base = { now: 10_000, lastChangeAt: 0, stabilityMs: 1_000, deadline: null, waitUntilIdle: true };
 

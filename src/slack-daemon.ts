@@ -794,6 +794,7 @@ export async function startSlackDaemon(
       communicator,
       config: cfg,
       isAgentBusy: () => getAgentInfo(binding.pane_id)?.agent_status === "working",
+      getCompletionInfo: () => getAgentInfo(binding.pane_id),
       emit: (event) => {
         // The agent is the pane's; the thread is whichever asked last. It is
         // looked up now, not when this agent was built — the binding that

@@ -159,6 +159,8 @@ export interface ObserveLoopControllerDeps {
    * Defaults to "no opinion" — the stability window decides alone.
    */
   isAgentBusy?: () => boolean;
+  /** Fresh full-turn proof for this poll only; null retains ordinary settling. */
+  completedOutput?: () => string | null;
   /**
    * Optional hard ceiling on one turn, in ms. Guarantees termination even if
    * `isAgentBusy` never goes false (a wedged agent, or a stale herdr status).
@@ -188,6 +190,7 @@ export class ObserveLoopController {
   private readonly formatWorkingTick: (elapsedMs: number) => string;
   private readonly finalPayload: "last-delta" | "full-turn";
   private readonly isAgentBusy: () => boolean;
+  private readonly completedOutput: () => string | null;
   private readonly maxTurnMs: number | null;
 
   /**
@@ -233,6 +236,7 @@ export class ObserveLoopController {
       ((elapsedMs) => `⏳ Working (${Math.floor(elapsedMs / 1000)}s).`);
     this.finalPayload = deps.finalPayload ?? "last-delta";
     this.isAgentBusy = deps.isAgentBusy ?? (() => false);
+    this.completedOutput = deps.completedOutput ?? (() => null);
     this.maxTurnMs = deps.maxTurnMs ?? null;
     this.done = new Promise<void>((resolve) => {
       this.resolveDone = resolve;
@@ -374,13 +378,27 @@ export class ObserveLoopController {
           this.emitFinal("ceiling", lastDeltaText, turnText);
           return;
         }
+        const agentBusy = this.isAgentBusy();
+        // No proof survives a poll: a follow deadline can be added or a
+        // session can be replaced while the same controller is running.
+        const completed = this.completedOutput();
+        if (this.aborted) {
+          this.emitFinal("aborted", lastDeltaText, turnText);
+          return;
+        }
+        const checkedAt = this.now();
+        if (this.maxTurnMs !== null && checkedAt - startedAt >= this.maxTurnMs) {
+          this.emitFinal("ceiling", lastDeltaText, turnText);
+          return;
+        }
         const state: StopState = {
-          now,
+          now: checkedAt,
           lastChangeAt,
           stabilityMs: this.stabilityMs,
           deadline: this.deadline,
           waitUntilIdle: this.waitUntilIdle,
-          agentBusy: this.isAgentBusy(),
+          agentBusy,
+          completionConfirmed: completed !== null && completed.trim().length > 0,
         };
         if (shouldStop(state)) {
           // Distinguish "idle" vs "deadline" in the final reason. The
@@ -392,7 +410,7 @@ export class ObserveLoopController {
           const reason: "idle" | "deadline" = this.waitUntilIdle
             ? "idle"
             : "deadline";
-          this.emitFinal(reason, lastDeltaText, turnText);
+          this.emitFinal(reason, lastDeltaText, turnText, completed ?? undefined);
           return;
         }
       }
@@ -443,10 +461,11 @@ export class ObserveLoopController {
     reason: "idle" | "deadline" | "ceiling" | "aborted",
     lastDeltaText: string,
     turnText: string,
+    confirmed?: string,
   ): void {
-    const observed = this.finalPayload === "full-turn"
+    const observed = confirmed ?? (this.finalPayload === "full-turn"
       ? this.turnPayload(turnText, lastDeltaText)
-      : lastDeltaText;
+      : lastDeltaText);
     let text: string;
     let source: "delta" | "snapshot" = "delta";
     if (observed.trim().length > 0) {

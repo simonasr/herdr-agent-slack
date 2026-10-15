@@ -50,8 +50,9 @@
  * and decides how to format / send them. This keeps the unit-testable
  * surface free of network dependencies.
  */
-import type { AgentCommunicator } from "./agent-sessions.js";
+import type { AgentCommunicator, AgentSessionRef } from "./agent-sessions.js";
 import type { Config } from "./config.js";
+import type { AgentInfo } from "./herdr-client.js";
 import {
   ObserveLoopController,
   type ObserveLoopControllerDeps,
@@ -78,6 +79,51 @@ export interface PaneAgentDeps {
   ) => ObserveLoopController;
 }
 
+interface CompletionSample {
+  agent: string;
+  pane: string;
+  terminal: string;
+  session: NonNullable<AgentSessionRef>;
+  endpoint: string;
+  status: string;
+  state: number;
+  completion: number | null;
+}
+
+function completionSample(info: AgentInfo | null, paneId: string): CompletionSample | null {
+  const evidence = info?.completion_evidence;
+  const session = info?.agent_session;
+  const reference = session?.kind === "path" ? session.path : session?.kind === "id" ? session.id : "";
+  if (!evidence || !info?.agent?.trim() || info.pane_id !== paneId || !reference?.trim() ||
+      !evidence.terminal_id?.trim() || !evidence.endpoint_identity?.trim() ||
+      evidence.screen_detection_skipped !== true || evidence.launch_pending !== false ||
+      !Number.isSafeInteger(evidence.state_change_seq) || evidence.state_change_seq < 0 ||
+      (evidence.completion_seq !== null &&
+        (!Number.isSafeInteger(evidence.completion_seq) || evidence.completion_seq <= 0 ||
+          evidence.completion_seq > evidence.state_change_seq))) return null;
+  return {
+    agent: info.agent, pane: info.pane_id, terminal: evidence.terminal_id,
+    session: session!.kind === "path" ? { kind: "path", path: reference } : { kind: "id", id: reference },
+    endpoint: evidence.endpoint_identity,
+    status: info.agent_status, state: evidence.state_change_seq,
+    completion: evidence.completion_seq,
+  };
+}
+
+function sessionValue(session: NonNullable<AgentSessionRef>): string {
+  return session.kind === "path" ? session.path : session.id;
+}
+
+function sameIdentity(a: CompletionSample, b: CompletionSample): boolean {
+  return a.agent === b.agent && a.pane === b.pane && a.terminal === b.terminal &&
+    a.session.kind === b.session.kind && sessionValue(a.session) === sessionValue(b.session) &&
+    a.endpoint === b.endpoint;
+}
+
+function settled(status: string): boolean {
+  return status === "idle" || status === "done";
+}
+
 export interface PaneAgentOptions {
   /** Pane id this agent coordinates. Stored for diagnostics / logs. */
   paneId: string;
@@ -92,6 +138,8 @@ export interface PaneAgentOptions {
    * without it a turn ends on screen stability alone.
    */
   isAgentBusy?: () => boolean;
+  /** Optional fresh Herdr metadata; absent suppliers retain settling. */
+  getCompletionInfo?: () => AgentInfo | null;
   /** Optional. Production leaves this unset. */
   deps?: PaneAgentDeps;
 }
@@ -111,6 +159,44 @@ export interface PaneAgentOptions {
  */
 export class PaneAgent {
   private loop: ObserveLoopController | null = null;
+  private turnGeneration = 0;
+  private fastTurn: { generation: number; baseline: CompletionSample; latest: CompletionSample; read: () => string | null } | null = null;
+
+  private sample(): CompletionSample | null {
+    try {
+      return completionSample(this.opts.getCompletionInfo?.() ?? null, this.opts.paneId);
+    } catch {
+      return null;
+    }
+  }
+
+  /** A bad observation disables this turn, never just this poll. */
+  private completedOutput(generation: number): string | null {
+    const turn = this.fastTurn;
+    if (!turn || turn.generation !== generation) return null;
+    const current = this.sample();
+    if (!current || !sameIdentity(turn.baseline, current) ||
+        current.state < turn.latest.state ||
+        (turn.latest.completion !== null &&
+          (current.completion === null || current.completion < turn.latest.completion))) {
+      this.fastTurn = null;
+      return null;
+    }
+    if (this.fastTurn !== turn || this.turnGeneration !== generation) return null;
+    turn.latest = current;
+    if (!settled(current.status) || current.completion !== current.state ||
+        current.state <= turn.baseline.state) return null;
+    let text: string | null;
+    try { text = turn.read(); } catch { text = null; }
+    if (this.fastTurn !== turn || this.turnGeneration !== generation || !text?.trim()) return null;
+    const after = this.sample();
+    if (!after || !sameIdentity(current, after) || !settled(after.status) ||
+        after.state !== current.state || after.completion !== current.completion) {
+      this.fastTurn = null;
+      return null;
+    }
+    return this.fastTurn === turn && this.turnGeneration === generation ? text : null;
+  }
   /**
    * Whether the turn under way was started in the pane rather than the chat.
    * Cleared by `handleMessage`, because a chat message makes the turn the
@@ -163,15 +249,31 @@ export class PaneAgent {
    * follow timer keeps ticking through user messages.
    */
   handleMessage(text: string): void {
+    // Invalidate before dispatch, including a reentrant message from a reader callback.
+    const generation = ++this.turnGeneration;
+    this.fastTurn = null;
+    if (!this.loop && this.opts.config.outputMode === "final") {
+      const baseline = this.sample();
+      if (baseline && settled(baseline.status)) {
+        const read = this.opts.communicator.captureCompletedResponse(text, baseline.session);
+        const after = this.sample();
+        if (read && after && sameIdentity(baseline, after) &&
+            after.state === baseline.state && after.completion === baseline.completion &&
+            settled(after.status) && this.turnGeneration === generation && !this.loop) {
+          this.fastTurn = { generation, baseline, latest: after, read };
+        }
+      }
+    }
     this.opts.communicator.sendInput(text);
     // Whatever started this turn, it is the user's now: their answer must be
     // delivered even if it repeats what the pane said a moment ago.
     this.externalTurn = false;
+    if (this.turnGeneration !== generation) this.fastTurn = null;
     if (this.loop) {
       this.loop.markUserInput();
       return;
     }
-    this.startLoop({ deadline: null, waitUntilIdle: true });
+    this.startLoop({ deadline: null, waitUntilIdle: true, fast: true });
   }
 
   /**
@@ -257,6 +359,7 @@ export class PaneAgent {
     }
     const external = this.externalTurn;
     this.externalTurn = false;
+    this.fastTurn = null;
     // `maxTurnMs` expiring is this loop's own guarantee of termination, not
     // the agent finishing. When herdr still reports the pane working, the turn
     // is simply longer than the ceiling: reporting a half-written answer would
@@ -349,6 +452,8 @@ export class PaneAgent {
    * No-op when no loop is active.
    */
   stop(): void {
+    this.turnGeneration++;
+    this.fastTurn = null;
     if (!this.loop) return;
     const loop = this.loop;
     this.loop = null;
@@ -377,6 +482,8 @@ export class PaneAgent {
    * pane and dispose() only at daemon shutdown.
    */
   dispose(): void {
+    this.turnGeneration++;
+    this.fastTurn = null;
     if (!this.loop) return;
     const loop = this.loop;
     this.loop = null;
@@ -396,7 +503,11 @@ export class PaneAgent {
   private startLoop(opts: {
     deadline: number | null;
     waitUntilIdle: boolean;
+    fast?: boolean;
   }): void {
+    const generation = this.turnGeneration;
+    if (!opts.fast || this.fastTurn?.generation !== generation) this.fastTurn = null;
+    const fast = this.fastTurn;
     const factory =
       this.opts.deps?.createController ??
       ((d: ObserveLoopControllerDeps) => new ObserveLoopController(d));
@@ -416,6 +527,7 @@ export class PaneAgent {
       // the turn's only delivery and has to carry all of it.
       finalPayload: this.opts.config.outputMode === "final" ? "full-turn" : "last-delta",
       isAgentBusy: this.opts.isAgentBusy,
+      completedOutput: fast ? () => this.completedOutput(generation) : undefined,
       maxTurnMs: this.opts.config.maxTotalWaitS * 1000,
     });
     controller.updateDeadline(opts.deadline);
@@ -426,6 +538,7 @@ export class PaneAgent {
     controller.done.then(() => {
       if (this.loop === controller) {
         this.loop = null;
+        if (this.fastTurn === fast) this.fastTurn = null;
       }
     });
     this.loop = controller;

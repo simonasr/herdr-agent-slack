@@ -1,5 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import type { AgentOutputReader } from "./types.js";
+import { createHash } from "node:crypto";
+import type { AgentOutputReader, CompletedReaderTurn } from "./types.js";
+import type { AgentSessionRef } from "../agent-sessions.js";
 import type { Logger } from "../logger.js";
 
 function extractTextFromContent(content: unknown[]): string {
@@ -37,6 +39,69 @@ export function readPiCumulativeSnapshot(path: string): string {
   return chunks.join("\n\n").trim();
 }
 
+function completionSnapshot(path: string): { bytes: Buffer; identity: string } | null {
+  try {
+    const before = statSync(path, { bigint: true });
+    if (!before.isFile()) return null;
+    const bytes = readFileSync(path);
+    const after = statSync(path, { bigint: true });
+    if (before.dev !== after.dev || before.ino !== after.ino ||
+        before.size !== after.size || before.ctimeNs !== after.ctimeNs ||
+        before.mtimeNs !== after.mtimeNs || BigInt(bytes.length) !== after.size) return null;
+    return { bytes, identity: `${after.dev}:${after.ino}:${after.birthtimeNs}` };
+  } catch {
+    return null;
+  }
+}
+
+function appendedCompletedTurn(raw: string, parent: string, previousIds: Set<string>): CompletedReaderTurn | null {
+  const lines = raw.trim().split("\n");
+  const ids = new Set(previousIds);
+  const pending = new Set<string>();
+  const toolIds = new Set<string>();
+  const chunks: string[] = [];
+  let prompt = "";
+  let final = false;
+  for (let i = 0; i < lines.length; i++) {
+    const entry = JSON.parse(lines[i]);
+    if (entry?.type !== "message" || typeof entry.id !== "string" || !entry.id.trim() ||
+        ids.has(entry.id) || entry.parentId !== parent) return null;
+    ids.add(entry.id);
+    parent = entry.id;
+    const message = entry.message;
+    if (!message || typeof message !== "object") return null;
+    final = false;
+    if (i === 0) {
+      if (message.role !== "user") return null;
+      prompt = typeof message.content === "string" ? message.content
+        : extractTextFromContent(message.content);
+      if (!prompt.trim()) return null;
+      continue;
+    }
+    if (message.role === "toolResult") {
+      if (!pending.delete(message.toolCallId)) return null;
+      continue;
+    }
+    if (message.role !== "assistant" || pending.size || !Array.isArray(message.content)) return null;
+    let calls = 0;
+    for (const part of message.content) {
+      if (part?.type === "toolCall") {
+        if (typeof part.id !== "string" || !part.id.trim() || toolIds.has(part.id)) return null;
+        pending.add(part.id);
+        toolIds.add(part.id);
+        calls++;
+      } else if (part?.type === "text") {
+        if (typeof part.text !== "string") return null;
+      } else if (part?.type !== "thinking") return null;
+    }
+    const text = extractTextFromContent(message.content);
+    if (text) chunks.push(text);
+    if (message.stopReason === "stop" && !calls && text.trim()) final = true;
+    else if (message.stopReason !== "toolUse" || !calls) return null;
+  }
+  return final && !pending.size ? { prompt, text: chunks.join("\n\n").trim() } : null;
+}
+
 export class PiJsonlReader implements AgentOutputReader {
   readonly kind = "pi-jsonl";
   constructor(
@@ -45,6 +110,36 @@ export class PiJsonlReader implements AgentOutputReader {
     private readonly paneId: string,
     private readonly agentName: string,
   ) {}
+
+  captureTurn(expectedSession?: AgentSessionRef): (() => CompletedReaderTurn | null) | null {
+    if (expectedSession !== undefined &&
+        (expectedSession?.kind !== "path" || expectedSession.path !== this.path)) return null;
+    try {
+      const baseline = completionSnapshot(this.path);
+      if (!baseline?.bytes.length || baseline.bytes.at(-1) !== 10) return null;
+      const records = new TextDecoder("utf-8", { fatal: true }).decode(baseline.bytes).trim().split("\n").map(line => JSON.parse(line));
+      const parent = records.at(-1)?.id;
+      if (typeof parent !== "string" || !parent.trim()) return null;
+      const ids = new Set<string>(records.map(entry => entry?.id).filter(id => typeof id === "string"));
+      const digest = createHash("sha256").update(baseline.bytes).digest("hex");
+      const length = baseline.bytes.length;
+      const identity = baseline.identity;
+      return () => {
+        try {
+          const current = completionSnapshot(this.path);
+          if (!current || current.identity !== identity || current.bytes.length <= length ||
+              current.bytes.at(-1) !== 10 ||
+              createHash("sha256").update(current.bytes.subarray(0, length)).digest("hex") !== digest) return null;
+          const tail = new TextDecoder("utf-8", { fatal: true }).decode(current.bytes.subarray(length));
+          return appendedCompletedTurn(tail, parent, ids);
+        } catch {
+          return null;
+        }
+      };
+    } catch {
+      return null;
+    }
+  }
 
   read(_maxLines: number): string {
     try {
@@ -356,6 +451,10 @@ export class DeferredReader implements AgentOutputReader {
 
   read(maxLines: number): string {
     return this.resolved()?.read(maxLines) ?? "";
+  }
+
+  captureTurn(expectedSession?: AgentSessionRef): (() => CompletedReaderTurn | null) | null {
+    return this.resolved()?.captureTurn?.(expectedSession) ?? null;
   }
 
   lastPrompt(): string {
