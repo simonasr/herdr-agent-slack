@@ -3,15 +3,15 @@ name = "Herdr Slack Bridge"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Drive your herdr agents from Slack: one thread per pane, several bots, handoffs between them. Zero-LLM bridge."
-platforms = ["linux"]
+platforms = ["linux", "macos"]
 
 [[build]]
 command = ["npm", "ci"]
-platforms = ["linux"]
+platforms = ["linux", "macos"]
 
 [[build]]
 command = ["npm", "run", "build"]
-platforms = ["linux"]
+platforms = ["linux", "macos"]
 
 [[actions]]
 id = "bootstrap"
