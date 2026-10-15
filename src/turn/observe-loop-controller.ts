@@ -216,6 +216,7 @@ export class ObserveLoopController {
    */
   private deadline: number | null = null;
   private waitUntilIdle: boolean = false;
+  private inputRevision = 0;
 
   /**
    * Abort latch. When non-null, the loop short-circuits to the final
@@ -287,11 +288,12 @@ export class ObserveLoopController {
   }
 
   /**
-   * A user message arrived during this turn. Toggles the idle gate on
-   * so the loop drains once the agent settles — even if a follow
-   * deadline is armed. Idempotent: calling twice is the same as once.
+   * A user message arrived during this turn. Enables the idle gate and
+   * invalidates observations/stability from before this dispatch, even when
+   * the idle gate was already enabled or a follow deadline is armed.
    */
   markUserInput(): void {
+    this.inputRevision++;
     this.waitUntilIdle = true;
   }
 
@@ -324,6 +326,7 @@ export class ObserveLoopController {
       // time we observe unseen content; left untouched while the pane
       // is stable so the stability window can elapse.
       let lastChangeAt = startedAt;
+      let inputRevision = this.inputRevision;
       // lastDeltaText remembers the most recent non-empty chunk we
       // emitted as a delta. The final payload falls back to this when
       // the pane goes idle — it's the most recent content the user has
@@ -344,6 +347,10 @@ export class ObserveLoopController {
         }
 
         const now = this.now();
+        if (inputRevision !== this.inputRevision) {
+          inputRevision = this.inputRevision;
+          lastChangeAt = now;
+        }
         const elapsedMs = now - startedAt;
         const fresh = this.communicator.getNewOutput();
         const unseen = resumed && fresh ? `${resumed}\n${fresh}` : resumed || fresh;
@@ -401,6 +408,13 @@ export class ObserveLoopController {
         if (this.maxTurnMs !== null && checkedAt - startedAt >= this.maxTurnMs) {
           this.emitFinal("ceiling", lastDeltaText, turnText);
           return;
+        }
+        // Input dispatched during the query invalidates ordinary settling as
+        // well as completion proof. Abort and ceiling still take priority.
+        if (inputRevision !== this.inputRevision) {
+          inputRevision = this.inputRevision;
+          lastChangeAt = checkedAt;
+          continue;
         }
         const state: StopState = {
           // Query latency is not evidence that newly observed output settled.
