@@ -8,6 +8,7 @@ import type { SlackClientDeps, SlackThread, ThreadMessage } from "../src/slack-c
 const mocks = vi.hoisted(() => ({
   live: null as AgentInfo | null,
   home: "",
+  screen: "",
   client: undefined as SlackClientDeps | undefined,
   extraPanes: [] as Array<{ pane_id: string; label: string; agent: string; status: string }>,
   post: vi.fn(async (_thread: SlackThread, _text: string) => "answer-ts"),
@@ -27,7 +28,7 @@ vi.mock("../src/herdr-client.js", async (original) => ({
     { pane_id: "w1:p1", label: "project", agent: mocks.live?.agent ?? "pi", status: mocks.live?.agent_status ?? "idle" },
     ...mocks.extraPanes,
   ]),
-  readPane: vi.fn(() => ""),
+  readPane: vi.fn(() => mocks.screen),
   sendText: vi.fn(),
 }));
 
@@ -71,6 +72,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   dir = mkdtempSync(join(tmpdir(), "slack-session-integration-"));
   mocks.home = dir;
+  mocks.screen = "";
   mocks.client = undefined;
   mocks.extraPanes.length = 0;
   writeFileSync(join(dir, "config.toml"), '[slack]\nbot_token = "test"\napp_token = "test"\nallowed_user_ids = ["U1"]\nprogress_interval_ms = 100\nstability_window_ms = 100\n');
@@ -114,6 +116,77 @@ describe("Slack session routing — real observe loops", () => {
     expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "the complete first answer");
     await vi.advanceTimersByTimeAsync(5_000);
     expect(disposed).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
+  it.each(["unreachable", "Pi without session"])("upgrades a scrape reader created with %s metadata instead of replaying its screen", async (missing) => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
+    mocks.live = missing === "unreachable" ? null : { ...liveSession(oldPath, "idle"), agent_session: undefined };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "a quiet question", "2.0");
+    mocks.screen = "old screen history must not be replayed";
+    mocks.live = liveSession(oldPath, "idle");
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    await mocks.client!.onUserMessage(thread, "U1", "a fresh question", "3.0");
+    appendFileSync(oldPath, message("fresh structured answer"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "fresh structured answer");
+  });
+
+  it("switches agent kinds before the replacement receives its first session identity", async () => {
+    const disposed = vi.spyOn(PaneAgent.prototype, "dispose");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: undefined };
+    await mocks.client!.onUserMessage(thread, "U1", "first codex question", "2.0");
+    expect(disposed).toHaveBeenCalledOnce();
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-agent-swap.jsonl"), [
+      { role: "user", text: "first codex question" },
+      { role: "assistant", text: "first answer after the agent swap" },
+    ].map(({ role, text }) => JSON.stringify({
+      type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
+    })).join("\n") + "\n");
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "agent-swap" } };
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "first answer after the agent swap");
+    expect(disposed).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])("recovers only a matching late-named answer, terminal watcher=%s", async (watcher) => {
+    appendFileSync(join(dir, "config.toml"), `relay_terminal_turns = ${watcher}\n`);
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    const turn = (prompt: string, answer: string): string => [
+      { role: "user", text: prompt }, { role: "assistant", text: answer },
+    ].map(({ role, text }) => JSON.stringify({
+      type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
+    })).join("\n") + "\n";
+    writeFileSync(join(sessions, "rollout-prior-codex.jsonl"), turn("old question", "old answer"));
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "prior-codex" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "1.1");
+    mocks.post.mockClear();
+    mocks.live = { ...mocks.live, agent_session: undefined };
+    await mocks.client!.onUserMessage(thread, "U1", "new question", "2.0");
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    writeFileSync(join(sessions, "rollout-current-codex.jsonl"), turn("new question", "the first fresh answer"));
+    mocks.live = { ...mocks.live, agent_session: { kind: "id", id: "current-codex" } };
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "the first fresh answer");
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+    // A different session's unrelated answer must still not settle a question.
+    mocks.post.mockClear();
+    mocks.live = { ...mocks.live, agent_session: undefined };
+    await mocks.client!.onUserMessage(thread, "U1", "another new question", "3.0");
+    await vi.advanceTimersByTimeAsync(300);
+    writeFileSync(join(sessions, "rollout-unrelated-codex.jsonl"), turn("someone else's question", "unrelated answer"));
+    mocks.live = { ...mocks.live, agent_session: { kind: "id", id: "unrelated-codex" } };
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(mocks.post).not.toHaveBeenCalled();
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
 

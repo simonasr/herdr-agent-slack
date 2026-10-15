@@ -445,6 +445,7 @@ export async function startSlackDaemon(
 
   const agents = new Map<string, PaneAgent>();
   const agentSessions = new WeakMap<PaneAgent, string | undefined>();
+  const agentSources = new WeakMap<PaneAgent, { name?: string; communicator: ReturnType<typeof createAgentCommunicator> }>();
   /** Incoming prompts retain ownership while Slack/history calls are awaited. */
   const startingTurns = new Map<string, number>();
   const finalRetries = new Map<PaneAgent, ReturnType<typeof setTimeout>>();
@@ -800,27 +801,20 @@ export async function startSlackDaemon(
     const liveInfo = getAgentInfo(binding.pane_id);
     const liveIdentity = sessionIdentity(liveInfo);
     const knownIdentity = existing ? agentSessions.get(existing) : undefined;
-    // Missing metadata is not evidence of a new session. The first identity
-    // enriches a deferred reader; only two different known identities replace it.
-    if (existing && (!liveIdentity || !knownIdentity || knownIdentity === liveIdentity)) {
-      if (liveIdentity) agentSessions.set(existing, liveIdentity);
+    const source = existing ? agentSources.get(existing) : undefined;
+    // An outage is not replacement. A confirmed agent-kind change is, even
+    // before the new agent has acquired its session identifier.
+    if (existing && (!liveInfo || (source?.name === liveInfo.agent && (!liveIdentity || knownIdentity === liveIdentity)))) {
       return existing;
     }
-    if (existing) {
-      agents.delete(binding.pane_id);
-      existing.dispose();
-      cancelFinalRetry(existing);
-      if (!startingTurns.has(binding.pane_id) && liveInfo?.agent_status !== "working") abandonTurn(binding);
-      announcedPrompt.delete(binding.pane_id);
-      log.info("pane session changed; replacing its reader", { paneId: binding.pane_id });
-    }
-    let sourceInfo: AgentInfo | null | undefined;
+    let firstRead = true;
     const communicator = createAgentCommunicator({
       paneId: binding.pane_id,
       getAgentInfo: (target) => {
-        const info = getAgentInfo(target);
-        if (sourceInfo === undefined) sourceInfo = info;
-        return info;
+        // Select against the same snapshot whose identity we compared. Later
+        // deferred resolution still consults live metadata.
+        if (firstRead) { firstRead = false; return liveInfo; }
+        return getAgentInfo(target);
       },
       readPane,
       agentPaths: cfg.agentPaths,
@@ -830,6 +824,23 @@ export async function startSlackDaemon(
       },
       logger: log,
     });
+    // A genuine deferred reader can retain its first answer. A reader chosen
+    // without metadata may instead be a scrape: upgrade it when the registry
+    // now selects a structured source, rather than merely labelling it known.
+    if (existing && source && !knownIdentity && (!source.name || source.name === liveInfo?.agent)
+      && source.communicator.readerKind === communicator.readerKind) {
+      source.name = liveInfo?.agent;
+      if (liveIdentity) agentSessions.set(existing, liveIdentity);
+      return existing;
+    }
+    const pendingPrompt = pendingTurns.isOpen(binding.pane_id) ? source?.communicator.getTurnPrompt() : undefined;
+    if (existing) {
+      agents.delete(binding.pane_id);
+      existing.dispose();
+      cancelFinalRetry(existing);
+      announcedPrompt.delete(binding.pane_id);
+      log.info("pane session changed; replacing its reader", { paneId: binding.pane_id });
+    }
     // A pane still working on a question asked through the chat, found on
     // restart: its current question is the chat's own, not one typed in the
     // terminal, and must not be announced as such when the turn is adopted.
@@ -848,11 +859,11 @@ export async function startSlackDaemon(
         const live = getAgentInfo(binding.pane_id);
         const identity = sessionIdentity(live);
         const known = agentSessions.get(agent);
-        if (identity && known && identity !== known) {
+        if ((identity && identity !== known) || (live && agentSources.get(agent)?.name !== live.agent)) {
           // Refresh here too: Slack-driven turns still need invalidation
-          // when terminal-turn polling is disabled.
-          paneAgentFor(bindingForPane(binding.pane_id) ?? binding);
-          return;
+          // when terminal-turn polling is disabled, including an initial
+          // scrape that must upgrade rather than accept the first identity.
+          if (paneAgentFor(bindingForPane(binding.pane_id) ?? binding) !== agent) return;
         }
         if (!live || (known && !identity)) {
           // A final is the loop's last event. Retain it through an outage,
@@ -874,7 +885,6 @@ export async function startSlackDaemon(
           }
           return;
         }
-        if (identity && !known) agentSessions.set(agent, identity);
         cancelFinalRetry(agent);
         // The agent is the pane's; the thread is whichever asked last. It is
         // looked up now, not when this agent was built — the binding that
@@ -909,12 +919,21 @@ export async function startSlackDaemon(
       },
     };
     const agent = new PaneAgent(agentOptions);
-    agentSessions.set(agent, sessionIdentity(sourceInfo ?? null));
+    agentSessions.set(agent, liveIdentity);
+    agentSources.set(agent, { name: liveInfo?.agent, communicator });
     agents.set(binding.pane_id, agent);
     // Replacement may be discovered by !last or another request before the
     // watcher ticks. Adopt here so a continuously-working turn is not lost.
-    if (existing && getAgentInfo(binding.pane_id)?.agent_status === "working") {
+    if (existing && liveInfo?.agent_status === "working") {
       adoptExternalTurn(binding.pane_id);
+    } else if (existing && !startingTurns.has(binding.pane_id)) {
+      // A short first turn may finish before a replacement is named. Recover
+      // only an isolated logged answer to the actual prompt sent through this
+      // pending turn; another session's latest answer is not enough evidence.
+      const answer = pendingPrompt && communicator.readerKind !== "scrape" && communicator.canIsolateLastAnswer()
+        && communicator.getLastLoggedPrompt() === pendingPrompt.trim() ? communicator.getLastAnswer().trim() : "";
+      if (answer) agentOptions.emit({ type: "final", text: answer, source: "snapshot", reason: "idle" });
+      else abandonTurn(bindingForPane(binding.pane_id) ?? binding);
     }
     return agent;
   };
