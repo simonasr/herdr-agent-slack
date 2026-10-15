@@ -790,6 +790,7 @@ async function flushMicrotasks() {
 /** Metadata and reader are independent: neither one alone can close a turn. */
 function completionEnv(opts: {
   mode?: "final" | "stream"; capture?: boolean; sync?: boolean; maxTotalWaitS?: number;
+  reader?: AgentOutputReader;
   metadata?: (info: AgentInfo | null, call: number) => AgentInfo | null | Promise<AgentInfo | null>;
 } = {}) {
   let info: AgentInfo | null = {
@@ -806,7 +807,7 @@ function completionEnv(opts: {
   let metadataCalls = 0;
   let captured = 0;
   let sent = 0;
-  const reader: AgentOutputReader = {
+  const reader: AgentOutputReader = opts.reader ?? {
     kind: "pi-jsonl",
     read: () => "old answer", // deliberately stale snapshot/anchor
     lastPrompt: () => "old prompt",
@@ -876,6 +877,47 @@ function deferred<T>() {
 }
 
 describe("PaneAgent — asynchronous metadata and turn ownership", () => {
+  it("delivers both answers when a new input arrives during the ceiling decision", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    let prompt = "first";
+    let answer = "";
+    let transcript = "";
+    const e = completionEnv({ maxTotalWaitS: 1,
+      reader: { kind: "pi-jsonl", read: () => transcript,
+        lastPrompt: () => prompt, lastAnswer: () => answer },
+      metadata: (info, call) => call === 2 ? ceiling.promise : info });
+    await e.agent.handleMessage("first");
+    answer = transcript = "first answer";
+    await e.tick();
+    expect(e.metadataCalls()).toBe(2);
+    expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+      .toEqual(["first answer"]);
+
+    const dispatch = vi.mocked(e.comm.sendInput).getMockImplementation()!;
+    const finalsAtDispatch: number[] = [];
+    vi.mocked(e.comm.sendInput).mockImplementation(text => {
+      finalsAtDispatch.push(e.finals().length);
+      dispatch(text);
+    });
+    const second = e.agent.handleMessage("second");
+    await flushMicrotasks();
+    const sentWhileDeciding = e.sent();
+    ceiling.resolve(e.getInfo());
+    await second;
+    prompt = "second";
+    answer = "second answer";
+    transcript += "\n" + answer;
+    await e.tick();
+
+    // Final-only consumers suppressed the first delta. A later final must not
+    // be mistaken for recovery of the preceding controller's lost payload.
+    expect(e.finals().map(event => event.text)).toEqual(["first answer", "second answer"]);
+    expect(sentWhileDeciding).toBe(1);
+    expect(finalsAtDispatch).toEqual([1]);
+    expect(e.sent()).toBe(2);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
   it("falls back after an asynchronous metadata rejection and still sends once", async () => {
     const e = completionEnv({ metadata: () => Promise.reject(new Error("unavailable")) });
     await e.agent.handleMessage("ask");
@@ -920,24 +962,159 @@ describe("PaneAgent — asynchronous metadata and turn ownership", () => {
     expect(e.finals()).toHaveLength(0);
   });
 
-  it("does not revive an old ceiling after a replacement follow has already finished", async () => {
+  it.each(["idle", "working"])("applies follow after the %s ceiling outcome without replacing it", async (status) => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: status });
+    await e.tick();
+    expect(e.metadataCalls()).toBe(3);
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.agent.noteExternalTurn()).toBe(false);
+    e.agent.enableFollow(10_000);
+    expect(e.agent.isFollowing()).toBe(true);
+    expect(e.finals()).toHaveLength(0);
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.agent.isFollowing()).toBe(true);
+    expect(e.finals()).toHaveLength(status === "idle" ? 1 : 0);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals().at(-1)).toMatchObject({ reason: "aborted" });
+  });
+
+  it.each(["idle", "working"])("honors unfollow during the %s ceiling decision", async (status) => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: status });
+    await e.tick();
+    e.agent.enableFollow(10_000);
+    e.agent.disableFollow();
+    expect(e.agent.isFollowing()).toBe(false);
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isFollowing()).toBe(false);
+    expect(e.agent.isLoopActive()).toBe(status === "working");
+    expect(e.finals()).toHaveLength(status === "idle" ? 1 : 0);
+    if (status === "working") {
+      e.agent.stop();
+      await e.tick();
+    }
+  });
+
+  it.each(["final", "stream"] as const)("preserves %s-mode diff-only output across busy ceiling decisions", async (mode) => {
+    const ceiling = deferred<AgentInfo | null>();
+    let transcript = "";
+    const e = completionEnv({ mode, maxTotalWaitS: 1,
+      reader: { kind: "opencode-db", read: () => transcript },
+      metadata: (info, call) => call === (mode === "final" ? 2 : 1) ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    transcript = "before ceiling";
+    await e.tick();
+    transcript += "\nduring decision";
+    ceiling.resolve(e.getInfo());
+    await flushMicrotasks();
+    expect(e.agent.isLoopActive()).toBe(true);
+    expect(e.finals()).toHaveLength(0);
+    transcript += "\nafter continuation";
+    await e.tick(); // still busy: carry output through another ceiling
+    expect(e.finals()).toHaveLength(0);
+    transcript += "\nfinished";
+    e.change({ agent_status: "idle" });
+    await e.tick();
+    expect(e.finals()).toHaveLength(1);
+    expect(e.finals()[0]!.reason).toBe("ceiling");
+    if (mode === "final") {
+      expect(e.finals()[0]!.text).toBe("before ceiling\nduring decision\nafter continuation\nfinished");
+    } else {
+      expect(e.events.filter(event => event.type === "delta").map(event => event.text.trim()))
+        .toEqual(["before ceiling", "during decision\nafter continuation", "finished"]);
+    }
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it.each(["idle", "working"])("queues arrivals in order behind the %s ceiling outcome", async (status) => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: status });
+    await e.tick();
+    const second = e.agent.handleMessage("second");
+    const third = e.agent.handleMessage("third");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    expect(e.agent.isLoopActive()).toBe(true);
+    ceiling.resolve(e.getInfo());
+    await Promise.all([second, third]);
+    expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text))
+      .toEqual(["ask", "second", "third"]);
+    expect(e.finals()).toHaveLength(status === "idle" ? 1 : 0);
+    e.agent.stop();
+    await e.tick();
+  });
+
+  it.each(["stop", "dispose"] as const)("%s cancels input queued behind a ceiling decision", async (action) => {
     const ceiling = deferred<AgentInfo | null>();
     const e = completionEnv({ maxTotalWaitS: 1,
       metadata: (info, call) => call === 3 ? ceiling.promise : info });
     await e.agent.handleMessage("ask");
     e.change({ agent_status: "working" });
     await e.tick();
-    expect(e.metadataCalls()).toBe(3);
-    const oldWorking = e.getInfo();
-    e.change({ agent_status: "idle" });
-    e.agent.enableFollow(3_000);
-    await e.tick();
+    const canceled = e.agent.handleMessage("canceled");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    e.agent[action]();
     expect(e.agent.isLoopActive()).toBe(false);
-    expect(e.finals()).toHaveLength(1);
+    ceiling.resolve(e.getInfo());
+    await canceled;
+    expect(e.sent()).toBe(1);
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(false);
+  });
+
+  it("does not make post-stop input wait for the canceled ceiling decision", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3 ? ceiling.promise : info });
+    await e.agent.handleMessage("ask");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    const oldWorking = e.getInfo();
+    e.agent.stop();
+    e.change({ agent_status: "idle" });
+    await e.agent.handleMessage("fresh");
+    expect(e.sent()).toBe(2);
     ceiling.resolve(oldWorking);
     await flushMicrotasks();
-    expect(e.agent.isLoopActive()).toBe(false);
-    expect(e.finals()).toHaveLength(1);
+    expect(e.finals()).toHaveLength(0);
+    expect(e.agent.isLoopActive()).toBe(true);
+    e.agent.stop();
+    await e.tick();
+    expect(e.finals()).toMatchObject([{ reason: "aborted" }]);
+  });
+
+  it("releases queued input after ceiling metadata rejects", async () => {
+    const ceiling = deferred<AgentInfo | null>();
+    const e = completionEnv({ maxTotalWaitS: 1,
+      metadata: (info, call) => call === 3
+        ? ceiling.promise.then(() => { throw new Error("metadata unavailable"); }) : info });
+    await e.agent.handleMessage("ask");
+    await e.tick();
+    const next = e.agent.handleMessage("next");
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    ceiling.resolve(null);
+    await next;
+    expect(e.finals()).toMatchObject([{ reason: "ceiling" }]);
+    expect(e.sent()).toBe(2);
+    e.agent.stop();
+    await e.tick();
   });
 
   it("lets a new message proceed after stop without waiting for canceled preparation", async () => {

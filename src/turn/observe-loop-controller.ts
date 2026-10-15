@@ -154,6 +154,13 @@ export interface ObserveLoopControllerDeps {
    */
   finalPayload?: "last-delta" | "full-turn";
   /**
+   * A ceiling continuation shares the communicator's existing diff baseline.
+   * Carry its undelivered full-turn output and retain the first read as new
+   * output instead of treating it as historical seed. Empty string resumes
+   * without carrying old output (streaming consumers already received it).
+   */
+  initialOutput?: string;
+  /**
    * Optional. Whether the agent is still working, per herdr. When it returns
    * true the idle gate cannot close, so a long quiet turn is not cut short.
    * Defaults to "no opinion" — the stability window decides alone.
@@ -190,6 +197,7 @@ export class ObserveLoopController {
   private readonly formatDelta: (chunk: string, elapsedMs: number) => string;
   private readonly formatWorkingTick: (elapsedMs: number) => string;
   private readonly finalPayload: "last-delta" | "full-turn";
+  private readonly initialOutput: string | undefined;
   private readonly isAgentBusy: () => boolean;
   private readonly observe: NonNullable<ObserveLoopControllerDeps["observe"]>;
   private readonly maxTurnMs: number | null;
@@ -236,6 +244,7 @@ export class ObserveLoopController {
       deps.formatWorkingTick ??
       ((elapsedMs) => `⏳ Working (${Math.floor(elapsedMs / 1000)}s).`);
     this.finalPayload = deps.finalPayload ?? "last-delta";
+    this.initialOutput = deps.initialOutput;
     this.isAgentBusy = deps.isAgentBusy ?? (() => false);
     this.observe = deps.observe ?? (() => ({ agentBusy: this.isAgentBusy(), completedOutput: null }));
     this.maxTurnMs = deps.maxTurnMs ?? null;
@@ -251,8 +260,8 @@ export class ObserveLoopController {
    *
    * The very first action inside the loop is a single
    * `communicator.getNewOutput()` call which seeds the communicator's
-   * baseline. No event is emitted for that seed — the user has been
-   * watching the pane live and replaying would duplicate content.
+   * baseline. Fresh loops emit no event for that seed, avoiding historical
+   * replay. Ceiling continuations retain it as output from the ongoing turn.
    */
   start(): Promise<void> {
     if (this.started) return this.started;
@@ -303,12 +312,11 @@ export class ObserveLoopController {
    */
   private async run(): Promise<void> {
     try {
-      // Baseline seed: one call to the communicator returns "" because
-      // it's the first call (and seeds `sentTail`). We deliberately do
-      // NOT treat this as an emission — historical content must never
-      // be replayed as "new".
+      // Fresh loops ignore their seed so history is not replayed. A ceiling
+      // continuation inherits the diff baseline: output since the last poll
+      // is new, even if it appeared while the busy/idle decision was pending.
       const seeded = this.communicator.getNewOutput();
-      void seeded; // baseline; intentionally ignored
+      let resumed = this.initialOutput === undefined ? "" : seeded;
 
       const startedAt = this.now();
       // lastChangeAt anchors the stability window. It is bumped every
@@ -319,11 +327,11 @@ export class ObserveLoopController {
       // emitted as a delta. The final payload falls back to this when
       // the pane goes idle — it's the most recent content the user has
       // already seen on Telegram and acts as a durable recap.
-      let lastDeltaText = "";
+      let lastDeltaText = this.initialOutput ?? "";
       // turnText accumulates every byte of unseen output observed during
       // this turn, before chunking. It is the `finalPayload: "full-turn"`
       // payload — the complete answer for consumers that suppress deltas.
-      let turnText = "";
+      let turnText = this.initialOutput ?? "";
 
       while (true) {
         await this.sleep(this.progressIntervalMs);
@@ -336,7 +344,9 @@ export class ObserveLoopController {
 
         const now = this.now();
         const elapsedMs = now - startedAt;
-        const unseen = this.communicator.getNewOutput();
+        const fresh = this.communicator.getNewOutput();
+        const unseen = resumed && fresh ? `${resumed}\n${fresh}` : resumed || fresh;
+        resumed = "";
 
         if (unseen.length > 0) {
           turnText += turnText ? `\n${unseen}` : unseen;

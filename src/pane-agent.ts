@@ -79,6 +79,12 @@ export interface PaneAgentDeps {
   ) => ObserveLoopController;
 }
 
+interface CeilingDecision {
+  done: Promise<void>;
+  /** undefined: unchanged; null: unfollow; number: requested follow deadline. */
+  followDeadline?: number | null;
+}
+
 interface CompletionSample {
   agent: string;
   pane: string;
@@ -163,6 +169,7 @@ export class PaneAgent {
   private inputEpoch = 0;
   private inputTail: Promise<void> = Promise.resolve();
   private pendingInputs = 0;
+  private ceilingDecision: CeilingDecision | null = null;
   private disposed = false;
   private fastTurn: { generation: number; baseline: CompletionSample; latest: CompletionSample; read: () => string | null } | null = null;
 
@@ -236,17 +243,20 @@ export class PaneAgent {
   }
 
   /**
-   * True while input is being prepared or an observe loop is running.
-   * Pending input must not be adopted as an unrelated terminal turn.
+   * True while input, observation or a ceiling outcome is pending.
+   * None may be adopted as an unrelated terminal turn.
    */
   isLoopActive(): boolean {
-    return this.loop !== null || this.pendingInputs > 0;
+    return this.loop !== null || this.pendingInputs > 0 || this.ceilingDecision !== null;
   }
 
   /**
    * Whether a follow is active (the loop has a deadline armed).
    */
   isFollowing(): boolean {
+    if (this.ceilingDecision?.followDeadline !== undefined) {
+      return this.ceilingDecision.followDeadline !== null;
+    }
     return this.loop !== null && this.loop.hasDeadline();
   }
 
@@ -274,6 +284,10 @@ export class PaneAgent {
     const prepared = this.inputTail.then(async () => {
       const active = () => !this.disposed && this.inputEpoch === epoch;
       if (!active()) return;
+      // The preceding controller built a final, but its busy/idle decision may
+      // still own that answer. Finish it before changing the reader's prompt.
+      if (this.ceilingDecision) await this.ceilingDecision.done;
+      if (!active()) return;
       if (!this.loop && generation === this.turnGeneration && this.opts.config.outputMode === "final") {
         const baseline = await this.sample();
         if (!active()) return;
@@ -290,6 +304,8 @@ export class PaneAgent {
           }
         }
       }
+      // A follow loop can reach its ceiling while baseline metadata is awaited.
+      if (this.ceilingDecision) await this.ceilingDecision.done;
       if (active()) this.dispatchInput(text);
     }).finally(() => {
       if (this.inputEpoch === epoch) this.pendingInputs--;
@@ -406,7 +422,11 @@ export class PaneAgent {
     // demonstrably still running.
     if (event.reason === "ceiling" && (agentBusy ?? this.opts.isAgentBusy?.())) {
       this.externalTurn = external;
-      this.startLoop({ deadline: null, waitUntilIdle: true });
+      this.startLoop({ deadline: null, waitUntilIdle: true,
+        // Final-only delivery has not sent any of the capped turn's deltas.
+        // Preserve them, plus output written during the ceiling metadata wait.
+        initialOutput: this.opts.config.outputMode === "final" && event.source === "delta" ? event.text : "",
+      });
       return;
     }
     const body = event.text.trim();
@@ -457,6 +477,10 @@ export class PaneAgent {
    */
   enableFollow(deadline: number): void {
     if (this.disposed) return;
+    if (this.ceilingDecision) {
+      this.ceilingDecision.followDeadline = deadline;
+      return;
+    }
     if (this.loop) {
       this.loop.updateDeadline(deadline);
       return;
@@ -475,6 +499,10 @@ export class PaneAgent {
    * No-op when no loop is active.
    */
   disableFollow(): void {
+    if (this.ceilingDecision) {
+      this.ceilingDecision.followDeadline = null;
+      return;
+    }
     if (!this.loop) return;
     this.loop.updateDeadline(null);
   }
@@ -490,6 +518,7 @@ export class PaneAgent {
     this.inputEpoch++;
     this.pendingInputs = 0;
     this.inputTail = Promise.resolve();
+    this.ceilingDecision = null;
     this.turnGeneration++;
     this.fastTurn = null;
     if (!this.loop) return;
@@ -537,9 +566,9 @@ export class PaneAgent {
     deadline: number | null;
     waitUntilIdle: boolean;
     fast?: boolean;
+    initialOutput?: string;
   }): void {
-    // A follow/adoption/continuation replaces observation intent too, even if
-    // it finishes before an older asynchronous ceiling check comes back.
+    // Follow/adoption/continuation cannot inherit proof from a user's input.
     if (!opts.fast) this.turnGeneration++;
     const generation = this.turnGeneration;
     if (!opts.fast || this.fastTurn?.generation !== generation) this.fastTurn = null;
@@ -556,13 +585,20 @@ export class PaneAgent {
       communicator: this.opts.communicator,
       emit: (event) => {
         if (event.type === "final" && event.reason === "ceiling" && this.opts.getCompletionInfo) {
-          // Ceiling continuation also needs fresh metadata, without blocking or
-          // restarting a turn that was stopped/replaced while the query ran.
-          const intent = this.turnGeneration;
-          void this.metadata().then(info => {
-            if (!this.disposed && this.turnGeneration === intent &&
-                (this.loop === controller || this.loop === null)) {
-              this.forward(event, info?.agent_status === "working");
+          // This final owns its answer until the fresh busy/idle decision is
+          // complete. New input invalidates proof, not an already-built final;
+          // only stop/dispose may cancel this outcome and release the queue.
+          const epoch = this.inputEpoch;
+          const decision: CeilingDecision = { done: Promise.resolve() };
+          this.ceilingDecision = decision;
+          decision.done = this.metadata().then(info => {
+            if (this.disposed || this.inputEpoch !== epoch || this.ceilingDecision !== decision) return;
+            this.ceilingDecision = null;
+            this.forward(event, info?.agent_status === "working");
+            if (this.disposed || this.inputEpoch !== epoch) return;
+            if (decision.followDeadline !== undefined) {
+              if (decision.followDeadline === null) this.disableFollow();
+              else this.enableFollow(decision.followDeadline);
             }
           });
         } else {
@@ -576,6 +612,7 @@ export class PaneAgent {
       // In "final" mode the daemon drops every delta, so the final event is
       // the turn's only delivery and has to carry all of it.
       finalPayload: this.opts.config.outputMode === "final" ? "full-turn" : "last-delta",
+      initialOutput: opts.initialOutput,
       isAgentBusy: this.opts.isAgentBusy,
       observe: this.opts.getCompletionInfo ? async () => {
         const info = await this.metadata();
