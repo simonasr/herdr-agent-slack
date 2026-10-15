@@ -10,7 +10,8 @@ const mocks = vi.hoisted(() => ({
   live: null as AgentInfo | null,
   client: undefined as SlackClientDeps | undefined,
   panes: [] as Array<{ opts: PaneAgentOptions; dispose: ReturnType<typeof vi.fn>; active: boolean }>,
-  post: vi.fn(async () => "answer-ts"),
+  post: vi.fn(async (_thread: { channel: string; threadTs: string }, _text: string) => "answer-ts"),
+  upload: vi.fn(async () => {}),
   status: vi.fn(async () => {}),
   react: vi.fn(async () => true),
 }));
@@ -30,6 +31,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
     start = vi.fn(async () => {});
     stop = vi.fn(async () => {});
     post = mocks.post;
+    upload = mocks.upload;
     setStatus = mocks.status;
     react = mocks.react;
     unreact = vi.fn(async () => {});
@@ -166,9 +168,9 @@ describe("Slack daemon — session replacement in the same pane", () => {
     let release!: (ts: string) => void;
     mocks.post.mockClear();
     mocks.post.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
-    // Enough prose to require multiple Slack posts. Only the in-flight one
-    // may survive replacement; remaining chunks and settlement must stop.
-    old.opts.emit({ type: "final", text: "old answer line\n".repeat(1500), source: "delta", reason: "idle" });
+    // A replacement stops remaining chunks; a same-session follow-up must
+    // preserve the full answer, but neither may settle the newer question.
+    old.opts.emit({ type: "final", text: "old answer line\n".repeat(900), source: "delta", reason: "idle" });
     await flush();
     expect(mocks.post).toHaveBeenCalledOnce();
     if (change === "replacement") mocks.live = liveSession(sessionFile("new.jsonl", "replacement history"));
@@ -177,13 +179,68 @@ describe("Slack daemon — session replacement in the same pane", () => {
     mocks.react.mockClear();
     release("old-answer-ts");
     await flush();
-    expect(mocks.post).toHaveBeenCalledOnce();
+    if (change === "replacement") expect(mocks.post).toHaveBeenCalledOnce();
+    else expect(mocks.post.mock.calls.map(([, text]) => text).join("\n").match(/old answer line/g)).toHaveLength(900);
     const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
     expect(state.marked["w1:p1"].ts).toBe("3.0");
     expect(state.last_answer["w1:p1"]).toBeUndefined();
     expect(state.delivered["w1:p1"]).toBeUndefined();
     expect(mocks.react).not.toHaveBeenCalled();
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+  });
+
+  it("posts a same-session final during new-turn setup without settling that new turn", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "old question", "2.0");
+    let release!: () => void;
+    mocks.status.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const incoming = mocks.client!.onUserMessage(thread, "U1", "new question", "3.0");
+    await flush();
+    mocks.post.mockClear();
+    mocks.panes[0].opts.emit({ type: "final", text: "complete old answer", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "complete old answer");
+    release();
+    await incoming;
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    expect(state.marked["w1:p1"].ts).toBe("3.0");
+    expect(state.last_answer["w1:p1"]).toBeUndefined();
+    expect(state.delivered["w1:p1"]).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+  });
+
+  it("finishes a started file batch and its notes after a same-session follow-up", async () => {
+    mocks.live = { ...mocks.live!, cwd: dir };
+    writeFileSync(join(dir, "one.txt"), "one");
+    writeFileSync(join(dir, "two.txt"), "two");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "old question", "2.0");
+    let release!: () => void;
+    mocks.upload.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    mocks.panes[0].opts.emit({ type: "final", text: "files ready\n@@send: one.txt\n@@send: two.txt\n@@send: missing.txt", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.upload).toHaveBeenCalledOnce();
+    await mocks.client!.onUserMessage(thread, "U1", "new question", "3.0");
+    release();
+    await flush();
+    expect(mocks.upload).toHaveBeenCalledTimes(2);
+    expect(mocks.post).toHaveBeenCalledWith(thread, expect.stringContaining("missing.txt"));
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked["w1:p1"].ts).toBe("3.0");
+  });
+
+  it("finishes a started self-command handoff after a same-session follow-up", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "old question", "2.0");
+    let release!: (ts: string) => void;
+    mocks.post.mockResolvedValueOnce("answer-ts").mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    mocks.panes[0].opts.emit({ type: "final", text: "@default !help\n@default !last", source: "delta", reason: "idle" });
+    await flush();
+    expect(release).toBeTypeOf("function");
+    await mocks.client!.onUserMessage(thread, "U1", "new question", "3.0");
+    release("help-ts");
+    await flush();
+    expect(mocks.post).toHaveBeenCalledWith(thread, "old unrelated history");
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked["w1:p1"].ts).toBe("3.0");
   });
 
   it("does not add a done reaction if a new turn starts while the old working reaction is removed", async () => {
