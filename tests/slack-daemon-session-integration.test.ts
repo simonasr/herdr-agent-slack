@@ -227,7 +227,10 @@ describe("Slack session routing — real observe loops", () => {
     expect(mocks.post).not.toHaveBeenCalled();
   });
 
-  it.each(["before setup", "during history"])("retains a new question when idle replacement arrives %s", async (when) => {
+  it.each([
+    ["before setup", "idle"], ["during history", "idle"],
+    ["before setup", "working"], ["during history", "working"],
+  ])("retains a new question when a %s replacement is %s", async (when, status) => {
     const statePath = join(dir, "state.json");
     const state = JSON.parse(readFileSync(statePath, "utf8"));
     state.threads["default|C1:1.0"].context_sent = false;
@@ -235,14 +238,18 @@ describe("Slack session routing — real observe loops", () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     const newPath = join(dir, "replacement.jsonl");
     writeFileSync(newPath, message("replacement history"));
-    if (when === "before setup") mocks.live = liveSession(newPath, "idle");
+    if (when === "before setup") mocks.live = liveSession(newPath, status);
     let release!: (value: ThreadMessage[]) => void;
     mocks.history.mockImplementationOnce(() => new Promise<ThreadMessage[]>(resolve => { release = resolve; }));
     const sending = mocks.client!.onUserMessage(thread, "U1", "pending new question", "2.0");
     await vi.advanceTimersByTimeAsync(0);
     expect(mocks.history).toHaveBeenCalledOnce();
-    if (when === "during history") mocks.live = liveSession(newPath, "idle");
+    if (when === "during history") mocks.live = liveSession(newPath, status);
     await vi.advanceTimersByTimeAsync(5_000);
+    // Any unrelated work in the replacement can finish while setup awaits Slack.
+    mocks.live = liveSession(newPath, "idle");
+    appendFileSync(newPath, message("unrelated answer during setup"));
+    await vi.advanceTimersByTimeAsync(300);
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
     expect(JSON.parse(readFileSync(statePath, "utf8")).marked["w1:p1"].ts).toBe("2.0");
     expect(mocks.status).not.toHaveBeenCalledWith(thread, "");

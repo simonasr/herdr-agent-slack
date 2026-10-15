@@ -961,6 +961,8 @@ export async function startSlackDaemon(
   const announcedPrompt = new Map<string, string>();
 
   const adoptExternalTurn = (paneId: string): boolean => {
+    // Slack owns setup until handleMessage starts observation with its prompt.
+    if (startingTurns.has(paneId)) return false;
     const binding = bindingForPane(paneId);
     if (!binding) return false;
     const agent = paneAgentFor(binding);
