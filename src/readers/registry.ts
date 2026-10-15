@@ -53,13 +53,15 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
   }
 
   if (req.session?.kind === "id" && req.agentName === "codex") {
-    const path = findCodexSessionPath(req.session.id);
+    const session = req.session;
+    const path = findCodexSessionPath(session.id);
     if (path) return new CodexJsonlReader(path, req.logger, req.paneId);
-    req.logger.warn("structured source unavailable; falling back to scrape", {
-      paneId: req.paneId,
-      agent: req.agentName,
-      reason: `codex session not on disk: ${req.session.id}`,
-    });
+    // Metadata may precede the rollout for initial and replacement sessions.
+    // Unlike the sessionless resolver, this reader must wait for this exact id.
+    return new DeferredReader("codex-jsonl", false, () => {
+      const found = findCodexSessionPath(session.id);
+      return found ? Object.assign(new CodexJsonlReader(found, req.logger, req.paneId), { session }) : null;
+    }, req.logger, req.paneId, new ScrapeReader(req.paneId, req.readPane));
   }
 
   // A Codex pane with no session yet has just started: the rollout is

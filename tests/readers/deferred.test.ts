@@ -107,6 +107,24 @@ describe("Codex pane that has no session yet", () => {
     expect(reader.session).toEqual({ kind: "id", id });
   });
 
+  it("waits for a known Codex id's missing rollout and stays pinned to that id", () => {
+    const session = { kind: "id" as const, id: "known-before-rollout" };
+    const reader = createAgentOutputReader({
+      paneId: "w1:p1", agentName: "codex", session,
+      resolveSession: () => ({ kind: "id", id: "different-session" }),
+      readPane: () => "unrelated screen history", logger,
+    });
+    expect(reader.kind).toBe("codex-jsonl");
+    expect(reader.read(100)).toBe("");
+    const sessions = join(home, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, `rollout-${session.id}.jsonl`), JSON.stringify({
+      type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "the known session answer" }] },
+    }) + "\n");
+    expect(reader.read(100)).toBe("the known session answer");
+    expect(reader.session).toEqual(session);
+  });
+
   it("still scrapes when nobody can ask herdr again", () => {
     const reader = createAgentOutputReader({
       paneId: "w1:p1",
