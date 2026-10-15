@@ -593,8 +593,13 @@ export class PaneAgent {
           this.ceilingDecision = decision;
           decision.done = this.metadata().then(info => {
             if (this.disposed || this.inputEpoch !== epoch || this.ceilingDecision !== decision) return;
+            const busy = info?.agent_status === "working";
+            // A busy continuation drains its inherited baseline; an idle
+            // outcome must likewise read the suffix before releasing input.
+            const final = busy ? event : controller.refreshCeilingFinal(event);
+            if (this.disposed || this.inputEpoch !== epoch || this.ceilingDecision !== decision) return;
             this.ceilingDecision = null;
-            this.forward(event, info?.agent_status === "working");
+            this.forward(final, busy);
             if (this.disposed || this.inputEpoch !== epoch) return;
             if (decision.followDeadline !== undefined) {
               if (decision.followDeadline === null) this.disableFollow();
