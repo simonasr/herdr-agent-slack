@@ -269,34 +269,34 @@ export class PaneAgent {
   /**
    * A user message arrived. Prepares metadata without blocking and forwards
    * input in arrival order, unless stop/dispose cancels it before dispatch.
-   * The returned promise resolves after dispatch (or cancellation).
+   * The returned promise resolves true after dispatch, false on cancellation.
    * If no loop is active, starts one with deadline=null and
    * waitUntilIdle=true (idle-based stop). If a loop is already active
    * (turn in flight, follow in flight, …), just marks waitUntilIdle on
    * it — the deadline gate (if any) is preserved untouched so a
    * follow timer keeps ticking through user messages.
    */
-  handleMessage(text: string): Promise<void> {
-    if (this.disposed) return Promise.resolve();
+  handleMessage(text: string): Promise<boolean> {
+    if (this.disposed) return Promise.resolve(false);
     // Invalidate on arrival, not after queued metadata or reader callbacks.
     const generation = ++this.turnGeneration;
     this.fastTurn = null;
     if (!this.opts.getCompletionInfo) {
       this.dispatchInput(text);
-      return Promise.resolve();
+      return Promise.resolve(true);
     }
     const epoch = this.inputEpoch;
     this.pendingInputs++;
     const prepared = this.inputTail.then(async () => {
       const active = () => !this.disposed && this.inputEpoch === epoch;
-      if (!active()) return;
+      if (!active()) return false;
       // The preceding controller built a final, but its busy/idle decision may
       // still own that answer. Finish it before changing the reader's prompt.
       if (this.ceilingDecision) await this.ceilingDecision.done;
-      if (!active()) return;
+      if (!active()) return false;
       if (!this.loop && generation === this.turnGeneration && this.opts.config.outputMode === "final") {
         const baseline = await this.sample();
-        if (!active()) return;
+        if (!active()) return false;
         if (baseline && settled(baseline.status) && generation === this.turnGeneration && !this.loop) {
           const read = this.opts.communicator.captureCompletedResponse(text, baseline.session);
           // Unsupported readers have nothing to revalidate.
@@ -312,12 +312,14 @@ export class PaneAgent {
       }
       // A follow loop can reach its ceiling while baseline metadata is awaited.
       if (this.ceilingDecision) await this.ceilingDecision.done;
-      if (active()) this.dispatchInput(text);
+      if (!active()) return false;
+      this.dispatchInput(text);
+      return true;
     }).finally(() => {
       if (this.inputEpoch === epoch) this.pendingInputs--;
     });
     // A failed send must not prevent later queued messages from being processed.
-    this.inputTail = prepared.catch(() => {});
+    this.inputTail = prepared.then(() => {}, () => {});
     return prepared;
   }
 
@@ -344,13 +346,16 @@ export class PaneAgent {
    * from being adopted a second time when herdr reports the pane busy a
    * moment later.
    *
+   * A matching submittedPrompt resumes a Slack turn instead: retain its full
+   * response anchor, without resending or announcing it as terminal input.
    * Returns whether a loop was actually started, so a caller can tell an
    * adopted turn from one that was already being followed.
    */
-  noteExternalTurn(): boolean {
+  noteExternalTurn(submittedPrompt = ""): boolean {
     if (this.disposed || this.isLoopActive()) return false;
-    this.opts.communicator.beginExternalTurn();
-    this.externalTurn = true;
+    if (submittedPrompt) this.opts.communicator.retainSubmittedPrompt(submittedPrompt);
+    else this.opts.communicator.beginExternalTurn();
+    this.externalTurn = !submittedPrompt;
     this.startLoop({ deadline: null, waitUntilIdle: true });
     return true;
   }
