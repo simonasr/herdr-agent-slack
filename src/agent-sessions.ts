@@ -755,6 +755,10 @@ export class AgentCommunicator {
   get readerKind(): string {
     return this.reader.kind;
   }
+  /** The pinned session, not merely the latest metadata seen by its resolver. */
+  get readerSession(): AgentSessionRef {
+    return this.reader.session;
+  }
   /** Whether the reader's text is the model's own, needing no pane filters. */
   get verbatim(): boolean {
     return this.reader.verbatim === true;
@@ -959,12 +963,17 @@ export class AgentCommunicator {
         "AgentCommunicator.sendInput requires a paneId — use createAgentCommunicator()"
       );
     }
+    this.retainSubmittedPrompt(text);
+    sendText(this.paneId, text);
+  }
+
+  /** Adopt a prompt already sent to this session, without sending it again. */
+  retainSubmittedPrompt(text: string): void {
     this.lastInput = text;
     this.externalTurn = false;
     this.remember(text);
     this.sentTexts.push(text);
     if (this.sentTexts.length > 8) this.sentTexts.shift();
-    sendText(this.paneId, text);
   }
 
   /**
@@ -1037,6 +1046,11 @@ export class AgentCommunicator {
     // last one — leaves the memory alone. Blanking it here is what let the
     // next such turn quote that question all over again.
     this.remember(prompt.trim() || this.lastInput);
+  }
+
+  /** Raw logged prompt for correlating a late-named session with a sent turn. */
+  getLastLoggedPrompt(): string {
+    return this.reader.lastPrompt?.().trim() ?? "";
   }
 
   /**
