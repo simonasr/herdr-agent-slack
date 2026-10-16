@@ -278,6 +278,8 @@ export interface AgentOutputReader {
    * be swallowed and surfaced via the communicator's logger.
    */
   read(_maxLines: number): string;
+  /** One parsed snapshot and all output since the earliest pending submitted prompt; null if absent. */
+  readSincePrompts?(prompts: readonly string[]): { snapshot: string; text: string } | null;
   /**
    * The question the agent is answering, or answered last. Only a source
    * that logs the user's side can offer it; a screen has its own extraction.
@@ -757,9 +759,9 @@ export class AgentCommunicator {
   get readerKind(): string {
     return this.reader.kind;
   }
-  /** Whether a real source (including a bounded scrape fallback) has been selected. */
+  /** Whether a source and any deferred submitted-prompt boundary are ready. */
   get outputReady(): boolean {
-    return this.reader.ready !== false;
+    return this.reader.ready !== false && this.deferredInputGroup?.ready !== false;
   }
   /** Whether the reader's text is the model's own, needing no pane filters. */
   get verbatim(): boolean {
@@ -799,6 +801,8 @@ export class AgentCommunicator {
   private initialized = false;
   /** Most recent text handed to the pane, used to anchor a turn's response. */
   private lastInput = "";
+  /** This turn's unresolved input group, frozen once found; reset on fresh input/follow/adoption. */
+  private deferredInputGroup: { prompts: string[]; ready: boolean } | null = null;
   /**
    * Whether the turn under way was started outside the bridge — somebody typed
    * in the pane itself. There is no submitted text to anchor on, so the answer
@@ -877,6 +881,18 @@ export class AgentCommunicator {
     }
   }
 
+  /** Capture an inactive turn's literal baseline before dispatch, never after it. */
+  seedOutputBaseline(): void {
+    this.sentTail = tailOf(this.getAgentOutput(4000), SENT_TAIL_MAX);
+    this.initialized = true;
+    this.deferredInputGroup = this.reader.ready === false ? { prompts: [], ready: false } : null;
+  }
+
+  /** A new follow window must not inherit an ended submitted turn's unresolved boundary. */
+  clearPendingInputBoundary(): void {
+    this.deferredInputGroup = null;
+  }
+
   /**
    * Stateful diff reader for polling consumers (follow loop, turn
    * controller, etc.).
@@ -892,11 +908,26 @@ export class AgentCommunicator {
    *     first error after a clean seed will look like "snapshot went
    *     empty", which `deriveUnseen` handles by returning "".
    *
+   * Submitted turns seedOutputBaseline before sending, so even their first
+   * poll can return a fast reply. Deferred sources first exclude prior prompts.
    * Multiple calls after the baseline seed each return only what has
    * appeared since the previous successful call, so a polling consumer
    * that calls this every tick will see each new chunk exactly once.
    */
   getNewOutput(): string {
+    if (this.deferredInputGroup && !this.deferredInputGroup.ready) {
+      const turn = this.reader.readSincePrompts?.(this.deferredInputGroup.prompts);
+      if (turn && turn.snapshot.endsWith(turn.text)) {
+        // Consume the same snapshot that supplied the entire pending input group.
+        this.sentTail = tailOf(turn.snapshot, SENT_TAIL_MAX);
+        this.initialized = true;
+        this.deferredInputGroup.ready = true;
+        return turn.text;
+      }
+      if (this.readerKind !== "scrape") return "";
+      // The bounded permanent fallback retains its ordinary screen behavior.
+      this.deferredInputGroup = null;
+    }
     const snapshot = this.getAgentOutput(4000);
     if (!this.initialized) {
       this.sentTail = tailOf(snapshot, SENT_TAIL_MAX);
@@ -966,6 +997,9 @@ export class AgentCommunicator {
       );
     }
     this.lastInput = text;
+    if (this.deferredInputGroup) {
+      if (!this.deferredInputGroup.ready) this.deferredInputGroup.prompts.push(text);
+    }
     this.externalTurn = false;
     this.remember(text);
     this.sentTexts.push(text);
@@ -993,6 +1027,11 @@ export class AgentCommunicator {
    */
   getTurnResponse(): string {
     if (this.readerKind !== "scrape") {
+      // A delayed source can contain several inputs from this active turn.
+      // Re-reading only its last answer would lose the earlier input's output.
+      if (this.deferredInputGroup?.ready) {
+        return this.reader.readSincePrompts?.(this.deferredInputGroup.prompts)?.text ?? "";
+      }
       const asked = this.reader.lastPrompt?.().trim() ?? "";
       if (!asked || !this.reader.lastAnswer) return "";
       const isNew = this.lastInput.trim()
@@ -1162,6 +1201,7 @@ export class AgentCommunicator {
 
   beginExternalTurn(): void {
     this.lastInput = "";
+    this.deferredInputGroup = null;
     this.externalTurn = true;
     this.readMark = "";
     if (this.readerKind !== "scrape") return;

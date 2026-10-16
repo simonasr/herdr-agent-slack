@@ -154,10 +154,10 @@ export interface ObserveLoopControllerDeps {
    */
   finalPayload?: "last-delta" | "full-turn";
   /**
-   * A ceiling continuation shares the communicator's existing diff baseline.
-   * Carry its undelivered full-turn output and retain the first read as new
-   * output instead of treating it as historical seed. Empty string resumes
-   * without carrying old output (streaming consumers already received it).
+   * A submitted turn or ceiling continuation shares a previously captured diff
+   * baseline. Carry any undelivered full-turn output and retain the first read
+   * as new instead of treating it as historical seed. Empty string retains
+   * the first read without carrying old output.
    */
   initialOutput?: string;
   /**
@@ -261,9 +261,9 @@ export class ObserveLoopController {
    * event (idle / deadline / aborted).
    *
    * The very first action inside the loop is a single
-   * `communicator.getNewOutput()` call which seeds the communicator's
-   * baseline. Fresh loops emit no event for that seed, avoiding historical
-   * replay. Ceiling continuations retain it as output from the ongoing turn.
+   * `communicator.getNewOutput()` call. Fresh follow/adoption loops discard
+   * that seed to avoid history replay; submitted turns and continuations retain
+   * it against their captured baseline, including replies arriving during send.
    */
   start(): Promise<void> {
     if (this.started) return this.started;
@@ -315,8 +315,8 @@ export class ObserveLoopController {
    */
   private async run(): Promise<void> {
     try {
-      // Fresh loops ignore their seed so history is not replayed. A ceiling
-      // continuation inherits the diff baseline: output since the last poll
+      // Fresh follow/adoption loops ignore their seed so history is not replayed.
+      // Submitted turns and continuations inherit a baseline: output since it
       // is new, even if it appeared while the busy/idle decision was pending.
       const seeded = this.communicator.getNewOutput();
       let resumed = this.initialOutput === undefined ? "" : seeded;
@@ -545,7 +545,7 @@ export class ObserveLoopController {
       // when this turn produced no output. Screens retain their readback.
       const latest = this.communicator.readerKind === "scrape"
         ? this.communicator.getLatestOutput()
-        : this.communicator.canIsolateLastAnswer() ? this.communicator.getLastAnswer() : "";
+        : this.communicator.outputReady && this.communicator.canIsolateLastAnswer() ? this.communicator.getLastAnswer() : "";
       if (latest.trim().length === 0) {
         text = "";
       } else if (this.finalPayload === "full-turn") {

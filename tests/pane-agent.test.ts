@@ -870,6 +870,70 @@ function completionEnv(opts: {
   };
 }
 
+describe("PaneAgent — pending source boundary lifecycle", () => {
+  it.each(["follow", "adoption"] as const)("keeps a pending %s observer's earlier output when Slack input joins", async observer => {
+    let ready = false;
+    let snapshot = "";
+    const e = completionEnv({ mode: "stream", reader: {
+      kind: "codex-jsonl", get ready() { return ready; }, read: () => snapshot,
+      readSincePrompts: () => ready ? { snapshot, text: "new input answer" } : null,
+    } });
+    if (observer === "follow") e.agent.enableFollow(60_000);
+    else e.agent.noteExternalTurn();
+    await e.agent.handleMessage("new input");
+    ready = true;
+    snapshot = "observer's earlier answer\n\nnew input answer";
+    await e.tick();
+    expect(e.events.filter(event => event.type === "delta")).toEqual([
+      { type: "delta", text: "observer's earlier answer\n\nnew input answer\n\n" },
+    ]);
+    e.agent.stop();
+  });
+
+  it("retains the pending group across a busy ceiling continuation", async () => {
+    let ready = false;
+    let snapshot = "";
+    const readSincePrompts = vi.fn((_prompts: readonly string[]) => ready
+      ? { snapshot, text: "first answer\n\nsecond answer" } : null);
+    const e = completionEnv({ mode: "final", maxTotalWaitS: 2,
+      reader: { kind: "codex-jsonl", get ready() { return ready; }, read: () => snapshot, readSincePrompts },
+    });
+    await e.agent.handleMessage("first");
+    await e.agent.handleMessage("second");
+    e.change({ agent_status: "working" });
+    await e.tick();
+    expect(e.finals()).toHaveLength(0);
+    ready = true;
+    snapshot = "historical answer\n\nfirst answer\n\nsecond answer";
+    e.change({ agent_status: "idle" });
+    await e.tick();
+    expect(readSincePrompts).toHaveBeenCalledWith(["first", "second"]);
+    expect(e.finals()).toHaveLength(1);
+    expect(e.finals()[0]).toMatchObject({ text: "first answer\n\nsecond answer", reason: "ceiling" });
+  });
+
+  it.each(["stop", "ceiling"] as const)("does not let a %s turn's unresolved prompt suppress a later follow", async ending => {
+    let ready = false;
+    let snapshot = "";
+    const e = completionEnv({ mode: "stream", maxTotalWaitS: ending === "ceiling" ? 2 : 20,
+      reader: { kind: "codex-jsonl", get ready() { return ready; }, read: () => snapshot,
+        lastPrompt: () => "older prompt", lastAnswer: () => "historical answer" },
+    });
+    await e.agent.handleMessage("new question");
+    await e.tick();
+    if (ending === "stop") { e.agent.stop(); await e.tick(); }
+    expect(e.finals()).toHaveLength(1);
+    expect(e.finals()[0]).toMatchObject({ reason: ending === "stop" ? "aborted" : "ceiling", text: "" });
+    ready = true;
+    snapshot = "historical answer";
+    e.agent.enableFollow(60_000);
+    snapshot += "\n\nnew followed answer";
+    await e.tick();
+    expect(e.events.filter(event => event.type === "delta")).toEqual([{ type: "delta", text: "new followed answer\n\n" }]);
+    e.agent.stop();
+  });
+});
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(r => { resolve = r; });

@@ -145,6 +145,114 @@ describe("Slack session routing — real observe loops", () => {
     expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "answer from the exact rollout");
   });
 
+  it("excludes historical answers when a delayed Codex rollout resolves in stream mode", async () => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "late-history" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "current question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-late-history.jsonl"),
+      codexTurn("historical question", "historical answer must not replay") + codexTurn(prompt, "current answer"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "current answer");
+  });
+
+  it("waits for the submitted prompt when a delayed rollout initially contains only history", async () => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "history-first" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "current question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    const path = join(sessions, "rollout-history-first.jsonl");
+    writeFileSync(path, codexTurn("historical question", "historical answer must not replay"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    appendFileSync(path, codexTurn(prompt, "current answer after history"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "current answer after history");
+  });
+
+  it.each(["final", "stream"] as const)("retains a cumulative Pi reply arriving during dispatch in %s mode", async mode => {
+    appendFileSync(join(dir, "config.toml"), `output_mode = "${mode}"\n`);
+    mocks.live = liveSession(oldPath, "idle");
+    vi.mocked(sendText).mockImplementationOnce(() => { appendFileSync(oldPath, message("fast current reply")); });
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "fast question", "2.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "fast current reply");
+  });
+
+  it.each([
+    ["coalesced", "stream"], ["separate", "stream"],
+    ["coalesced", "final"], ["separate", "final"],
+  ] as const)("retains delayed answers for %s inputs in %s mode through the same active loop", async (mode, outputMode) => {
+    appendFileSync(join(dir, "config.toml"), `output_mode = "${outputMode}"\n`);
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "pending-inputs" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "first question", "2.0");
+    await mocks.client!.onUserMessage(thread, "U1", "additional question", "3.0");
+    expect(sendText).toHaveBeenCalledTimes(2);
+    const first = vi.mocked(sendText).mock.calls[0][1];
+    const second = vi.mocked(sendText).mock.calls[1][1];
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-pending-inputs.jsonl"),
+      codexTurn("historical question", "old answer must not replay") +
+      codexTurn(first, "first current answer") + (mode === "separate" ? codexTurn(second, "second current answer") : ""));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread,
+      mode === "separate" ? "first current answer\n\nsecond current answer" : "first current answer");
+  });
+
+  it("does not consume an active observer's unread output when another input is sent", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    appendFileSync(oldPath, message("unread terminal output"));
+    vi.mocked(sendText).mockImplementationOnce(() => { appendFileSync(oldPath, message("fast current reply")); });
+    await mocks.client!.onUserMessage(thread, "U1", "additional question", "2.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    mocks.live = liveSession(oldPath, "idle");
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "unread terminal output\n\nfast current reply");
+  });
+
+  it("reseeds before a later inactive input without replaying output between turns", async () => {
+    mocks.live = liveSession(oldPath, "idle");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    vi.mocked(sendText).mockImplementationOnce(() => { appendFileSync(oldPath, message("first fast reply")); });
+    await mocks.client!.onUserMessage(thread, "U1", "first question", "2.0");
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "first fast reply");
+    appendFileSync(oldPath, message("historical output between inactive turns"));
+    vi.mocked(sendText).mockImplementationOnce(() => { appendFileSync(oldPath, message("second fast reply")); });
+    await mocks.client!.onUserMessage(thread, "U1", "second question", "3.0");
+    await vi.advanceTimersByTimeAsync(300);
+    expect(sendText).toHaveBeenCalledTimes(2);
+    expect(mocks.post).toHaveBeenCalledTimes(2);
+    expect(mocks.post).toHaveBeenNthCalledWith(2, thread, "second fast reply");
+  });
+
+  it("honors the hard ceiling without using unmatched delayed history as a snapshot", async () => {
+    appendFileSync(join(dir, "config.toml"), 'max_total_wait_s = 1\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "ceiling-history" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "current question", "2.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-ceiling-history.jsonl"), codexTurn("old question", "historical answer"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "✅ Done (no output).");
+  });
+
   it("preserves last-delta delivery for an ordinary anchored stream-mode question", async () => {
     appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
     const sessions = join(dir, ".codex", "sessions");
