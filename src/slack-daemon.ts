@@ -450,22 +450,60 @@ export async function startSlackDaemon(
   /** Invalidates in-flight settlement when even the same session gets a new turn. */
   const turnOwners = new Map<string, object>();
   const agentSessions = new WeakMap<PaneAgent, string | undefined>();
-  const agentSources = new WeakMap<PaneAgent, { name?: string; communicator: ReturnType<typeof createAgentCommunicator> }>();
+  const metadataOverride = new WeakMap<ReturnType<typeof createAgentCommunicator>, AgentInfo | null>();
+  const asyncReaderInfo = new WeakMap<ReturnType<typeof createAgentCommunicator>, AgentInfo | null>();
+  const agentSources = new WeakMap<PaneAgent, { name?: string; communicator: ReturnType<typeof createAgentCommunicator>;
+    emit: (event: OutputEvent, deadline?: number) => void }>();
   /** Incoming prompts retain ownership while Slack/history calls are awaited. */
   const startingTurns = new Map<string, number>();
-  const finalRetries = new Map<PaneAgent, ReturnType<typeof setTimeout>>();
-  const cancelFinalRetry = (agent: PaneAgent): void => {
-    clearTimeout(finalRetries.get(agent));
-    finalRetries.delete(agent);
+  type Verification = { turn: object | undefined; duringSetup: boolean; binding: ThreadBinding;
+    deadline?: number; expired?: boolean; retry?: ReturnType<typeof setTimeout>; deadlineTimer?: ReturnType<typeof setTimeout> };
+  const finalVerifications = new Map<PaneAgent, Set<Verification>>();
+  const cancelVerification = (agent: PaneAgent, verification: Verification): void => {
+    clearTimeout(verification.retry);
+    clearTimeout(verification.deadlineTimer);
+    verification.retry = undefined;
+    verification.deadlineTimer = undefined;
+    const active = finalVerifications.get(agent);
+    active?.delete(verification);
+    if (active?.size === 0) finalVerifications.delete(agent);
+  };
+  const cancelFinalRetry = (agent: PaneAgent, preserveSetup = false): void => {
+    for (const verification of finalVerifications.get(agent) ?? []) {
+      if (!preserveSetup || !verification.duringSetup) cancelVerification(agent, verification);
+    }
   };
   const sessionIdentity = (info: Pick<AgentInfo, "agent" | "agent_session"> | null): string | undefined => {
     const ref = info?.agent_session;
     return ref ? JSON.stringify([info.agent, ref.kind, ref.kind === "path" ? ref.path : ref.id]) : undefined;
   };
-  const readerIdentityOf = (agent: PaneAgent): string | undefined => {
+  /** Concurrent event checks share a request, never a completed (stale) result. */
+  const pendingIdentity = new Map<string, Promise<AgentInfo | null>>();
+  const identityEpoch = new Map<string, number>();
+  const freshIdentity = (paneId: string): Promise<AgentInfo | null> => {
+    const pending = pendingIdentity.get(paneId);
+    if (pending) return pending;
+    const epoch = identityEpoch.get(paneId);
+    const request = Promise.resolve().then(() => getAgentInfoAsync(paneId)).catch(() => null)
+      .then(info => epoch === identityEpoch.get(paneId) ? info : freshIdentity(paneId));
+    pendingIdentity.set(paneId, request);
+    void request.finally(() => { if (pendingIdentity.get(paneId) === request) pendingIdentity.delete(paneId); });
+    return request;
+  };
+  const withSnapshot = <T>(agent: PaneAgent, info: AgentInfo | null, read: () => T): T => {
     const source = agentSources.get(agent);
-    return source?.name
-      ? sessionIdentity({ agent: source.name, agent_session: source.communicator.readerSession }) : undefined;
+    if (!source) return read();
+    if (asyncReaderInfo.has(source.communicator)) asyncReaderInfo.set(source.communicator, info);
+    metadataOverride.set(source.communicator, info);
+    try { return read(); } finally { metadataOverride.delete(source.communicator); }
+  };
+  const readerIdentityOf = (agent: PaneAgent, info?: AgentInfo | null): string | undefined => {
+    const read = (): string | undefined => {
+      const source = agentSources.get(agent);
+      return source?.name
+        ? sessionIdentity({ agent: source.name, agent_session: source.communicator.readerSession }) : undefined;
+    };
+    return info === undefined ? read() : withSnapshot(agent, info, read);
   };
   /**
    * Questions asked in a thread that have not been answered yet. Read at
@@ -481,10 +519,11 @@ export async function startSlackDaemon(
   const idleRecoveries = new Map<string, {
     binding: ThreadBinding; turn: object | undefined; deadline: number;
     agent: PaneAgent; timer?: ReturnType<typeof setTimeout>;
+    deadlineTimer?: ReturnType<typeof setTimeout>; probing?: boolean;
   }>();
   const cancelIdleRecovery = (paneId: string): void => {
     const recovery = idleRecoveries.get(paneId);
-    if (recovery) clearTimeout(recovery.timer);
+    if (recovery) { clearTimeout(recovery.timer); clearTimeout(recovery.deadlineTimer); }
     idleRecoveries.delete(paneId);
   };
   const closePendingTurn = (paneId: string): void => {
@@ -565,22 +604,24 @@ export async function startSlackDaemon(
    * running in the background — then the answer was an interim one, the mark
    * stays, and the status line says what is still going.
    */
-  const markDone = async (bot: Bot, paneId: string, thread: SlackThread, isCurrent: () => boolean): Promise<void> => {
-    if (!isCurrent()) return;
+  const markDone = async (bot: Bot, paneId: string, thread: SlackThread, isCurrent: () => Promise<boolean>): Promise<void> => {
+    if (!await isCurrent()) return;
     const mark = state.marked[paneId];
     if (!mark) return;
     const running = backgroundOn(paneId);
     if (running) {
+      if (!await isCurrent()) return;
       log.info("answer delivered, but work continues in the background", { paneId, running });
       await bot.client.setStatus(thread, `has ${running} still running in the background`);
       return;
     }
+    if (!await isCurrent() || state.marked[paneId] !== mark) return;
     delete state.marked[paneId];
     persist();
     await bot.client.react(mark.channel, mark.ts, mark.name ?? FALLBACK_WORKING, false);
-    if (!isCurrent()) return;
+    if (!await isCurrent()) return;
     if (!(await bot.client.react(mark.channel, mark.ts, bot.cfg.markDone, true)) && bot.cfg.markDone !== FALLBACK_DONE) {
-      if (!isCurrent()) return;
+      if (!await isCurrent()) return;
       await bot.client.react(mark.channel, mark.ts, FALLBACK_DONE, true);
     }
   };
@@ -590,6 +631,54 @@ export async function startSlackDaemon(
     if (!startedAt) return "";
     const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
     return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  };
+
+  /** A null registry response is unavailable evidence, not a new session. */
+  type OwnerCheck = { state: "valid"; info: AgentInfo } | { state: "unavailable" | "retired" };
+  const localOwner = (binding: ThreadBinding, owner: PaneAgent): boolean => {
+    const paneId = binding.pane_id;
+    return !stopping && agents.get(paneId) === owner &&
+      state.threads[bindingKey(binding.bot, { channel: binding.channel, threadTs: binding.thread_ts })] === binding &&
+      bindingForPane(paneId) === binding;
+  };
+  /** Refresh against one async snapshot before every independent side effect. */
+  const verifiedOwner = async (binding: ThreadBinding, owner: PaneAgent): Promise<OwnerCheck> => {
+    if (!localOwner(binding, owner)) return { state: "retired" };
+    const info = await freshIdentity(binding.pane_id);
+    if (!localOwner(binding, owner)) return { state: "retired" };
+    if (!info) return { state: "unavailable" };
+    if (paneAgentFor(binding, { info }) !== owner) return { state: "retired" };
+    const identity = sessionIdentity(info);
+    const known = agentSessions.get(owner);
+    const pinned = readerIdentityOf(owner, info);
+    if ((known || pinned) && !identity) return { state: "unavailable" };
+    if (identity !== known || (pinned && pinned !== identity)) return { state: "retired" };
+    return { state: "valid", info };
+  };
+  /** Wait only for missing evidence, within the event's original verification budget. */
+  const awaitOwner = async (binding: ThreadBinding, owner: PaneAgent, captured: Verification): Promise<AgentInfo | null> => {
+    const deadline = captured.deadline ??= Date.now() + cfg.maxTotalWaitS * 1000;
+    while (!captured.expired && Date.now() < deadline && localOwner(binding, owner)) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const wait = new Promise<"wait">(resolve => {
+        timer = setTimeout(() => resolve("wait"), Math.min(5_000, deadline - Date.now()));
+        timer.unref();
+      });
+      const check = await Promise.race([verifiedOwner(binding, owner), wait]);
+      clearTimeout(timer);
+      if (captured.expired || !localOwner(binding, owner)) return null;
+      if (check === "wait") continue;
+      if (check.state === "valid") return check.info;
+      if (check.state === "retired") return null;
+      // One transient outage cannot discard an already captured answer.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise<void>(resolve => {
+        const retry = setTimeout(resolve, Math.min(5_000, remaining));
+        retry.unref();
+      });
+    }
+    return null;
   };
 
   /** Deliver a finished turn into the thread it belongs to. */
@@ -606,24 +695,31 @@ export async function startSlackDaemon(
      * meant for now.
      */
     replay = false,
+    captured: Verification = {
+      turn: turnOwners.get(binding.pane_id), duringSetup: startingTurns.has(binding.pane_id), binding,
+    },
   ): Promise<void> => {
     const paneId = binding.pane_id;
-    const turn = turnOwners.get(paneId);
-    const duringSetup = startingTurns.has(paneId);
-    // A new session retires the answer, but a same-session follow-up must
-    // not truncate it. Only settlement belongs exclusively to the old turn.
-    const canPost = (): boolean => agents.get(paneId) === owner && paneAgentFor(binding) === owner;
-    const isCurrent = (): boolean => !duringSetup && !startingTurns.has(paneId)
-      && turnOwners.get(paneId) === turn && canPost() && turnOwners.get(paneId) === turn;
-    if (!canPost()) return;
+    // Session ownership allows an already-started answer to finish; only
+    // captured turn ownership permits settlement of the ledger and marks.
+    const canPost = async (): Promise<boolean> => !captured.expired &&
+      (await awaitOwner(binding, owner, captured)) !== null && !captured.expired;
+    const isCurrent = (): boolean => !captured.duringSetup && !startingTurns.has(paneId)
+      && turnOwners.get(paneId) === captured.turn && agents.get(paneId) === owner
+      && bindingForPane(paneId) === binding && !stopping;
+    const canSettle = async (): Promise<boolean> => isCurrent() && await canPost() && isCurrent();
+    if (!await canPost()) return;
     const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
-    if (isCurrent()) {
+    const closeOwned = (): void => {
+      if (!isCurrent()) return;
       turnStartedAt.delete(paneId);
       closePendingTurn(paneId);
-    }
+    };
     if (event.duplicate) {
+      closeOwned();
+      cancelVerification(owner, captured);
       log.info("suppressed a repeat of the last answer", { paneId });
-      if (isCurrent()) await botOf(binding).client.setStatus(thread, "");
+      if (isCurrent() && await canPost() && isCurrent()) await botOf(binding).client.setStatus(thread, "");
       return;
     }
     // Accumulated turn output has already been through the snapshot filters;
@@ -661,20 +757,27 @@ export async function startSlackDaemon(
     });
     if (messages.length === 0 && requestedFiles.length === 0) {
       if (event.reason === "aborted") {
+        if (!await canPost()) return;
         await bot.client.post(thread, `${note}🛑 Stopped.`);
-        await markDone(bot, binding.pane_id, thread, isCurrent);
+        if (isCurrent() && await canPost()) closeOwned();
+        if (isCurrent() && await canPost()) await markDone(bot, binding.pane_id, thread, canSettle);
+        cancelVerification(owner, captured);
         return;
       }
       // Nothing said, but the pane is stuck on a question of its own — an
       // approval, a choice — which only the terminal can answer. That is
       // worth a message; show what it is asking.
-      const stuck = getAgentInfo(binding.pane_id)?.agent_status === "blocked" ? paneTail(binding.pane_id) : "";
-      if (!canPost()) return;
+      const live = await awaitOwner(binding, owner, captured);
+      if (!live) return;
+      const stuck = live.agent_status === "blocked" ? paneTail(binding.pane_id) : "";
       if (stuck) {
+        if (!await canPost()) return;
         await bot.client.post(
           thread,
           `${note}⚠️ *${binding.label}* is waiting for an answer in the terminal:\n\`\`\`\n${stuck}\n\`\`\``,
         );
+        if (isCurrent() && await canPost()) closeOwned();
+        cancelVerification(owner, captured);
         return;
       }
       // A turn somebody asked for owes a reply, even an empty one. A turn
@@ -682,12 +785,18 @@ export async function startSlackDaemon(
       // command — owes nothing, and "Done (no output)" only reads as an
       // answer to whatever was said last.
       if (!awaited) {
+        if (!await canPost()) return;
+        closeOwned();
+        cancelVerification(owner, captured);
         log.info("a turn of the pane's own ended with nothing to say", { paneId: binding.pane_id });
-        if (isCurrent()) await bot.client.setStatus(thread, "");
+        if (isCurrent() && await canPost() && isCurrent()) await bot.client.setStatus(thread, "");
         return;
       }
+      if (!await canPost()) return;
       await bot.client.post(thread, `${note}✅ Done (no output).`);
-      await markDone(bot, binding.pane_id, thread, isCurrent);
+      if (isCurrent() && await canPost()) closeOwned();
+      if (isCurrent() && await canPost()) await markDone(bot, binding.pane_id, thread, canSettle);
+      cancelVerification(owner, captured);
       return;
     }
     // The question, when it was asked in the terminal and this thread never
@@ -700,26 +809,38 @@ export async function startSlackDaemon(
     const prefix = note + quoted + (event.reason === "aborted" ? "🛑 Stopped.\n\n" : "");
     let lastTs = "";
     for (const [index, message] of messages.entries()) {
-      if (!canPost()) return;
+      if (!await canPost()) return;
       lastTs = await bot.client.post(thread, (index === 0 ? prefix : "") + message.text) || lastTs;
     }
-    if (isCurrent()) {
+    if (messages.length > 0 && isCurrent() && await canPost() && isCurrent()) {
+      closeOwned();
       if (lastTs) state.last_answer[binding.pane_id] = { channel: thread.channel, ts: lastTs };
       state.delivered[binding.pane_id] = digest(event.text);
       persist();
-      await markDone(bot, binding.pane_id, thread, isCurrent);
+      if (isCurrent() && await canPost()) await markDone(bot, binding.pane_id, thread, canSettle);
     }
-    if (!canPost()) return;
+    if (!await canPost()) return;
     log.info("answer delivered", { bot: bot.name, paneId: binding.pane_id, messages: messages.length });
     // These are dispatched operations: once started, finish their files or
     // command/spawn/brief sequence rather than strand a partial side effect.
-    if (requestedFiles.length > 0) await deliverRequestedFiles(binding, thread, requestedFiles);
+    if (requestedFiles.length > 0) {
+      const info = await awaitOwner(binding, owner, captured);
+      if (!info) return;
+      await deliverRequestedFiles(binding, thread, requestedFiles, info.cwd);
+    }
+    if (messages.length === 0 && isCurrent() && await canPost() && isCurrent()) {
+      closeOwned();
+      state.delivered[paneId] = digest(event.text);
+      persist();
+      if (isCurrent() && await canPost()) await markDone(bot, paneId, thread, canSettle);
+    }
     for (const handoff of handoffs) {
-      if (!canPost()) return;
+      if (!await canPost()) return;
       await handOff(bot, thread, handoff, binding.pane_id).catch((err) =>
         log.error("handoff failed", { from: bot.name, to: handoff.bot, message: String(err) }),
       );
     }
+    cancelVerification(owner, captured);
   };
 
   /**
@@ -806,9 +927,9 @@ export async function startSlackDaemon(
     binding: ThreadBinding,
     thread: SlackThread,
     requested: string[],
+    cwd: string | undefined,
   ): Promise<void> => {
     const client = botOf(binding).client;
-    const cwd = getAgentInfo(binding.pane_id)?.cwd;
     if (!cwd) {
       await client.post(thread, "Could not send files: this pane has no working directory.");
       return;
@@ -856,13 +977,21 @@ export async function startSlackDaemon(
   };
 
   /** Lazily build the PaneAgent that owns a pane, wired to this thread. */
-  const paneAgentFor = (binding: ThreadBinding): PaneAgent => {
+  const paneAgentFor = (binding: ThreadBinding, snapshot?: { info: AgentInfo | null }): PaneAgent => {
     const existing = agents.get(binding.pane_id);
-    const liveInfo = getAgentInfo(binding.pane_id);
+    const liveInfo = snapshot ? snapshot.info : getAgentInfo(binding.pane_id);
     const liveIdentity = sessionIdentity(liveInfo);
     const knownIdentity = existing ? agentSessions.get(existing) : undefined;
     const source = existing ? agentSources.get(existing) : undefined;
-    const readerIdentity = existing ? readerIdentityOf(existing) : undefined;
+    const readerIdentity = existing ? readerIdentityOf(existing, snapshot?.info) : undefined;
+    // A synchronous command may discover a replacement while an earlier
+    // event request is in flight. Only a confirmed change invalidates it.
+    if (!snapshot && ((!existing && pendingIdentity.has(binding.pane_id)) || (existing && liveInfo &&
+      (source?.name !== liveInfo.agent || (liveIdentity &&
+        (knownIdentity !== liveIdentity || (readerIdentity && readerIdentity !== liveIdentity))))))) {
+      identityEpoch.set(binding.pane_id, (identityEpoch.get(binding.pane_id) ?? 0) + 1);
+      pendingIdentity.delete(binding.pane_id);
+    }
     // An outage is not replacement. A confirmed agent-kind change is, even
     // before the new agent has acquired its session identifier.
     if (existing && (!liveInfo || (source?.name === liveInfo.agent
@@ -870,13 +999,17 @@ export async function startSlackDaemon(
       return existing;
     }
     let firstRead = true;
-    const communicator = createAgentCommunicator({
+    let communicator: ReturnType<typeof createAgentCommunicator>;
+    communicator = createAgentCommunicator({
       paneId: binding.pane_id,
       getAgentInfo: (target) => {
         // Select against the same snapshot whose identity we compared. Later
         // deferred resolution still consults live metadata.
         if (firstRead) { firstRead = false; return liveInfo; }
-        return getAgentInfo(target);
+        // Event-built deferred readers use the latest verified snapshot;
+        // command-built readers retain their legacy resolver outside checks.
+        return metadataOverride.has(communicator) ? metadataOverride.get(communicator) ?? null
+          : asyncReaderInfo.has(communicator) ? asyncReaderInfo.get(communicator) ?? null : getAgentInfo(target);
       },
       readPane,
       agentPaths: cfg.agentPaths,
@@ -886,6 +1019,7 @@ export async function startSlackDaemon(
       },
       logger: log,
     });
+    if (snapshot) asyncReaderInfo.set(communicator, liveInfo);
     // A genuine deferred reader can retain its first answer. A reader chosen
     // without metadata may instead be a scrape: upgrade it when the registry
     // now selects a structured source, rather than merely labelling it known.
@@ -897,7 +1031,9 @@ export async function startSlackDaemon(
       return existing;
     }
     const pendingPrompt = pendingTurns.isOpen(binding.pane_id)
-      ? submittedPrompts.get(binding.pane_id)?.text ?? source?.communicator.getTurnPrompt() : undefined;
+      ? submittedPrompts.get(binding.pane_id)?.text ?? (existing && snapshot
+        ? withSnapshot(existing, liveInfo, () => source?.communicator.getTurnPrompt())
+        : source?.communicator.getTurnPrompt()) : undefined;
     if (existing) {
       agents.delete(binding.pane_id);
       existing.dispose();
@@ -921,65 +1057,80 @@ export async function startSlackDaemon(
       communicator,
       config: cfg,
       getCompletionInfo: () => getAgentInfoAsync(binding.pane_id),
-      emit: (event: OutputEvent, verificationDeadline = Date.now() + cfg.maxTotalWaitS * 1000): void => {
-        // A disposed loop may finish asynchronously. Never route its output
-        // into the replacement session, or read from a stale session file.
-        if (agents.get(binding.pane_id) !== agent) return;
-        const live = getAgentInfo(binding.pane_id);
-        const identity = sessionIdentity(live);
-        const known = agentSessions.get(agent);
-        const pinned = readerIdentityOf(agent);
-        if ((identity && (identity !== known || (pinned && pinned !== identity)))
-          || (live && agentSources.get(agent)?.name !== live.agent)) {
-          // Refresh here too: Slack-driven turns still need invalidation
-          // when terminal-turn polling is disabled, including an initial
-          // scrape that must upgrade rather than accept the first identity.
-          if (paneAgentFor(bindingForPane(binding.pane_id) ?? binding) !== agent) return;
-        }
-        if (!live || (known && !identity)) {
-          // A final is the loop's last event. Retain it through an outage,
-          // but never through a contradicted identity or a new turn. Metadata
-          // may never return after an agent exits: bound this wait too.
-          if (event.type === "final" && !finalRetries.has(agent)) {
-            const remaining = verificationDeadline - Date.now();
-            if (remaining <= 0) {
-              log.warn("could not verify the answer's session before the delivery deadline", { paneId: binding.pane_id });
-              if (!startingTurns.has(binding.pane_id)) abandonTurn(bindingForPane(binding.pane_id) ?? binding);
-              return;
+      emit: (event: OutputEvent, verificationDeadline = Date.now() + cfg.maxTotalWaitS * 1000,
+        captured: Verification = {
+          turn: turnOwners.get(binding.pane_id), duringSetup: startingTurns.has(binding.pane_id),
+          binding: bindingForPane(binding.pane_id) ?? binding }): void => {
+        const paneId = binding.pane_id;
+        const valid = (): boolean => !stopping && agents.get(paneId) === agent
+          && bindingForPane(paneId) === captured.binding
+          && state.threads[bindingKey(captured.binding.bot, {
+            channel: captured.binding.channel, threadTs: captured.binding.thread_ts,
+          })] === captured.binding;
+        if (!valid()) return;
+        if (event.type === "final" && !captured.deadlineTimer && !captured.expired) {
+          captured.deadline = verificationDeadline;
+          const active = finalVerifications.get(agent) ?? new Set<Verification>();
+          active.add(captured);
+          finalVerifications.set(agent, active);
+          captured.deadlineTimer = setTimeout(() => {
+            captured.expired = true;
+            cancelVerification(agent, captured);
+            if (!captured.duringSetup && valid() && turnOwners.get(paneId) === captured.turn && !startingTurns.has(paneId)) {
+              abandonTurn(captured.binding);
             }
-            const retry = setTimeout(() => {
-              finalRetries.delete(agent);
-              agentOptions.emit(event, verificationDeadline);
-            }, Math.min(5_000, remaining));
-            retry.unref();
-            finalRetries.set(agent, retry);
+          }, Math.max(0, verificationDeadline - Date.now()));
+          captured.deadlineTimer.unref();
+        }
+        void (async () => {
+          const live = await freshIdentity(paneId);
+          if (!valid()) return;
+          if (event.type === "final" && Date.now() >= verificationDeadline) return;
+          const identity = sessionIdentity(live);
+          const known = agentSessions.get(agent);
+          const pinned = readerIdentityOf(agent, live);
+          if ((identity && (identity !== known || (pinned && pinned !== identity)))
+            || (live && agentSources.get(agent)?.name !== live.agent)) {
+            // Use this very snapshot for selection and deferred resolution.
+            if (paneAgentFor(captured.binding, { info: live }) !== agent) return;
           }
-          return;
-        }
-        cancelFinalRetry(agent);
-        // The agent is the pane's; the thread is whichever asked last. It is
-        // looked up now, not when this agent was built — the binding that
-        // built it may be one of many on a default pane, or gone.
-        const target = bindingForPane(binding.pane_id) ?? binding;
-        const thread: SlackThread = { channel: target.channel, threadTs: target.thread_ts };
-        // Progress never reaches Slack as messages: the whole turn arrives
-        // once, at the end. Each tick refreshes the status line instead —
-        // Slack drops one that is left alone for long — with the clock on
-        // it, which is what progress looks like without an output stream.
-        if (event.type !== "final") {
-          const elapsed = elapsedSince(turnStartedAt.get(target.pane_id));
-          void botOf(target).client.setStatus(thread, elapsed ? `is working… (${elapsed})` : "is working…");
-          return;
-        }
-        const asked = pendingTurns.isOpen(target.pane_id);
-        void deliverFinal(target, event, agent, "", asked).catch((err) =>
-          log.error("Slack answer delivery failed", { paneId: target.pane_id, message: String(err) }),
-        );
+          if (!valid()) return;
+          if (!live || ((known || pinned) && !identity)) {
+            // One bounded retry for this event; neither a hung request nor a
+            // canceled owner may extend the original deadline.
+            if (event.type === "final" && !captured.retry
+              && (captured.duringSetup || (turnOwners.get(paneId) === captured.turn && !startingTurns.has(paneId)))) {
+              const remaining = verificationDeadline - Date.now();
+              if (remaining <= 0) {
+                log.warn("could not verify the answer's session before the delivery deadline", { paneId });
+                if (!captured.duringSetup && turnOwners.get(paneId) === captured.turn) abandonTurn(captured.binding);
+                return;
+              }
+              captured.retry = setTimeout(() => {
+                captured.retry = undefined;
+                agentOptions.emit(event, verificationDeadline, captured);
+              }, Math.min(5_000, remaining));
+              captured.retry.unref();
+            }
+            return;
+          }
+          if (event.type !== "final") cancelFinalRetry(agent, true);
+          const target = captured.binding;
+          const thread: SlackThread = { channel: target.channel, threadTs: target.thread_ts };
+          if (event.type !== "final") {
+            if ((await verifiedOwner(target, agent)).state !== "valid" || !valid()) return;
+            const elapsed = elapsedSince(turnStartedAt.get(paneId));
+            void botOf(target).client.setStatus(thread, elapsed ? `is working… (${elapsed})` : "is working…");
+            return;
+          }
+          const asked = pendingTurns.isOpen(paneId);
+          await deliverFinal(target, event, agent, "", asked, false, captured);
+        })().catch((err) => log.error("Slack event delivery failed", { paneId, message: String(err) }));
       },
     };
     const agent = new PaneAgent(agentOptions);
     agentSessions.set(agent, liveIdentity);
-    agentSources.set(agent, { name: liveInfo?.agent, communicator });
+    agentSources.set(agent, { name: liveInfo?.agent, communicator, emit: agentOptions.emit });
     agents.set(binding.pane_id, agent);
     const recovery = idleRecoveries.get(binding.pane_id);
     if (recovery) recovery.agent = agent;
@@ -989,7 +1140,7 @@ export async function startSlackDaemon(
       const matchingPrompt = pendingPrompt && communicator.readerKind !== "scrape"
         && communicator.canIsolateLastAnswer() && communicator.getLastLoggedPrompt() === pendingPrompt.trim()
         ? pendingPrompt : undefined;
-      adoptExternalTurn(binding.pane_id, matchingPrompt);
+      adoptExternalTurn(binding.pane_id, matchingPrompt, agent);
     } else if (existing && !startingTurns.has(binding.pane_id)) {
       // A short first turn may finish before a replacement is named. Recover
       // only an isolated logged answer to the actual prompt sent through this
@@ -1037,6 +1188,12 @@ export async function startSlackDaemon(
     if (!recovery) {
       recovery = { binding, turn: turnOwners.get(paneId), agent, deadline: Date.now() + cfg.maxTotalWaitS * 1000 };
       idleRecoveries.set(paneId, recovery);
+      const owned = recovery;
+      owned.deadlineTimer = setTimeout(() => {
+        if (idleRecoveries.get(paneId) === owned && !stopping &&
+          turnOwners.get(paneId) === owned.turn && bindingForPane(paneId) === owned.binding) abandonTurn(binding);
+      }, cfg.maxTotalWaitS * 1000);
+      owned.deadlineTimer.unref();
     }
     recovery.agent = agent;
     const current = (): boolean => !stopping && !startingTurns.has(paneId)
@@ -1044,53 +1201,70 @@ export async function startSlackDaemon(
       && bindingForPane(paneId) === recovery.binding
       && submittedPrompts.get(paneId)?.binding === recovery.binding
       && pendingTurns.isOpen(paneId) && agents.get(paneId) === recovery.agent;
-    const probe = (): void => {
+    const probe = async (): Promise<void> => {
+      if (recovery.probing) return;
       if (!current()) { if (idleRecoveries.get(paneId) === recovery) cancelIdleRecovery(paneId); return; }
-      // This may itself discover another replacement. Recheck ownership before
-      // reading or settling anything from the refreshed reader.
-      const selected = paneAgentFor(binding);
-      if (!current() || selected !== recovery.agent) return;
-      const live = getAgentInfo(paneId);
-      const identity = sessionIdentity(live);
-      const pinned = readerIdentityOf(selected);
-      if (!live || !identity || (pinned && pinned !== identity)) {
-        // Metadata outage / unresolved pin is not a contradictory transcript.
-      } else if (live?.agent_status !== "working") {
-        const communicator = agentSources.get(selected)?.communicator;
-        if (communicator && (communicator.readerKind === "scrape" || !communicator.canIsolateLastAnswer())) {
-          // No reliable user-prompt boundary; waiting cannot make this history safe to replay.
-          abandonTurn(binding);
-          return;
-        }
-        if (communicator) {
-          const logged = communicator.getLastLoggedPrompt();
-          if (!current()) return;
-          const prompt = submittedPrompts.get(paneId)?.text.trim();
-          if (logged && logged !== prompt) { abandonTurn(binding); return; }
-          if (logged && logged === prompt) {
-            const answer = communicator.getLastAnswer().trim();
+      recovery.probing = true;
+      recovery.timer = undefined;
+      const probedAgent = recovery.agent;
+      try {
+        const live = await freshIdentity(paneId);
+        if (!current() || recovery.agent !== probedAgent) return;
+        // Selection and deferred reader resolution use the compared snapshot.
+        const selected = live ? paneAgentFor(binding, { info: live }) : recovery.agent;
+        if (!current() || selected !== recovery.agent) return;
+        const identity = sessionIdentity(live);
+        const pinned = readerIdentityOf(selected, live);
+        if (!live || !identity || (pinned && pinned !== identity)) {
+          // Metadata outage / unresolved pin is not a contradictory transcript.
+        } else if (live?.agent_status !== "working") {
+          const communicator = agentSources.get(selected)?.communicator;
+          if (communicator && withSnapshot(selected, live, () =>
+            communicator.readerKind === "scrape" || !communicator.canIsolateLastAnswer())) {
+            // No reliable user-prompt boundary; waiting cannot make this history safe to replay.
+            abandonTurn(binding);
+            return;
+          }
+          if (communicator) {
+            const logged = withSnapshot(selected, live, () => communicator.getLastLoggedPrompt());
             if (!current()) return;
-            if (answer) {
-              cancelIdleRecovery(paneId);
-              void deliverFinal(binding, { type: "final", text: answer, source: "snapshot", reason: "idle" }, selected)
-                .catch((err) => log.error("Slack answer delivery failed", { paneId, message: String(err) }));
-              return;
+            const prompt = submittedPrompts.get(paneId)?.text.trim();
+            if (logged && logged !== prompt) { abandonTurn(binding); return; }
+            if (logged && logged === prompt) {
+              const answer = withSnapshot(selected, live, () => communicator.getLastAnswer().trim());
+              if (!current()) return;
+              if (answer) {
+                const deadline = recovery.deadline;
+                cancelIdleRecovery(paneId);
+                agentSources.get(selected)?.emit({ type: "final", text: answer, source: "snapshot", reason: "idle" }, deadline);
+                return;
+              }
             }
           }
         }
+        if (!current()) return;
+        const remaining = recovery.deadline - Date.now();
+        if (remaining <= 0) { abandonTurn(binding); return; }
+        clearTimeout(recovery.timer);
+        recovery.timer = setTimeout(() => { void probe().catch(err =>
+          log.error("idle recovery probe failed", { paneId, message: String(err) })); }, Math.min(1_000, remaining));
+        recovery.timer.unref();
+      } finally {
+        recovery.probing = false;
+        if (current() && !recovery.timer) {
+          recovery.timer = setTimeout(() => { void probe().catch(err =>
+            log.error("idle recovery probe failed", { paneId, message: String(err) })); },
+          Math.min(1_000, Math.max(0, recovery.deadline - Date.now())));
+          recovery.timer.unref();
+        }
       }
-      if (!current()) return;
-      const remaining = recovery.deadline - Date.now();
-      if (remaining <= 0) { abandonTurn(binding); return; }
-      clearTimeout(recovery.timer);
-      recovery.timer = setTimeout(probe, Math.min(1_000, remaining));
-      recovery.timer.unref();
     };
     clearTimeout(recovery.timer);
-    probe();
+    recovery.timer = undefined;
+    void probe().catch(err => log.error("idle recovery probe failed", { paneId, message: String(err) }));
   };
 
-  const adoptExternalTurn = (paneId: string, submittedPrompt?: string): boolean => {
+  const adoptExternalTurn = (paneId: string, submittedPrompt?: string, selected?: PaneAgent): boolean => {
     // Slack owns setup until handleMessage starts observation with its prompt.
     if (startingTurns.has(paneId)) return false;
     // Readbacks must not opt into terminal relaying, but an existing Slack
@@ -1098,7 +1272,7 @@ export async function startSlackDaemon(
     if (!cfg.relayTerminalTurns && !pendingTurns.isOpen(paneId)) return false;
     const binding = bindingForPane(paneId);
     if (!binding) return false;
-    const agent = paneAgentFor(binding);
+    const agent = selected ?? paneAgentFor(binding);
     if (!agent.noteExternalTurn(submittedPrompt)) return false;
     const recovery = idleRecoveries.get(paneId);
     const carriesDebt = recovery?.binding === binding && recovery.turn === turnOwners.get(paneId)
@@ -1403,7 +1577,7 @@ export async function startSlackDaemon(
       if (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
         let agent = paneAgentFor(binding);
         while (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
-          cancelFinalRetry(agent);
+          cancelFinalRetry(agent, true);
           if (await agent.handleMessage(framed) !== false) {
             sent = true;
             setupOnlyTurns.delete(paneId);
