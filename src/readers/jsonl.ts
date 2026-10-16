@@ -431,6 +431,10 @@ export class DeferredReader implements AgentOutputReader {
     return this.inner?.session;
   }
 
+  get ready(): boolean {
+    return this.inner !== null;
+  }
+
   private resolved(): AgentOutputReader | null {
     if (this.inner) return this.inner;
     this.firstReadAt ??= this.now();

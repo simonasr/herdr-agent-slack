@@ -8,6 +8,8 @@ export interface CompletedReaderTurn {
 
 export interface AgentOutputReader {
   readonly kind: string;
+  /** False while a deferred source is unresolved, not merely empty. Omitted means ready. */
+  readonly ready?: boolean;
   /** The session actually selected by a deferred structured reader, if resolved. */
   readonly session?: AgentSessionRef;
   read(maxLines: number): string;

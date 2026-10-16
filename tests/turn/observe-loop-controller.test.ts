@@ -75,6 +75,7 @@ function makeFakeReader(snapshots: string[], isolateLastAnswer = true) {
  */
 function makeEnv(opts: {
   snapshots: string[];
+  reader?: AgentOutputReader;
   progressIntervalMs?: number;
   stabilityMs?: number;
   formatWorkingSuffix?: (elapsedMs: number) => string;
@@ -87,7 +88,7 @@ function makeEnv(opts: {
 }) {
   const progressIntervalMs = opts.progressIntervalMs ?? 100;
   const stabilityMs = opts.stabilityMs ?? 100;
-  const reader = makeFakeReader(opts.snapshots, opts.isolateLastAnswer);
+  const reader = opts.reader ?? makeFakeReader(opts.snapshots, opts.isolateLastAnswer);
   const communicator = new AgentCommunicator(reader, noopLogger);
   const events: OutputEvent[] = [];
   const pending: Array<() => void> = [];
@@ -151,6 +152,25 @@ function makeEnv(opts: {
     },
   };
 }
+
+describe("ObserveLoopController — unresolved output retains explicit termination", () => {
+  it.each(["deadline", "ceiling", "aborted"] as const)("still terminates for %s while the reader is unresolved", async (reason) => {
+    const env = makeEnv({
+      snapshots: [],
+      reader: { kind: "deferred", ready: false, read: () => "" },
+      maxTurnMs: reason === "ceiling" ? 100 : undefined,
+    });
+    if (reason === "deadline") env.controller.updateDeadline(100);
+    else env.controller.markUserInput();
+    const done = env.controller.start();
+    if (reason === "aborted") env.controller.abort();
+    await env.drive();
+    await done;
+    expect(env.events.filter(e => e.type === "final")).toEqual([
+      { type: "final", text: "", reason, source: "snapshot" },
+    ]);
+  });
+});
 
 describe("ObserveLoopController — deadline state", () => {
   it("reports whether a deadline is currently armed", () => {

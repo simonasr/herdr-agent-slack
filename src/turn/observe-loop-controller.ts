@@ -438,7 +438,9 @@ export class ObserveLoopController {
           // retain their existing stop rules.
           if (this.waitUntilIdle && !state.completionConfirmed) {
             resumed = this.communicator.getNewOutput();
-            if (resumed) continue;
+            // An unresolved source is not stable empty output. Keep polling
+            // until it resolves or its bounded screen fallback takes over.
+            if (resumed || !this.communicator.outputReady) continue;
           }
           // Distinguish "idle" vs "deadline" in the final reason. The
           // single rule: if waitUntilIdle is true, the idle gate was

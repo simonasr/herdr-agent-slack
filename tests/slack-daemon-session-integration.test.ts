@@ -112,6 +112,39 @@ afterEach(async () => {
 });
 
 describe("Slack session routing — real observe loops", () => {
+  it("waits for a missing known Codex rollout before delivering the bounded screen fallback", async () => {
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "screen-only question", "2.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const prompt = vi.mocked(sendText).mock.calls[0][1];
+    mocks.screen = `› ${prompt}\n\nreply available only on screen`;
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(mocks.post).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "reply available only on screen");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(mocks.post).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers a known Codex rollout that appears while an idle reader is waiting", async () => {
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "late-rollout" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "late transcript question", "2.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const prompt = vi.mocked(sendText).mock.calls[0][1];
+    mocks.screen = `› ${prompt}\n\nstale screen answer`;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(mocks.post).not.toHaveBeenCalled();
+
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-late-rollout.jsonl"), codexTurn(prompt, "answer from the exact rollout"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "answer from the exact rollout");
+  });
+
   it("preserves last-delta delivery for an ordinary anchored stream-mode question", async () => {
     appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
     const sessions = join(dir, ".codex", "sessions");
