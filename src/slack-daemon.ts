@@ -1101,6 +1101,19 @@ export async function startSlackDaemon(
           })().catch((err) => log.error("Slack event delivery failed", { paneId, message: String(err) }));
           return;
         }
+        // A late log may have arrived after the observer seeded an empty
+        // baseline. Use only the answer under this turn's exact sent prompt,
+        // never the accumulated history (including its files and handoffs).
+        const debt = submittedPrompts.get(paneId);
+        if (!event.duplicate && event.source !== "snapshot" && !captured.duringSetup
+          && !startingTurns.has(paneId) && turnOwners.get(paneId) === captured.turn
+          && debt?.binding === captured.binding && pendingTurns.isOpen(paneId)
+          && communicator.readerKind !== "scrape" && communicator.canIsolateLastAnswer()
+          && communicator.getTurnPrompt().trim() !== debt.text.trim()
+          && communicator.getLastLoggedPrompt() === debt.text.trim()) {
+          const answer = communicator.getLastAnswer().trim();
+          if (answer) event = { ...event, text: answer, source: "snapshot", prompt: undefined };
+        }
         // A progress check started earlier cannot restore "working" after a final.
         progressVersion++;
         startVerification(captured.binding, verificationDeadline, captured);
@@ -1253,16 +1266,14 @@ export async function startSlackDaemon(
     const binding = bindingForPane(paneId);
     if (!binding) return false;
     const agent = selected ?? paneAgentFor(binding);
+    const debt = submittedPrompts.get(paneId);
+    // Once recovery owns a sent question, an observer must not race its
+    // answer or acquire a new budget beyond the original recovery deadline.
+    if (debt?.binding === binding && pendingTurns.isOpen(paneId)
+      && idleRecoveries.get(paneId)?.binding === binding) return false;
     if (!agent.noteExternalTurn(submittedPrompt)) return false;
-    const recovery = idleRecoveries.get(paneId);
-    const carriesDebt = recovery?.binding === binding && recovery.turn === turnOwners.get(paneId)
-      && submittedPrompts.get(paneId)?.binding === binding && pendingTurns.isOpen(paneId);
     const owner = {};
     turnOwners.set(paneId, owner);
-    // This adoption follows the same sent Slack question into a working
-    // replacement; it is not a new Slack dispatch. Keep its original deadline
-    // while allowing only the newly adopted owner to settle that debt.
-    if (carriesDebt && recovery) recovery.turn = owner;
     cancelFinalRetry(agent);
     // Adopted means the thread is following it; losing it to a restart is
     // the same silence as losing a question asked in the thread.
