@@ -161,6 +161,75 @@ describe("Slack session routing — real observe loops", () => {
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
 
+  it.each(["unavailable", "known prompt", "unrelated answer", "framed prompt"])("keeps the dispatched prompt across a working intermediate reader: %s", async (intermediate) => {
+    if (intermediate === "framed prompt") {
+      const statePath = join(dir, "state.json");
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      state.threads["default|C1:1.0"].note_version = 0;
+      writeFileSync(statePath, JSON.stringify(state));
+    }
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    const turn = (question: string, answer: string): string => [
+      { role: "user", text: question }, { role: "assistant", text: answer },
+    ].map(({ role, text }) => JSON.stringify({
+      type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
+    })).join("\n") + "\n";
+    writeFileSync(join(sessions, "rollout-anchor-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "anchor-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "outstanding Slack question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    if (intermediate === "framed prompt") {
+      expect(prompt).toContain("[Slack bridge:");
+      expect(prompt).toContain("outstanding Slack question");
+    } else expect(prompt).toBe("outstanding Slack question");
+    mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "anchor-b" } };
+    if (intermediate !== "unavailable") {
+      writeFileSync(join(sessions, "rollout-anchor-b.jsonl"), turn(prompt, "intermediate history"));
+    }
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    const question = intermediate === "unrelated answer" ? "unrelated terminal question" : prompt;
+    writeFileSync(join(sessions, "rollout-anchor-c.jsonl"), turn(question, "answer after second replacement"));
+    mocks.live = { ...mocks.live!, agent_status: "idle", agent_session: { kind: "id", id: "anchor-c" } };
+    await vi.advanceTimersByTimeAsync(300);
+    if (intermediate === "unrelated answer") {
+      expect(mocks.post).not.toHaveBeenCalled();
+    } else {
+      expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "answer after second replacement");
+    }
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", prompt);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
+  it("does not correlate a retired same-pane binding with its former dispatched prompt", async () => {
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-retired-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "retired-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "retired question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    await mocks.client!.onUserMessage(thread, "U1", "!bind project", "3.0");
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    mocks.post.mockClear();
+    writeFileSync(join(sessions, "rollout-retired-b.jsonl"), [
+      { role: "user", text: prompt }, { role: "assistant", text: "retired answer must not arrive" },
+    ].map(({ role, text }) => JSON.stringify({
+      type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
+    })).join("\n") + "\n");
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "retired-b" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "4.0");
+    mocks.post.mockClear();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", prompt);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
   it.each(["session-a", "session-b"])("checks a prompt-resolved deferred reader against the first reported identity %s", async (reported) => {
     appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\n");
     mocks.live = { ...liveSession(oldPath, "idle"), agent: "claude", agent_session: undefined, cwd: dir };

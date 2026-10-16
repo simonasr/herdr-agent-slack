@@ -475,8 +475,11 @@ export async function startSlackDaemon(
   const pendingTurns = new PendingTurnLog(join(statePath, "pending-turns.json"), log);
   /** Positively known unsent debt; restored ledger entries are conservatively owed. */
   const setupOnlyTurns = new Set<string>();
+  /** Exact dispatched input, independent of any reader's known-prompt suppression. */
+  const submittedPrompts = new Map<string, { binding: ThreadBinding; text: string }>();
   const closePendingTurn = (paneId: string): void => {
     setupOnlyTurns.delete(paneId);
+    submittedPrompts.delete(paneId);
     pendingTurns.close(paneId);
   };
   /** The bot a binding posts through. Bindings only exist for configured bots. */
@@ -882,7 +885,8 @@ export async function startSlackDaemon(
       if (liveIdentity) agentSessions.set(existing, liveIdentity);
       return existing;
     }
-    const pendingPrompt = pendingTurns.isOpen(binding.pane_id) ? source?.communicator.getTurnPrompt() : undefined;
+    const pendingPrompt = pendingTurns.isOpen(binding.pane_id)
+      ? submittedPrompts.get(binding.pane_id)?.text ?? source?.communicator.getTurnPrompt() : undefined;
     if (existing) {
       agents.delete(binding.pane_id);
       existing.dispose();
@@ -1100,6 +1104,10 @@ export async function startSlackDaemon(
     const previous = state.threads[bindingKey(bot.name, thread)];
     state.threads[bindingKey(bot.name, thread)] = binding;
     persist();
+    // A same-pane rebind retires this binding's outstanding question too.
+    // Otherwise the retiring communicator could supply its prompt again.
+    if (previous && previous.pane_id === pane.pane_id
+      && submittedPrompts.get(previous.pane_id)?.binding === previous) abandonTurn(previous);
     // A thread that moved lets go of the pane it left, unless another
     // thread still delivers for it.
     if (previous && previous.pane_id !== pane.pane_id && !bindingForPane(previous.pane_id)) {
@@ -1311,6 +1319,14 @@ export async function startSlackDaemon(
           if (await agent.handleMessage(framed) !== false) {
             sent = true;
             setupOnlyTurns.delete(paneId);
+            // The dispatch queue orders accepted questions even when a later
+            // turn owns setup already. Do not retain input for a retired binding
+            // or reader, and never anchor a canceled, never-sent setup.
+            if (pendingTurns.isOpen(paneId) && state.threads[bindingKey(bot.name, thread)] === binding
+              && (turnOwners.get(paneId) === owner || (startingTurns.get(paneId) ?? 0) > 1
+                || agents.get(paneId) !== agent)) {
+              submittedPrompts.set(paneId, { binding, text: framed });
+            }
             break;
           }
           // Replacement can cancel queued input before it reaches the pane.
@@ -1575,8 +1591,10 @@ export async function startSlackDaemon(
 
   /** Release a binding, and the pane's agent when no other thread delivers for it. */
   const unbind = async (bot: Bot, thread: SlackThread, binding: ThreadBinding): Promise<void> => {
+    const ownsPrompt = submittedPrompts.get(binding.pane_id)?.binding === binding;
     delete state.threads[bindingKey(bot.name, thread)];
     persist();
+    if (ownsPrompt && bindingForPane(binding.pane_id)) abandonTurn(binding);
     // The PaneAgent is per pane, not per thread: keep it while any other
     // thread still delivers for that pane.
     if (!bindingForPane(binding.pane_id)) {
@@ -2055,6 +2073,7 @@ export async function startSlackDaemon(
         cancelFinalRetry(agent);
       }
       agents.clear();
+      submittedPrompts.clear();
       for (const bot of bots.values()) await bot.client.stop();
     },
   };
