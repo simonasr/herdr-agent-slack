@@ -268,6 +268,8 @@ export function findClaudeSessionByPrompt(cwd: string | undefined, prompts: Iter
 export interface AgentOutputReader {
   /** Short identifier for logs ("scrape", "jsonl", "opencode-db"). */
   readonly kind: string;
+  /** False while a deferred source is unresolved, not merely empty. Omitted means ready. */
+  readonly ready?: boolean;
   /** The session actually selected by a deferred structured reader, if resolved. */
   readonly session?: AgentSessionRef;
   /**
@@ -754,6 +756,10 @@ export class AgentCommunicator {
    */
   get readerKind(): string {
     return this.reader.kind;
+  }
+  /** Whether a real source (including a bounded scrape fallback) has been selected. */
+  get outputReady(): boolean {
+    return this.reader.ready !== false;
   }
   /** Whether the reader's text is the model's own, needing no pane filters. */
   get verbatim(): boolean {

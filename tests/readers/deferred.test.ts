@@ -29,6 +29,38 @@ describe("DeferredReader — a log that is not there yet", () => {
   });
 });
 
+describe("DeferredReader — readiness", () => {
+  it("distinguishes an unresolved source from a resolved empty transcript", () => {
+    let available = false;
+    let picks = 0;
+    const reader = new DeferredReader("x-jsonl", false, () => {
+      picks++;
+      return available ? { kind: "x-jsonl", read: () => "" } : null;
+    }, logger, "w1:p1");
+    expect(reader.ready).toBe(false);
+    expect(picks).toBe(0); // Inspecting readiness does not resolve or start the grace clock.
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(false);
+    available = true;
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(true);
+  });
+
+  it("becomes ready when the bounded fallback takes over, even if it is empty", () => {
+    let t = 0;
+    const reader = new DeferredReader("x-jsonl", false, () => null, logger, "w1:p1",
+      { kind: "scrape", read: () => "" }, 90_000, () => t);
+    expect(reader.read(10)).toBe("");
+    t = 90_000;
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(false);
+    t++;
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(true);
+    expect(reader.kind).toBe("scrape");
+  });
+});
+
 describe("DeferredReader — when the log never comes", () => {
   it("reads the screen after the grace period, and says so as a scrape", () => {
     let t = 1_000_000;
