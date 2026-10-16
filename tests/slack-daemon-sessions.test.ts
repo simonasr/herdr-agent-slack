@@ -170,6 +170,161 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(mocks.post).toHaveBeenCalledOnce();
   });
 
+  it("routes progress and a final for a supported sessionless scrape pane", async () => {
+    mocks.live = { ...mocks.live!, agent: "custom", agent_session: undefined };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "scrape question", "2.0");
+    mocks.status.mockClear();
+    mocks.post.mockClear();
+    vi.mocked(getAgentInfo).mockClear();
+    mocks.panes[0].opts.emit({ type: "working", text: "running" });
+    await flush();
+    expect(mocks.status).toHaveBeenCalledWith(thread, expect.stringContaining("is working…"));
+    mocks.panes[0].opts.emit({ type: "final", text: "sessionless scrape answer", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "sessionless scrape answer");
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(getAgentInfo).not.toHaveBeenCalled();
+  });
+
+  it("continues remaining chunks best effort after an unavailable post-dispatch check", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "long answer question", "2.0");
+    const text = "answer line\n".repeat(900);
+    mocks.post.mockClear();
+    mocks.post.mockImplementationOnce(async () => {
+      vi.mocked(getAgentInfoAsync).mockResolvedValueOnce(null);
+      return "answer-ts";
+    });
+    mocks.panes[0].opts.emit({ type: "final", text, source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post.mock.calls.map(([, packet]) => packet)).toEqual(formatForSlack(text.trim()).map(packet => packet.text));
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+  });
+
+  it.each(["available", "unavailable", "unbound"])("keeps dispatched work in its captured thread with %s metadata/binding", async (phase) => {
+    const other = { channel: "C1", threadTs: "4.0" };
+    const statePath = join(dir, "state.json");
+    const initial = JSON.parse(readFileSync(statePath, "utf8"));
+    initial.threads["default|C1:4.0"] = { ...initial.threads["default|C1:1.0"], thread_ts: "4.0" };
+    writeFileSync(statePath, JSON.stringify(initial));
+    mocks.live = { ...mocks.live!, cwd: dir };
+    writeFileSync(join(dir, "one.txt"), "one");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "Q1 in A", "2.0");
+    mocks.post.mockClear();
+    mocks.upload.mockClear();
+    let release!: (ts: string) => void;
+    mocks.post.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const prose = "answer line\n".repeat(900) + "@default !last";
+    mocks.panes[0].opts.emit({ type: "final", text: "answer line\n".repeat(900) + "@@send: one.txt\n@default !last", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledOnce();
+    await mocks.client!.onUserMessage(other, "U1", "Q2 in B", "5.0");
+    const q2 = JSON.parse(readFileSync(statePath, "utf8"));
+    const pending = readFileSync(join(dir, "pending-turns.json"), "utf8");
+    const statusCalls = mocks.status.mock.calls.length;
+    const reactionCalls = mocks.react.mock.calls.length;
+    expect(q2.marked["w1:p1"].ts).toBe("5.0");
+    expect(mocks.panes).toHaveLength(1);
+    if (phase === "unbound") await mocks.client!.onUserMessage(thread, "U1", "!unbind", "6.0");
+    if (phase === "unavailable") vi.mocked(getAgentInfoAsync).mockResolvedValueOnce(null);
+    const postsBeforeRelease = mocks.post.mock.calls.length;
+    release("chunk-one-ts");
+    await flush();
+    if (phase === "unbound") {
+      expect(mocks.post).toHaveBeenCalledTimes(postsBeforeRelease);
+      expect(mocks.upload).not.toHaveBeenCalled();
+    } else {
+      expect(mocks.post.mock.calls).toEqual([
+        ...formatForSlack(prose).map(packet => [thread, packet.text]),
+        [thread, "old unrelated history"],
+      ]);
+      expect(mocks.upload).toHaveBeenCalledExactlyOnceWith(thread, join(dir, "one.txt"), "one.txt", "one.txt");
+    }
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(after.asked_from["w1:p1"]).toBe("default|C1:4.0");
+    expect(after.marked).toEqual(q2.marked);
+    expect(after.last_answer).toEqual(q2.last_answer);
+    expect(after.delivered).toEqual(q2.delivered);
+    expect(readFileSync(join(dir, "pending-turns.json"), "utf8")).toBe(pending);
+    expect(mocks.status).toHaveBeenCalledTimes(statusCalls);
+    expect(mocks.react).toHaveBeenCalledTimes(reactionCalls);
+    expect(mocks.panes).toHaveLength(1);
+  });
+
+  it("does not replay a dispatched chunk when the next identity check hangs past the deadline", async () => {
+    const configPath = join(dir, "config.toml");
+    writeFileSync(configPath, readFileSync(configPath, "utf8") + "max_total_wait_s = 1\n");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "long answer", "2.0");
+    let release!: (info: AgentInfo | null) => void;
+    mocks.post.mockClear();
+    mocks.post.mockImplementationOnce(async () => {
+      vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { release = r; }));
+      return "answer-ts";
+    });
+    mocks.panes[0].opts.emit({ type: "final", text: "answer line\n".repeat(900), source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    release(mocks.live);
+    await flush();
+    expect(mocks.post.mock.calls.map(([, packet]) => packet)).toEqual(formatForSlack("answer line\n".repeat(900).trim()).map(packet => packet.text));
+  });
+
+  it("keeps a file batch and later handoff after metadata fails at settlement", async () => {
+    mocks.live = { ...mocks.live!, cwd: dir };
+    writeFileSync(join(dir, "one.txt"), "one");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "send a file", "2.0");
+    let outage = false;
+    let dropped = false;
+    vi.mocked(getAgentInfoAsync).mockImplementation(async () => {
+      if (outage && !dropped) { dropped = true; return null; }
+      return mocks.live;
+    });
+    mocks.react.mockImplementation(async (_channel, _ts, name, add) => {
+      if (name === "white_check_mark" && add) outage = true;
+      return true;
+    });
+    mocks.post.mockClear();
+    mocks.panes[0].opts.emit({ type: "final", text: "files ready\n@@send: one.txt\n@default !last", source: "delta", reason: "idle" });
+    await flush();
+    expect(dropped).toBe(true);
+    expect(mocks.upload).toHaveBeenCalledExactlyOnceWith(thread, join(dir, "one.txt"), "one.txt", "one.txt");
+    expect(mocks.post.mock.calls.map(([, text]) => text)).toEqual([
+      ...formatForSlack("files ready\n@default !last").map(packet => packet.text), "old unrelated history",
+    ]);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
+  it("finishes a begun file batch and resumes a later handoff after one unavailable check", async () => {
+    mocks.live = { ...mocks.live!, cwd: dir };
+    writeFileSync(join(dir, "one.txt"), "one");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "send a file", "2.0");
+    let outage = false;
+    let dropped = false;
+    vi.mocked(getAgentInfoAsync).mockImplementation(async () => {
+      if (outage && !dropped) { dropped = true; return null; }
+      return mocks.live;
+    });
+    mocks.upload.mockImplementationOnce(async () => { outage = true; });
+    mocks.post.mockClear();
+    mocks.panes[0].opts.emit({ type: "final", text: "files ready\n@@send: one.txt\n@default !last", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.upload).toHaveBeenCalledOnce();
+    expect(dropped).toBe(true);
+    expect(mocks.post.mock.calls).toHaveLength(2);
+    expect(mocks.upload).toHaveBeenCalledTimes(1);
+    expect(mocks.post.mock.calls.map(([, text]) => text)).toEqual([
+      ...formatForSlack("files ready\n@default !last").map(packet => packet.text), "old unrelated history",
+    ]);
+  });
+
   it("does not abandon Q2 when Q1's setup-captured final reaches its deadline", async () => {
     const configPath = join(dir, "config.toml");
     writeFileSync(configPath, readFileSync(configPath, "utf8") + "max_total_wait_s = 1\n");
@@ -212,6 +367,50 @@ describe("Slack daemon — session replacement in the same pane", () => {
     resolve(mocks.live);
     await flush();
     expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "nonblocking answer");
+    expect(getAgentInfo).not.toHaveBeenCalled();
+  });
+
+  it("bounds a burst of progress lookups without delaying independent final verification", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await flush();
+    mocks.status.mockClear();
+    let release!: (info: AgentInfo | null) => void;
+    vi.mocked(getAgentInfoAsync).mockClear();
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { release = r; }));
+    for (let i = 0; i < 12; i++) mocks.panes[0].opts.emit({ type: "working", text: `fragment ${i}` });
+    await flush();
+    expect(getAgentInfoAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.status).not.toHaveBeenCalledWith(thread, "is working…");
+    mocks.post.mockClear();
+    mocks.panes[0].opts.emit({ type: "final", text: "independent final", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "independent final");
+    const statusesAfterFinal = mocks.status.mock.calls.length;
+    release(mocks.live);
+    await flush();
+    expect(getAgentInfoAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.status).toHaveBeenCalledTimes(statusesAfterFinal);
+  });
+
+  it("does not route delayed progress from a replaced session or block another timer", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await flush();
+    mocks.status.mockClear();
+    const old = mocks.panes[0];
+    vi.mocked(getAgentInfo).mockClear();
+    let resolve!: (info: AgentInfo | null) => void;
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    old.opts.emit({ type: "working", text: "old progress" });
+    await flush();
+    let timerRan = false;
+    setTimeout(() => { timerRan = true; }, 10);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(timerRan).toBe(true);
+    expect(mocks.status).not.toHaveBeenCalled();
+    resolve(liveSession(sessionFile("progress-replacement.jsonl", "new"), "idle"));
+    await flush();
+    expect(old.dispose).toHaveBeenCalledOnce();
+    expect(mocks.status).not.toHaveBeenCalledWith(thread, "is working…");
     expect(getAgentInfo).not.toHaveBeenCalled();
   });
 
@@ -299,6 +498,21 @@ describe("Slack daemon — session replacement in the same pane", () => {
     const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
     expect(state.last_answer["w1:p1"].ts).toBe("answer-ts");
     expect(state.delivered["w1:p1"]).toBeDefined();
+  });
+
+  it("stops later chunks when fresh async metadata reports a new session", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    mocks.post.mockClear();
+    mocks.post.mockImplementationOnce(async () => {
+      mocks.live = liveSession(sessionFile("replacement.jsonl", "other"));
+      return "answer-ts";
+    });
+    vi.mocked(getAgentInfo).mockClear();
+    mocks.panes[0].opts.emit({ type: "final", text: "answer line\n".repeat(900), source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledOnce();
+    expect(mocks.panes[0].dispose).toHaveBeenCalledOnce();
+    expect(getAgentInfo).not.toHaveBeenCalled();
   });
 
   it.each(["unbind", "reader replacement"])("records resolved dispatch only for its live debt after %s", async (race) => {

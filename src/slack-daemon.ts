@@ -697,7 +697,9 @@ export async function startSlackDaemon(
     // dispatch it is only a positive contradiction that stops later operations.
     const nextOperation = async (): Promise<AgentInfo | null> => {
       if (!captured.dispatched) return awaitOwner(binding, owner, captured);
-      return bindingLive(binding, owner) ? deliveryInfo : null;
+      const check = await verifiedOwner(binding, owner, bindingLive);
+      return check.state === "valid" ? check.info : check.state === "unavailable" && bindingLive(binding, owner)
+        ? deliveryInfo : null;
     };
     const beginOperation = (info: AgentInfo): void => {
       if (captured.dispatched) return;
@@ -708,7 +710,8 @@ export async function startSlackDaemon(
     };
     const canSettle = async (): Promise<boolean> => {
       if (!isCurrent()) return false;
-      return isCurrent();
+      const info = await nextOperation();
+      return !!info && isCurrent();
     };
     let deliveryInfo: AgentInfo | null = null;
     const initial = await nextOperation();
@@ -1061,6 +1064,10 @@ export async function startSlackDaemon(
       // Remember it without assuming it anchors the replacement's answer.
       if (pendingPrompt) communicator.markDelivered(pendingPrompt);
     }
+    // The observe loop emits all progress fragments synchronously. A hung
+    // lookup must not create one metadata request per fragment.
+    let progressPending = false;
+    let progressVersion = 0;
     const agentOptions = {
       paneId: binding.pane_id,
       communicator,
@@ -1078,9 +1085,20 @@ export async function startSlackDaemon(
           })] === captured.binding;
         if (!valid()) return;
         if (event.type !== "final") {
-          const elapsed = elapsedSince(turnStartedAt.get(paneId));
-          const thread: SlackThread = { channel: captured.binding.channel, threadTs: captured.binding.thread_ts };
-          void botOf(captured.binding).client.setStatus(thread, elapsed ? `is working… (${elapsed})` : "is working…");
+          if (progressPending) return;
+          progressPending = true;
+          const version = progressVersion;
+          void (async () => {
+            try {
+              const check = await verifiedOwner(captured.binding, agent);
+              if (check.state !== "valid" || !valid() || version !== progressVersion) return;
+              const elapsed = elapsedSince(turnStartedAt.get(paneId));
+              const thread: SlackThread = { channel: captured.binding.channel, threadTs: captured.binding.thread_ts };
+              void botOf(captured.binding).client.setStatus(thread, elapsed ? `is working… (${elapsed})` : "is working…");
+            } finally {
+              progressPending = false;
+            }
+          })().catch((err) => log.error("Slack event delivery failed", { paneId, message: String(err) }));
           return;
         }
         // A late log may have arrived after the observer seeded an empty
@@ -1096,6 +1114,8 @@ export async function startSlackDaemon(
           const answer = communicator.getLastAnswer().trim();
           if (answer) event = { ...event, text: answer, source: "snapshot", prompt: undefined };
         }
+        // A progress check started earlier cannot restore "working" after a final.
+        progressVersion++;
         startVerification(captured.binding, verificationDeadline, captured);
         void deliverFinal(captured.binding, event, agent, "", pendingTurns.isOpen(paneId), false, captured)
           .catch((err) => log.error("Slack event delivery failed", { paneId, message: String(err) }));
