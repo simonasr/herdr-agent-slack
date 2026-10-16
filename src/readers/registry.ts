@@ -53,13 +53,15 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
   }
 
   if (req.session?.kind === "id" && req.agentName === "codex") {
-    const path = findCodexSessionPath(req.session.id);
+    const session = req.session;
+    const path = findCodexSessionPath(session.id);
     if (path) return new CodexJsonlReader(path, req.logger, req.paneId);
-    req.logger.warn("structured source unavailable; falling back to scrape", {
-      paneId: req.paneId,
-      agent: req.agentName,
-      reason: `codex session not on disk: ${req.session.id}`,
-    });
+    // Metadata may precede the rollout for initial and replacement sessions.
+    // Unlike the sessionless resolver, this reader must wait for this exact id.
+    return new DeferredReader("codex-jsonl", false, () => {
+      const found = findCodexSessionPath(session.id);
+      return found ? Object.assign(new CodexJsonlReader(found, req.logger, req.paneId), { session }) : null;
+    }, req.logger, req.paneId, new ScrapeReader(req.paneId, req.readPane));
   }
 
   // A Codex pane with no session yet has just started: the rollout is
@@ -71,7 +73,7 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
       const session = resolve();
       if (session?.kind !== "id") return null;
       const path = findCodexSessionPath(session.id);
-      return path ? new CodexJsonlReader(path, req.logger, req.paneId) : null;
+      return path ? Object.assign(new CodexJsonlReader(path, req.logger, req.paneId), { session }) : null;
     }, req.logger, req.paneId, new ScrapeReader(req.paneId, req.readPane));
   }
 
@@ -85,7 +87,7 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
       // The transcript itself may still be missing; the reader looks again on
       // every read, so hand it over only once the file is there.
       return findClaudeSessionPath(sessionId)
-        ? new ClaudeJsonlReader(() => findClaudeSessionPath(sessionId), req.logger, req.paneId)
+        ? Object.assign(new ClaudeJsonlReader(() => findClaudeSessionPath(sessionId), req.logger, req.paneId), { session })
         : null;
     }, req.logger, req.paneId, new ScrapeReader(req.paneId, req.readPane));
   }

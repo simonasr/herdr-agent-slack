@@ -427,6 +427,10 @@ export class DeferredReader implements AgentOutputReader {
     return this.inner ? this.inner.verbatim === true : this.expectedVerbatim;
   }
 
+  get session() {
+    return this.inner?.session;
+  }
+
   private resolved(): AgentOutputReader | null {
     if (this.inner) return this.inner;
     this.firstReadAt ??= this.now();
