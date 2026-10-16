@@ -64,6 +64,15 @@ function message(text: string): string {
   return JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text }] } }) + "\n";
 }
 
+function codexTurn(prompt: string, answer = ""): string {
+  return [
+    { role: "user", text: prompt },
+    ...(answer ? [{ role: "assistant", text: answer }] : []),
+  ].map(({ role, text }) => JSON.stringify({
+    type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
+  })).join("\n") + "\n";
+}
+
 function liveSession(path: string, status = "working"): AgentInfo {
   return {
     agent: "pi", agent_status: status, pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1",
@@ -102,6 +111,154 @@ afterEach(async () => {
 });
 
 describe("Slack session routing — real observe loops", () => {
+  it("recovers a submitted prompt when an idle replacement transcript arrives late", async () => {
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-recovery-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "recovery-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "outstanding Slack question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "recovery-b" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear();
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(mocks.post).not.toHaveBeenCalled();
+    writeFileSync(join(sessions, "rollout-recovery-b.jsonl"), codexTurn(prompt, "late matching answer"));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "late matching answer");
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", prompt);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(mocks.post).toHaveBeenCalledTimes(1);
+  });
+
+  it("abandons a verified unrelated idle transcript without posting its answer", async () => {
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-mismatch-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "mismatch-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "a submitted question", "2.0");
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "mismatch-b" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear();
+    writeFileSync(join(sessions, "rollout-mismatch-b.jsonl"), codexTurn("unrelated question", "old history"));
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+    expect(mocks.status).toHaveBeenCalledWith(thread, "");
+    expect(sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps one deadline through incomplete prompts and successive idle replacements", async () => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\nmax_total_wait_s = 3\n");
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-budget-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "budget-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const idleTimers = vi.getTimerCount();
+    await mocks.client!.onUserMessage(thread, "U1", "budget question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "budget-b" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear();
+    writeFileSync(join(sessions, "rollout-budget-b.jsonl"), codexTurn(prompt));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "budget-c" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.1");
+    mocks.post.mockClear();
+    mocks.live = null; // An outage cannot reset the original replacement's deadline.
+    writeFileSync(join(sessions, "rollout-budget-c.jsonl"), codexTurn(prompt, "unverifiable answer"));
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", prompt);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+    expect(mocks.status).toHaveBeenCalledWith(thread, "");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(idleTimers);
+  });
+
+  it.each(["matching answer", "original deadline"])("keeps recovery through idle -> working -> idle replacements: %s", async (outcome) => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\nmax_total_wait_s = 3\n");
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-transition-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "transition-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const idleTimers = vi.getTimerCount();
+    await mocks.client!.onUserMessage(thread, "U1", "outstanding transition question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "transition-b" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+    mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "transition-c" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.1");
+    mocks.post.mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+    if (outcome === "matching answer") {
+      writeFileSync(join(sessions, "rollout-transition-d.jsonl"), codexTurn(prompt, "answer after working intermediate"));
+    }
+    mocks.live = { ...mocks.live!, agent_status: "idle", agent_session: { kind: "id", id: "transition-d" } };
+    // No !last for D: only automatic recovery can deliver or time out.
+    await vi.advanceTimersByTimeAsync(outcome === "matching answer" ? 1_600 : 1_400);
+    if (outcome === "matching answer") {
+      expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "answer after working intermediate");
+    } else {
+      expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(200); // 3.1s since the *first* idle replacement.
+      expect(mocks.post).not.toHaveBeenCalled();
+    }
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", prompt);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+    if (outcome === "original deadline") {
+      expect(mocks.status).toHaveBeenCalledWith(thread, "");
+      expect(vi.getTimerCount()).toBe(idleTimers);
+    }
+  });
+
+  it.each(["new question", "!unbind", "!bind project", "shutdown"])("cancels a late recovery on %s", async (action) => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\nmax_total_wait_s = 2\n");
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-cancel-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "cancel-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "canceled question", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "cancel-b" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear();
+    if (action === "shutdown") {
+      await daemon.stop();
+      daemon = undefined;
+    } else {
+      if (action === "new question") mocks.live = { ...mocks.live!, agent_status: "working" };
+      await mocks.client!.onUserMessage(thread, "U1", action, "4.0");
+    }
+    mocks.post.mockClear();
+    if (action !== "new question") writeFileSync(join(sessions, "rollout-cancel-b.jsonl"), codexTurn(prompt, "stale recovered answer"));
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(mocks.post).not.toHaveBeenCalledWith(thread, "stale recovered answer");
+    expect(sendText).toHaveBeenCalledTimes(action === "new question" ? 2 : 1);
+    const owed = JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"));
+    expect(owed).toHaveLength(action === "shutdown" || action === "new question" ? 1 : 0);
+    if (action === "new question") {
+      expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked["w1:p1"].ts).toBe("4.0");
+    }
+  });
+
   it.each([false, true])("keeps a deferred reader and its first answer, metadata before rollout=%s", async (metadataFirst) => {
     mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: undefined };
     const disposed = vi.spyOn(PaneAgent.prototype, "dispose");
