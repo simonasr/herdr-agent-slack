@@ -544,7 +544,7 @@ export class ObserveLoopController {
       // even through getLastAnswer(). Never replay that history as a reply
       // when this turn produced no output. Screens retain their readback.
       const latest = this.communicator.readerKind === "scrape"
-        ? this.communicator.getLatestOutput()
+        ? this.communicator.getFinalFallbackOutput()
         : this.communicator.outputReady && this.communicator.canIsolateLastAnswer() ? this.communicator.getLastAnswer() : "";
       if (latest.trim().length === 0) {
         text = "";

@@ -6,6 +6,33 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 describe("AgentCommunicator — deferred boundary", () => {
+  it.each([
+    ["codex", "coalesced"], ["claude", "coalesced"],
+    ["codex", "separate"], ["claude", "separate"],
+    ["codex", "old-only"], ["claude", "old-only"],
+  ] as const)("matches distinct %s prompt occurrences with a dispatch time floor for %s logs", (agent, logging) => {
+    const dir = mkdtempSync(join(tmpdir(), "timed-pending-prompts-"));
+    const path = join(dir, "session.jsonl");
+    const logger = { info() {}, warn() {}, error() {}, debug() {} };
+    const startedAt = Date.UTC(2026, 0, 1);
+    const answers = ["historical answer", ...(logging !== "old-only" ? ["first current answer"] : []),
+      ...(logging === "separate" ? ["second current answer"] : [])];
+    try {
+      writeFileSync(path, answers.flatMap((text, index) => [
+        { role: "user", text: "continue" }, { role: "assistant", text },
+      ].map(({ role, text: content }) => JSON.stringify({ timestamp: new Date(startedAt + (index - 1) * 1000).toISOString(),
+        ...(agent === "codex"
+          ? { type: "response_item", payload: { type: "message", role, content: [{ type: "text", text: content }] } }
+          : { type: role === "user" ? "user" : "assistant", message: { role, content: [{ type: "text", text: content }] } }),
+      }))).join("\n") + "\n");
+      const reader = agent === "codex" ? new CodexJsonlReader(path, logger, "w1:p1")
+        : new ClaudeJsonlReader(() => path, logger, "w1:p1");
+      expect(reader.readSincePrompts(["continue", "continue"], startedAt)).toEqual(logging === "old-only" ? null : {
+        snapshot: answers.join("\n\n"), text: answers.slice(1).join("\n\n"),
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(["codex", "claude"] as const)("reads one coherent pending group from %s, preferring the latest occurrence", agent => {
     const dir = mkdtempSync(join(tmpdir(), "pending-input-group-"));
     const path = join(dir, "session.jsonl");

@@ -896,7 +896,8 @@ describe("PaneAgent — pending source boundary lifecycle", () => {
     const readSincePrompts = vi.fn((_prompts: readonly string[]) => ready
       ? { snapshot, text: "first answer\n\nsecond answer" } : null);
     const e = completionEnv({ mode: "final", maxTotalWaitS: 2,
-      reader: { kind: "codex-jsonl", get ready() { return ready; }, read: () => snapshot, readSincePrompts },
+      reader: { kind: "codex-jsonl", get ready() { return ready; }, read: () => snapshot,
+        readSincePrompts: prompts => readSincePrompts(prompts) },
     });
     await e.agent.handleMessage("first");
     await e.agent.handleMessage("second");

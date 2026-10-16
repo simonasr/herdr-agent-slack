@@ -74,6 +74,11 @@ function codexTurn(prompt: string, answer = ""): string {
   })).join("\n") + "\n";
 }
 
+function codexTurnAt(prompt: string, answer: string, timestamp: number): string {
+  return codexTurn(prompt, answer).trimEnd().split("\n")
+    .map(line => JSON.stringify({ ...JSON.parse(line), timestamp: new Date(timestamp).toISOString() })).join("\n") + "\n";
+}
+
 function liveSession(path: string, status = "working"): AgentInfo {
   return {
     agent: "pi", agent_status: status, pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1",
@@ -112,6 +117,153 @@ afterEach(async () => {
 });
 
 describe("Slack session routing — real observe loops", () => {
+  it.each([
+    ["❯", "repeat"], ["›", "repeat"],
+    ["❯", "absent"], ["›", "absent"],
+    ["❯", "blockquote"], ["›", "blockquote"],
+    ["❯", "shell"], ["›", "shell"],
+  ] as const)("bounds ordered %s screen readback for %s later input", async (marker, scenario) => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "final"\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const first = scenario === "repeat" ? "continue" : "first question";
+    const later = scenario === "repeat" ? "status?" : "second\n\nquestion";
+    const quotedInput = scenario === "absent" ? "second question\n> second question\n$ second question" :
+      `${scenario === "blockquote" ? "> " : scenario === "shell" ? "$ " : ""}second question`;
+    const firstAnswer = scenario === "repeat" ? "FIRST CURRENT ANSWER" : `FIRST CURRENT ANSWER\n${quotedInput}\nKEEP THE REST`;
+    await mocks.client!.onUserMessage(thread, "U1", first, "2.0");
+    mocks.live = { ...mocks.live!, agent_status: "working" };
+    const initialScreen = `${marker} ${first}\n\n${firstAnswer}`;
+    mocks.screen = initialScreen;
+    await vi.advanceTimersByTimeAsync(90_100);
+    expect(mocks.post).not.toHaveBeenCalled();
+    await mocks.client!.onUserMessage(thread, "U1", later, "3.0");
+    mocks.screen = scenario === "absent" ? initialScreen : `${initialScreen}\n\n${marker} ${later}\n\nSECOND CURRENT ANSWER`;
+    if (scenario === "repeat") {
+      await mocks.client!.onUserMessage(thread, "U1", first, "4.0");
+      mocks.screen += `\n\n${marker} ${first}\n\nTHIRD CURRENT ANSWER`;
+    }
+    expect(sendText).toHaveBeenCalledTimes(scenario === "repeat" ? 3 : 2);
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    await vi.advanceTimersByTimeAsync(300);
+    // Repeated screen echoes still have no timestamp identity; retain each latest answer once, in send order.
+    const expected = scenario === "repeat" ? "SECOND CURRENT ANSWER\n\nTHIRD CURRENT ANSWER" :
+      scenario === "absent" ? firstAnswer : `${firstAnswer}\n\nSECOND CURRENT ANSWER`;
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, expected.replaceAll(">", "&gt;"));
+  });
+
+  it.each([
+    ["❯", 1], ["›", 1], ["❯", 2], ["›", 2],
+  ] as const)("includes later input in a %s fallback full-turn readback with %s additional prompts", async (marker, extra) => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "final"\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const prompts = ["first question", "second\n\nquestion", "third question"].slice(0, extra + 1);
+    const answers = ["FIRST CURRENT ANSWER\nsecond question\nstill part of the first answer", "SECOND CURRENT ANSWER", "THIRD CURRENT ANSWER"].slice(0, extra + 1);
+    await mocks.client!.onUserMessage(thread, "U1", prompts[0], "2.0");
+    mocks.live = { ...mocks.live!, agent_status: "working" };
+    mocks.screen = `${marker} historical question\n\nOLD HISTORICAL ANSWER\n\n${marker} ${prompts[0]}\n\n${answers[0]}`;
+    await vi.advanceTimersByTimeAsync(90_100);
+    expect(mocks.post).not.toHaveBeenCalled();
+    for (let i = 1; i < prompts.length; i++) await mocks.client!.onUserMessage(thread, "U1", prompts[i], `${i + 2}.0`);
+    expect(sendText).toHaveBeenCalledTimes(prompts.length);
+    mocks.screen = `${marker} historical question\n\nOLD HISTORICAL ANSWER\n\n` +
+      prompts.map((prompt, i) => `${marker} ${prompt}\n\n${answers[i]}`).join("\n\n");
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, answers.join("\n\n"));
+  });
+
+  it("does not replay an earlier screen answer when a missing rollout falls back in stream mode", async () => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "current question", "2.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const prompt = vi.mocked(sendText).mock.calls[0][1];
+    mocks.screen = `› historical question\n\nOLD HISTORICAL ANSWER\n\n› ${prompt}\n\nCURRENT ANSWER`;
+    await vi.advanceTimersByTimeAsync(91_000);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "CURRENT ANSWER");
+  });
+
+  it.each(["stream", "final"] as const)("retains both duplicate pending answers in %s mode with identical historical prompts", async mode => {
+    appendFileSync(join(dir, "config.toml"), `output_mode = "${mode}"\n`);
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "duplicate-pending" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "continue", "2.0");
+    await mocks.client!.onUserMessage(thread, "U1", "continue", "3.0");
+    expect(sendText).toHaveBeenCalledTimes(2);
+    const prompt = vi.mocked(sendText).mock.calls[0][1];
+    expect(vi.mocked(sendText).mock.calls[1][1]).toBe(prompt);
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-duplicate-pending.jsonl"),
+      codexTurn(prompt, "OLD HISTORICAL ANSWER") + codexTurn(prompt, "FIRST CURRENT ANSWER") + codexTurn(prompt, "SECOND CURRENT ANSWER"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "FIRST CURRENT ANSWER\n\nSECOND CURRENT ANSWER");
+  });
+
+  it.each([
+    ["coalesced", "stream"], ["separate", "stream"],
+    ["coalesced", "final"], ["separate", "final"],
+  ] as const)("excludes timestamped historical repetitions for %s duplicate inputs in %s mode", async (logging, mode) => {
+    appendFileSync(join(dir, "config.toml"), `output_mode = "${mode}"\n`);
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "timestamped-inputs" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const submittedAt = Date.now();
+    await mocks.client!.onUserMessage(thread, "U1", "continue", "2.0");
+    await mocks.client!.onUserMessage(thread, "U1", "continue", "3.0");
+    expect(sendText).toHaveBeenCalledTimes(2);
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-timestamped-inputs.jsonl"),
+      codexTurnAt("continue", "OLD HISTORICAL ANSWER", submittedAt - 10_000) +
+      codexTurnAt("continue", "FIRST CURRENT ANSWER", submittedAt) +
+      (logging === "separate" ? codexTurnAt("continue", "SECOND CURRENT ANSWER", submittedAt) : ""));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread,
+      logging === "separate" ? "FIRST CURRENT ANSWER\n\nSECOND CURRENT ANSWER" : "FIRST CURRENT ANSWER");
+  });
+
+  it.each(["stream", "final"] as const)("does not use an old-only fallback screen as the %s final snapshot", async mode => {
+    appendFileSync(join(dir, "config.toml"), `output_mode = "${mode}"\n`);
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
+    mocks.screen = "› historical question\n\nOLD HISTORICAL ANSWER";
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "current question", "2.0");
+    await vi.advanceTimersByTimeAsync(91_000);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "✅ Done (no output).");
+  });
+
+  it("bounds the first nonempty fallback screen after an empty fallback selection", async () => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "current question", "2.0");
+    mocks.live = { ...mocks.live!, agent_status: "working" };
+    await vi.advanceTimersByTimeAsync(90_100);
+    expect(mocks.post).not.toHaveBeenCalled();
+    mocks.screen = "› historical question\n\nOLD HISTORICAL ANSWER\n\n› current question\n\nCURRENT ANSWER";
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "CURRENT ANSWER");
+  });
+
+  it("retains literal fallback diffs after the submitted prompt scrolls offscreen", async () => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "current question", "2.0");
+    mocks.live = { ...mocks.live!, agent_status: "working" };
+    mocks.screen = "› historical question\n\nOLD HISTORICAL ANSWER\n\n› current question\n\nCURRENT PREFIX";
+    await vi.advanceTimersByTimeAsync(90_100);
+    expect(mocks.post).not.toHaveBeenCalled();
+    mocks.screen = "CURRENT PREFIX\nCURRENT SUFFIX";
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "CURRENT SUFFIX");
+  });
+
   it("waits for a missing known Codex rollout before delivering the bounded screen fallback", async () => {
     mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "missing-rollout" } };
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
