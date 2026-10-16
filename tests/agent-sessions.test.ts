@@ -1,8 +1,84 @@
 import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { createAgentCommunicator } from "../src/agent-sessions.js";
+import { AgentCommunicator, createAgentCommunicator } from "../src/agent-sessions.js";
+import { ClaudeJsonlReader, CodexJsonlReader } from "../src/readers/jsonl.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+describe("AgentCommunicator — deferred boundary", () => {
+  it.each(["codex", "claude"] as const)("reads one coherent pending group from %s, preferring the latest occurrence", agent => {
+    const dir = mkdtempSync(join(tmpdir(), "pending-input-group-"));
+    const path = join(dir, "session.jsonl");
+    const logger = { info() {}, warn() {}, error() {}, debug() {} };
+    const events = [
+      { role: "user", text: "first" }, { role: "assistant", text: "historical identical-prompt answer" },
+      { role: "user", text: "first" }, { role: "assistant", text: "first current answer" },
+      { role: "user", text: "second" }, { role: "assistant", text: "second current answer" },
+    ];
+    try {
+      writeFileSync(path, events.map(({ role, text }) => JSON.stringify(agent === "codex"
+        ? { type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] } }
+        : { type: role === "user" ? "user" : "assistant", message: { role, content: [{ type: "text", text }] } },
+      )).join("\n") + "\n");
+      const reader = agent === "codex" ? new CodexJsonlReader(path, logger, "w1:p1")
+        : new ClaudeJsonlReader(() => path, logger, "w1:p1");
+      expect(reader.readSincePrompts(["first", "second"])).toEqual({
+        snapshot: "historical identical-prompt answer\n\nfirst current answer\n\nsecond current answer",
+        text: "first current answer\n\nsecond current answer",
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(["codex", "claude"] as const)("matches a URL-leading submitted prompt without changing %s prompt classification", agent => {
+    const dir = mkdtempSync(join(tmpdir(), "pending-url-prompt-"));
+    const path = join(dir, "session.jsonl");
+    const logger = { info() {}, warn() {}, error() {}, debug() {} };
+    const prompt = "<https://github.com/o/r/pull/1> review this";
+    const events = [
+      { role: "user", text: "historical prompt" }, { role: "assistant", text: "historical answer" },
+      { role: "user", text: prompt }, { role: "assistant", text: "current review answer" },
+    ];
+    try {
+      writeFileSync(path, events.map(({ role, text }) => JSON.stringify(agent === "codex"
+        ? { type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] } }
+        : { type: role === "user" ? "user" : "assistant", message: { role, content: [{ type: "text", text }] } },
+      )).join("\n") + "\n");
+      const reader = agent === "codex" ? new CodexJsonlReader(path, logger, "w1:p1")
+        : new ClaudeJsonlReader(() => path, logger, "w1:p1");
+      let ready = false;
+      const comm = new AgentCommunicator({ kind: reader.kind, get ready() { return ready; },
+        read: () => "", readSincePrompts: prompts => { ready = true; return reader.readSincePrompts(prompts); },
+      }, logger, "w1:p1");
+      comm.seedOutputBaseline();
+      comm.sendInput(prompt);
+      expect(comm.getNewOutput()).toBe("current review answer");
+      expect(comm.outputReady).toBe(true);
+      expect(reader.lastPrompt()).toBe("historical prompt");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("does not emit a separately read answer beyond its consumed snapshot", () => {
+    let ready = false;
+    let snapshot = "";
+    let answer = "";
+    const comm = new AgentCommunicator({
+      kind: "codex-jsonl", get ready() { return ready; },
+      read: () => snapshot, lastPrompt: () => "current question", lastAnswer: () => answer,
+      readSincePrompts: () => ready ? { snapshot, text: answer } : null,
+    }, { info() {}, warn() {}, error() {}, debug() {} }, "w1:p1");
+    comm.seedOutputBaseline();
+    comm.sendInput("current question");
+    ready = true;
+    snapshot = "historical answer\n\ncurrent prefix";
+    answer = "current prefix with a racing suffix";
+    expect(comm.getNewOutput()).toBe("");
+    expect(comm.outputReady).toBe(false);
+    snapshot = `historical answer\n\n${answer}`;
+    expect(comm.getNewOutput()).toBe(answer);
+    expect(comm.outputReady).toBe(true);
+    expect(comm.getNewOutput()).toBe("");
+  });
+});
 
 describe("AgentCommunicator (factory)", () => {
   const noopLogger = { info() {}, warn() {}, error() {}, debug() {} };
