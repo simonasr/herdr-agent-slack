@@ -322,6 +322,8 @@ export class PaneAgent {
   }
 
   private dispatchInput(text: string): void {
+    // An active observer owns its unread output; only a fresh turn can reseed.
+    if (!this.loop) this.opts.communicator.seedOutputBaseline();
     this.opts.communicator.sendInput(text);
     // Whatever started this turn, it is the user's now.
     this.externalTurn = false;
@@ -329,7 +331,8 @@ export class PaneAgent {
       this.loop.markUserInput();
       return;
     }
-    this.startLoop({ deadline: null, waitUntilIdle: true, fast: true });
+    // The baseline precedes sendInput: even the first read is current output.
+    this.startLoop({ deadline: null, waitUntilIdle: true, fast: true, initialOutput: "" });
   }
 
   /**
@@ -491,6 +494,7 @@ export class PaneAgent {
       this.loop.updateDeadline(deadline);
       return;
     }
+    this.opts.communicator.clearPendingInputBoundary();
     this.startLoop({ deadline, waitUntilIdle: false });
   }
 

@@ -160,6 +160,26 @@ interface CodexTurns {
   answers: string[];
   latestAnswerStart: number;
   latestPrompt: string;
+  promptStarts: Array<{ prompt: string; answerStart: number; timestamp: number }>;
+}
+
+/** Align pending inputs to distinct occurrences, newest first, allowing coalesced inputs to be absent. */
+function submittedOutput(turns: CodexTurns | ClaudeTurns, prompts: readonly string[], notBefore?: number): { snapshot: string; text: string } | null {
+  // Untimed legacy records remain best-effort: repeated/coalesced history is inherently ambiguous.
+  const entries = turns.promptStarts.filter(entry => notBefore === undefined || !Number.isFinite(entry.timestamp) || entry.timestamp >= notBefore);
+  const normalized = entries.map(entry => entry.prompt.replace(/\s+/g, " ").trim());
+  let cursor = entries.length - 1;
+  let boundary: typeof entries[number] | undefined;
+  for (let i = prompts.length - 1; i >= 0 && cursor >= 0; i--) {
+    const index = normalized.lastIndexOf(prompts[i].replace(/\s+/g, " ").trim(), cursor);
+    if (index < 0) continue;
+    boundary = entries[index];
+    cursor = index - 1;
+  }
+  return boundary ? {
+    snapshot: turns.answers.join("\n\n").trim(),
+    text: turns.answers.slice(boundary.answerStart).join("\n\n").trim(),
+  } : null;
 }
 
 /**
@@ -174,7 +194,7 @@ function codexPromptText(text: string): string {
 }
 
 function readCodexTurns(path: string): CodexTurns {
-  const turns: CodexTurns = { answers: [], latestAnswerStart: 0, latestPrompt: "" };
+  const turns: CodexTurns = { answers: [], latestAnswerStart: 0, latestPrompt: "", promptStarts: [] };
   if (!existsSync(path)) return turns;
   const raw = readFileSync(path, "utf8");
   for (const line of raw.split("\n")) {
@@ -188,7 +208,10 @@ function readCodexTurns(path: string): CodexTurns {
     }
     if (ev?.type !== "response_item" || ev?.payload?.type !== "message") continue;
     if (ev.payload.role === "user") {
-      const prompt = codexPromptText(extractTextFromContent(ev.payload.content));
+      const raw = extractTextFromContent(ev.payload.content).trim();
+      if (raw) turns.promptStarts.push({ prompt: raw, answerStart: turns.answers.length,
+        timestamp: typeof ev.timestamp === "string" ? Date.parse(ev.timestamp) : NaN });
+      const prompt = codexPromptText(raw);
       if (!prompt) continue;
       turns.latestPrompt = prompt;
       turns.latestAnswerStart = turns.answers.length;
@@ -226,6 +249,10 @@ export class CodexJsonlReader implements AgentOutputReader {
     return turns.answers.slice(turns.latestAnswerStart).join("\n\n").trim();
   }
 
+  readSincePrompts(prompts: readonly string[], notBefore?: number): { snapshot: string; text: string } | null {
+    return submittedOutput(this.turns(), prompts, notBefore);
+  }
+
   private turns(): CodexTurns {
     try {
       return readCodexTurns(this.path);
@@ -235,7 +262,7 @@ export class CodexJsonlReader implements AgentOutputReader {
         agent: "codex",
         message: err instanceof Error ? err.message : String(err),
       });
-      return { answers: [], latestAnswerStart: 0, latestPrompt: "" };
+      return { answers: [], latestAnswerStart: 0, latestPrompt: "", promptStarts: [] };
     }
   }
 }
@@ -260,6 +287,7 @@ export function validatePathSession(path: string): string | null {
  */
 interface ClaudeTranscriptLine {
   type?: string;
+  timestamp?: unknown;
   /** A subagent's traffic, logged into the same file. Never the answer. */
   isSidechain?: boolean;
   /** Bridge/skill scaffolding injected as the user, not something they typed. */
@@ -275,6 +303,7 @@ interface ClaudeTurns {
   latestAnswerStart: number;
   /** The last thing the user actually typed; "" when the log has none. */
   latestPrompt: string;
+  promptStarts: Array<{ prompt: string; answerStart: number; timestamp: number }>;
 }
 
 /**
@@ -299,7 +328,7 @@ function claudePromptText(line: ClaudeTranscriptLine): string {
 }
 
 function readClaudeTurns(path: string): ClaudeTurns {
-  const turns: ClaudeTurns = { answers: [], latestAnswerStart: 0, latestPrompt: "" };
+  const turns: ClaudeTurns = { answers: [], latestAnswerStart: 0, latestPrompt: "", promptStarts: [] };
   if (!existsSync(path)) return turns;
   const raw = readFileSync(path, "utf8");
   for (const line of raw.split("\n")) {
@@ -312,6 +341,11 @@ function readClaudeTurns(path: string): ClaudeTurns {
       continue;
     }
     if (ev?.type === "user") {
+      if (ev.isMeta || ev.isSidechain) continue;
+      const content = ev.message?.content;
+      const raw = typeof content === "string" ? content : Array.isArray(content) ? extractTextFromContent(content) : "";
+      if (raw.trim()) turns.promptStarts.push({ prompt: raw.trim(), answerStart: turns.answers.length,
+        timestamp: typeof ev.timestamp === "string" ? Date.parse(ev.timestamp) : NaN });
       const prompt = claudePromptText(ev);
       if (!prompt) continue;
       turns.latestPrompt = prompt;
@@ -369,10 +403,14 @@ export class ClaudeJsonlReader implements AgentOutputReader {
     return turns.answers.slice(turns.latestAnswerStart).join("\n\n").trim();
   }
 
+  readSincePrompts(prompts: readonly string[], notBefore?: number): { snapshot: string; text: string } | null {
+    return submittedOutput(this.turns(), prompts, notBefore);
+  }
+
   private turns(): ClaudeTurns {
     try {
       this.path ??= this.locate();
-      if (!this.path) return { answers: [], latestAnswerStart: 0, latestPrompt: "" };
+      if (!this.path) return { answers: [], latestAnswerStart: 0, latestPrompt: "", promptStarts: [] };
       return readClaudeTurns(this.path);
     } catch (err) {
       this.logger.warn("claude jsonl read failed", {
@@ -380,7 +418,7 @@ export class ClaudeJsonlReader implements AgentOutputReader {
         agent: "claude",
         message: err instanceof Error ? err.message : String(err),
       });
-      return { answers: [], latestAnswerStart: 0, latestPrompt: "" };
+      return { answers: [], latestAnswerStart: 0, latestPrompt: "", promptStarts: [] };
     }
   }
 }
@@ -427,6 +465,14 @@ export class DeferredReader implements AgentOutputReader {
     return this.inner ? this.inner.verbatim === true : this.expectedVerbatim;
   }
 
+  get session() {
+    return this.inner?.session;
+  }
+
+  get ready(): boolean {
+    return this.inner !== null;
+  }
+
   private resolved(): AgentOutputReader | null {
     if (this.inner) return this.inner;
     this.firstReadAt ??= this.now();
@@ -451,6 +497,10 @@ export class DeferredReader implements AgentOutputReader {
 
   read(maxLines: number): string {
     return this.resolved()?.read(maxLines) ?? "";
+  }
+
+  readSincePrompts(prompts: readonly string[], notBefore?: number): { snapshot: string; text: string } | null {
+    return this.resolved()?.readSincePrompts?.(prompts, notBefore) ?? null;
   }
 
   captureTurn(expectedSession?: AgentSessionRef): (() => CompletedReaderTurn | null) | null {

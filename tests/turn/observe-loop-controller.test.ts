@@ -42,10 +42,12 @@ const noopLogger = {
  * returns the next snapshot from the array, or the last element if
  * exhausted. This models an agent that keeps appending to a pane.
  */
-function makeFakeReader(snapshots: string[]) {
+function makeFakeReader(snapshots: string[], isolateLastAnswer = true) {
   let i = 0;
   const reader: AgentOutputReader & { calls: number; append(extra: string[]): void } = {
     kind: "fake",
+    // Most fallback tests model a reader that can isolate one answer.
+    ...(isolateLastAnswer ? { lastAnswer: () => reader.read(4000) } : {}),
     calls: 0,
     append(extra: string[]) {
       snapshots.push(...extra);
@@ -73,6 +75,7 @@ function makeFakeReader(snapshots: string[]) {
  */
 function makeEnv(opts: {
   snapshots: string[];
+  reader?: AgentOutputReader;
   progressIntervalMs?: number;
   stabilityMs?: number;
   formatWorkingSuffix?: (elapsedMs: number) => string;
@@ -81,10 +84,11 @@ function makeEnv(opts: {
   finalPayload?: "last-delta" | "full-turn";
   completedOutput?: () => string | null | Promise<string | null>;
   maxTurnMs?: number;
+  isolateLastAnswer?: boolean;
 }) {
   const progressIntervalMs = opts.progressIntervalMs ?? 100;
   const stabilityMs = opts.stabilityMs ?? 100;
-  const reader = makeFakeReader(opts.snapshots);
+  const reader = opts.reader ?? makeFakeReader(opts.snapshots, opts.isolateLastAnswer);
   const communicator = new AgentCommunicator(reader, noopLogger);
   const events: OutputEvent[] = [];
   const pending: Array<() => void> = [];
@@ -149,6 +153,25 @@ function makeEnv(opts: {
   };
 }
 
+describe("ObserveLoopController — unresolved output retains explicit termination", () => {
+  it.each(["deadline", "ceiling", "aborted"] as const)("still terminates for %s while the reader is unresolved", async (reason) => {
+    const env = makeEnv({
+      snapshots: [],
+      reader: { kind: "deferred", ready: false, read: () => "" },
+      maxTurnMs: reason === "ceiling" ? 100 : undefined,
+    });
+    if (reason === "deadline") env.controller.updateDeadline(100);
+    else env.controller.markUserInput();
+    const done = env.controller.start();
+    if (reason === "aborted") env.controller.abort();
+    await env.drive();
+    await done;
+    expect(env.events.filter(e => e.type === "final")).toEqual([
+      { type: "final", text: "", reason, source: "snapshot" },
+    ]);
+  });
+});
+
 describe("ObserveLoopController — deadline state", () => {
   it("reports whether a deadline is currently armed", () => {
     const env = makeEnv({ snapshots: ["stable"] });
@@ -160,6 +183,39 @@ describe("ObserveLoopController — deadline state", () => {
 
     env.controller.updateDeadline(null);
     expect(env.controller.hasDeadline()).toBe(false);
+  });
+});
+
+describe("ObserveLoopController — cumulative history is not a fallback answer", () => {
+  it.each(["full-turn", "last-delta"] as const)("does not replay history in %s mode", async (finalPayload) => {
+    const env = makeEnv({
+      snapshots: ["old unrelated answer\n\nolder conversation"],
+      isolateLastAnswer: false,
+      finalPayload,
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    expect(env.events.filter(e => e.type === "final")).toEqual([
+      { type: "final", text: "", reason: "idle", source: "snapshot" },
+    ]);
+    expect(env.events.filter(e => e.type === "delta")).toEqual([]);
+  });
+
+  it("still delivers newly appended output from a cumulative reader", async () => {
+    const env = makeEnv({
+      snapshots: ["old unrelated answer", "old unrelated answer\n\nnew reply"],
+      isolateLastAnswer: false,
+      finalPayload: "full-turn",
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    const finals = env.events.filter(e => e.type === "final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text.trim()).toBe("new reply");
   });
 });
 

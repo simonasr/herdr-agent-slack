@@ -29,6 +29,38 @@ describe("DeferredReader — a log that is not there yet", () => {
   });
 });
 
+describe("DeferredReader — readiness", () => {
+  it("distinguishes an unresolved source from a resolved empty transcript", () => {
+    let available = false;
+    let picks = 0;
+    const reader = new DeferredReader("x-jsonl", false, () => {
+      picks++;
+      return available ? { kind: "x-jsonl", read: () => "" } : null;
+    }, logger, "w1:p1");
+    expect(reader.ready).toBe(false);
+    expect(picks).toBe(0); // Inspecting readiness does not resolve or start the grace clock.
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(false);
+    available = true;
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(true);
+  });
+
+  it("becomes ready when the bounded fallback takes over, even if it is empty", () => {
+    let t = 0;
+    const reader = new DeferredReader("x-jsonl", false, () => null, logger, "w1:p1",
+      { kind: "scrape", read: () => "" }, 90_000, () => t);
+    expect(reader.read(10)).toBe("");
+    t = 90_000;
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(false);
+    t++;
+    expect(reader.read(10)).toBe("");
+    expect(reader.ready).toBe(true);
+    expect(reader.kind).toBe("scrape");
+  });
+});
+
 describe("DeferredReader — when the log never comes", () => {
   it("reads the screen after the grace period, and says so as a scrape", () => {
     let t = 1_000_000;
@@ -87,6 +119,7 @@ describe("Codex pane that has no session yet", () => {
       logger,
     });
     expect(reader.kind).toBe("codex-jsonl");
+    expect(reader.session).toBeUndefined();
     expect(reader.read(100)).toBe("");
     // The first prompt: herdr learns the id, and the rollout appears.
     const id = `late-${Date.now()}`;
@@ -97,7 +130,31 @@ describe("Codex pane that has no session yet", () => {
       payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "from rollout" }] },
     }) + "\n");
     session = { kind: "id", id };
+    // Metadata alone does not pin the reader; resolving the on-disk log does.
+    expect(reader.session).toBeUndefined();
     expect(reader.read(100)).toBe("from rollout");
+    expect(reader.session).toEqual({ kind: "id", id });
+    session = { kind: "id", id: "replacement" };
+    expect(reader.read(100)).toBe("from rollout");
+    expect(reader.session).toEqual({ kind: "id", id });
+  });
+
+  it("waits for a known Codex id's missing rollout and stays pinned to that id", () => {
+    const session = { kind: "id" as const, id: "known-before-rollout" };
+    const reader = createAgentOutputReader({
+      paneId: "w1:p1", agentName: "codex", session,
+      resolveSession: () => ({ kind: "id", id: "different-session" }),
+      readPane: () => "unrelated screen history", logger,
+    });
+    expect(reader.kind).toBe("codex-jsonl");
+    expect(reader.read(100)).toBe("");
+    const sessions = join(home, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, `rollout-${session.id}.jsonl`), JSON.stringify({
+      type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "the known session answer" }] },
+    }) + "\n");
+    expect(reader.read(100)).toBe("the known session answer");
+    expect(reader.session).toEqual(session);
   });
 
   it("still scrapes when nobody can ask herdr again", () => {
