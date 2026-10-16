@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AgentInfo } from "../src/herdr-client.js";
@@ -8,12 +8,19 @@ import type { SlackClientDeps } from "../src/slack-client.js";
 
 const mocks = vi.hoisted(() => ({
   live: null as AgentInfo | null,
+  home: "",
   client: undefined as SlackClientDeps | undefined,
   panes: [] as Array<{ opts: PaneAgentOptions; dispose: ReturnType<typeof vi.fn>; active: boolean }>,
   post: vi.fn(async (_thread: { channel: string; threadTs: string }, _text: string) => "answer-ts"),
   upload: vi.fn(async () => {}),
   status: vi.fn(async () => {}),
   react: vi.fn(async () => true),
+  dispatch: undefined as undefined | ((text: string) => Promise<boolean>),
+}));
+
+vi.mock("node:os", async (original) => ({
+  ...await original<typeof import("node:os")>(),
+  homedir: () => mocks.home,
 }));
 
 vi.mock("../src/herdr-client.js", async (original) => ({
@@ -36,6 +43,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
     react = mocks.react;
     unreact = vi.fn(async () => {});
     threadHistory = vi.fn(async () => []);
+    rename = vi.fn(async () => {});
   },
 }));
 
@@ -51,7 +59,7 @@ vi.mock("../src/pane-agent.js", () => ({
       this.active = true;
       return true;
     }
-    handleMessage() { this.active = true; }
+    handleMessage(text: string) { this.active = true; return mocks.dispatch?.(text); }
     getPendingPrompt() { return ""; }
     getLastAnswer() { return this.opts.communicator.getLastAnswer(); }
     get verbatim() { return this.opts.communicator.verbatim; }
@@ -60,7 +68,7 @@ vi.mock("../src/pane-agent.js", () => ({
 }));
 
 import { startSlackDaemon } from "../src/slack-daemon.js";
-import { getAgentInfo } from "../src/herdr-client.js";
+import { getAgentInfo, sendText } from "../src/herdr-client.js";
 
 const thread = { channel: "C1", threadTs: "1.0" };
 let dir: string;
@@ -90,7 +98,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.panes.length = 0;
   mocks.client = undefined;
+  mocks.dispatch = undefined;
   dir = mkdtempSync(join(tmpdir(), "slack-session-test-"));
+  mocks.home = dir;
   writeFileSync(join(dir, "config.toml"), '[slack]\nbot_token = "test"\napp_token = "test"\nallowed_user_ids = ["U1"]\n');
   writeFileSync(join(dir, "state.json"), JSON.stringify({
     threads: { "default|C1:1.0": {
@@ -109,6 +119,48 @@ afterEach(async () => {
 });
 
 describe("Slack daemon — session replacement in the same pane", () => {
+  it.each(["unbind", "reader replacement"])("records resolved dispatch only for its live debt after %s", async (race) => {
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-race-a.jsonl"), "");
+    mocks.live = { ...mocks.live!, agent: "codex", agent_session: { kind: "id", id: "race-a" } };
+    let finish!: (sent: boolean) => void;
+    mocks.dispatch = (text) => {
+      sendText("w1:p1", text);
+      return new Promise<boolean>(resolve => { finish = resolve; });
+    };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const sending = mocks.client!.onUserMessage(thread, "U1", "dispatched question", "2.0");
+    await flush();
+    expect(finish).toBeTypeOf("function");
+    if (race === "unbind") {
+      await mocks.client!.onUserMessage(thread, "U1", "!unbind", "3.0");
+      expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    } else {
+      mocks.live = { ...mocks.live!, agent_status: "working", agent_session: { kind: "id", id: "race-b" } };
+      await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+      expect(mocks.panes).toHaveLength(2);
+    }
+    // Simulates successful dispatch whose continuation was delayed beyond
+    // binding retirement or a working reader replacement.
+    finish(true);
+    await sending;
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", "dispatched question");
+    mocks.post.mockClear();
+    writeFileSync(join(sessions, "rollout-race-c.jsonl"), [
+      { role: "user", text: "dispatched question" }, { role: "assistant", text: "late answer" },
+    ].map(({ role, text }) => JSON.stringify({
+      type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] },
+    })).join("\n") + "\n");
+    mocks.live = { ...mocks.live!, agent_status: "idle", agent_session: { kind: "id", id: "race-c" } };
+    if (race === "unbind") await mocks.client!.onUserMessage(thread, "U1", "!bind project", "4.0");
+    else await mocks.client!.onUserMessage(thread, "U1", "!last", "4.0");
+    await flush();
+    if (race === "reader replacement") expect(mocks.post).toHaveBeenCalledWith(thread, "late answer");
+    else expect(mocks.post).not.toHaveBeenCalledWith(thread, "late answer");
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+  });
+
   it("replaces the reader and adopts a new session even while the pane stays working", async () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     expect(mocks.panes).toHaveLength(1);
