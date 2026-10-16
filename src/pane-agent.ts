@@ -346,13 +346,16 @@ export class PaneAgent {
    * from being adopted a second time when herdr reports the pane busy a
    * moment later.
    *
+   * A matching submittedPrompt resumes a Slack turn instead: retain its full
+   * response anchor, without resending or announcing it as terminal input.
    * Returns whether a loop was actually started, so a caller can tell an
    * adopted turn from one that was already being followed.
    */
-  noteExternalTurn(): boolean {
+  noteExternalTurn(submittedPrompt = ""): boolean {
     if (this.disposed || this.isLoopActive()) return false;
-    this.opts.communicator.beginExternalTurn();
-    this.externalTurn = true;
+    if (submittedPrompt) this.opts.communicator.retainSubmittedPrompt(submittedPrompt);
+    else this.opts.communicator.beginExternalTurn();
+    this.externalTurn = !submittedPrompt;
     this.startLoop({ deadline: null, waitUntilIdle: true });
     return true;
   }
