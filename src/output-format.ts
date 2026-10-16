@@ -231,12 +231,13 @@ function normalizeSpace(text: string): string {
  * that 251-character prompt and left every wrapped prompt shorter than 80
  * unanchored.
  */
-function consumePrompt(lines: string[], start: number, target: string): number | null {
+function consumePrompt(lines: string[], start: number, target: string, skipBlankLines = false): number | null {
   let accumulated = normalizeSpace(dechromePrompt(lines[start]));
   if (!accumulated || !target.startsWith(accumulated)) return null;
   let end = start;
   while (accumulated !== target && end + 1 < lines.length) {
     const next = normalizeSpace(lines[end + 1]);
+    if (!next && skipBlankLines) { end += 1; continue; }
     if (!next) break;
     const combined = normalizeSpace(`${accumulated} ${next}`);
     if (!target.startsWith(combined)) break;
@@ -246,9 +247,8 @@ function consumePrompt(lines: string[], start: number, target: string): number |
   return accumulated === target ? end : null;
 }
 
-/** Return only content after the last occurrence of the submitted prompt. */
-export function extractResponseSince(content: string, userInput: string): string {
-  const lines = content.split("\n");
+/** Locate the end of the last submitted-prompt echo, retaining ordinary single-prompt compatibility. */
+function submittedPromptEnd(lines: string[], userInput: string): number {
   const userLines = userInput.split("\n").filter((line) => line.trim());
   const anchor = userLines.at(-1) ?? userInput;
   const target = normalizeSpace(anchor);
@@ -267,6 +267,13 @@ export function extractResponseSince(content: string, userInput: string): string
     if (lines[i].includes(anchor)) { index = i; break; }
     if (anchor.length > 80 && lines[i].includes(anchor.slice(0, 80))) { index = i; break; }
   }
+  return index;
+}
+
+/** Return only content after the last occurrence of the submitted prompt. */
+export function extractResponseSince(content: string, userInput: string): string {
+  const lines = content.split("\n");
+  const index = submittedPromptEnd(lines, userInput);
   if (index < 0) return "";
   // Stop at the next prompt: everything past it belongs to a later turn (or
   // is a prompt the user has typed but not sent). Without this bound the
@@ -558,6 +565,39 @@ export function extractScreenResponse(content: string, userInput: string): strin
   // correlation anchor for this turn.
   const dechromed = content.replace(/^[ \t┃│▏▕]+/gm, "");
   return cleanPaneOutput(extractResponseSince(dechromed, userInput));
+}
+
+/** Bound one deferred screen turn by ordered submitted echoes, not quoted prose or attachments. */
+export function extractSubmittedScreenResponses(content: string, submitted: readonly string[]): string {
+  const lines = content.replace(/^[ \t┃│▏▕]+/gm, "").split("\n");
+  // Screens have no timestamp identity. Keep each latest echo in its latest send position.
+  const prompts = [...new Set([...submitted].reverse())].reverse();
+  const anchors: Array<{ start: number; end: number }> = [];
+  for (let p = 0; p < prompts.length; p++) {
+    const floor = anchors.at(-1)?.end ?? -1;
+    const target = normalizeSpace(prompts[p]);
+    let found = false;
+    for (let i = lines.length - 1; i > floor; i--) {
+      if (!/^[❯›]\s/.test(lines[i].trim())) continue;
+      const end = consumePrompt(lines, i, target, true);
+      if (end === null) continue;
+      anchors.push({ start: i, end });
+      found = true;
+      break;
+    }
+    // Only the initial anchor retains the ordinary truncated/unmarked-prompt fallback.
+    if (p === 0 && !found) {
+      const end = submittedPromptEnd(lines, prompts[p]);
+      if (end >= 0) anchors.push({ start: end, end });
+    }
+  }
+  return anchors.map((anchor, i) => {
+    let end = anchors[i + 1]?.start ?? lines.length;
+    for (let j = anchor.end + 1; j < end; j++) {
+      if (PROMPT_LINE.test(lines[j].trim()) || TURN_END_LINE.test(lines[j].trim())) { end = j; break; }
+    }
+    return cleanPaneOutput(stripStatusBar(lines.slice(anchor.end + 1, end).join("\n")));
+  }).filter(answer => answer.trim()).join("\n\n");
 }
 
 /**

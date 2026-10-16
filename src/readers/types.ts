@@ -14,7 +14,7 @@ export interface AgentOutputReader {
   readonly session?: AgentSessionRef;
   read(maxLines: number): string;
   /** One parsed snapshot and all output since the earliest pending submitted prompt; null if absent. */
-  readSincePrompts?(prompts: readonly string[]): { snapshot: string; text: string } | null;
+  readSincePrompts?(prompts: readonly string[], notBefore?: number): { snapshot: string; text: string } | null;
   /**
    * The question the agent is answering, or answered last. Only a source
    * that logs the user's side can offer it; a screen has its own extraction.
