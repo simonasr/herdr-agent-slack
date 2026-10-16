@@ -477,7 +477,18 @@ export async function startSlackDaemon(
   const setupOnlyTurns = new Set<string>();
   /** Exact dispatched input, independent of any reader's known-prompt suppression. */
   const submittedPrompts = new Map<string, { binding: ThreadBinding; text: string }>();
+  /** One recovery budget per submitted turn, even if its reader changes again. */
+  const idleRecoveries = new Map<string, {
+    binding: ThreadBinding; turn: object | undefined; deadline: number;
+    agent: PaneAgent; timer?: ReturnType<typeof setTimeout>;
+  }>();
+  const cancelIdleRecovery = (paneId: string): void => {
+    const recovery = idleRecoveries.get(paneId);
+    if (recovery) clearTimeout(recovery.timer);
+    idleRecoveries.delete(paneId);
+  };
   const closePendingTurn = (paneId: string): void => {
+    cancelIdleRecovery(paneId);
     setupOnlyTurns.delete(paneId);
     submittedPrompts.delete(paneId);
     pendingTurns.close(paneId);
@@ -970,6 +981,8 @@ export async function startSlackDaemon(
     agentSessions.set(agent, liveIdentity);
     agentSources.set(agent, { name: liveInfo?.agent, communicator });
     agents.set(binding.pane_id, agent);
+    const recovery = idleRecoveries.get(binding.pane_id);
+    if (recovery) recovery.agent = agent;
     // Replacement may be discovered by !last or another request before the
     // watcher ticks. Adopt here so a continuously-working turn is not lost.
     if (existing && liveInfo?.agent_status === "working") {
@@ -981,10 +994,16 @@ export async function startSlackDaemon(
       // A short first turn may finish before a replacement is named. Recover
       // only an isolated logged answer to the actual prompt sent through this
       // pending turn; another session's latest answer is not enough evidence.
-      const answer = pendingPrompt && communicator.readerKind !== "scrape" && communicator.canIsolateLastAnswer()
-        && communicator.getLastLoggedPrompt() === pendingPrompt.trim() ? communicator.getLastAnswer().trim() : "";
-      if (answer) agentOptions.emit({ type: "final", text: answer, source: "snapshot", reason: "idle" });
-      else abandonTurn(bindingForPane(binding.pane_id) ?? binding);
+      const debt = submittedPrompts.get(binding.pane_id);
+      if (debt && debt.binding === bindingForPane(binding.pane_id) && pendingPrompt) {
+        recoverIdleTurn(debt.binding, agent);
+      } else {
+        // Restored debt has no known submitted prompt: never infer one from history.
+        const answer = pendingPrompt && communicator.readerKind !== "scrape" && communicator.canIsolateLastAnswer()
+          && communicator.getLastLoggedPrompt() === pendingPrompt.trim() ? communicator.getLastAnswer().trim() : "";
+        if (answer) agentOptions.emit({ type: "final", text: answer, source: "snapshot", reason: "idle" });
+        else abandonTurn(bindingForPane(binding.pane_id) ?? binding);
+      }
     }
     return agent;
   };
@@ -1011,6 +1030,66 @@ export async function startSlackDaemon(
   /** The question last announced for a pane, so the answer does not repeat it. */
   const announcedPrompt = new Map<string, string>();
 
+  /** Poll only this binding's positively dispatched prompt, never the replacement's history. */
+  const recoverIdleTurn = (binding: ThreadBinding, agent: PaneAgent): void => {
+    const paneId = binding.pane_id;
+    let recovery = idleRecoveries.get(paneId);
+    if (!recovery) {
+      recovery = { binding, turn: turnOwners.get(paneId), agent, deadline: Date.now() + cfg.maxTotalWaitS * 1000 };
+      idleRecoveries.set(paneId, recovery);
+    }
+    recovery.agent = agent;
+    const current = (): boolean => !stopping && !startingTurns.has(paneId)
+      && idleRecoveries.get(paneId) === recovery && turnOwners.get(paneId) === recovery.turn
+      && bindingForPane(paneId) === recovery.binding
+      && submittedPrompts.get(paneId)?.binding === recovery.binding
+      && pendingTurns.isOpen(paneId) && agents.get(paneId) === recovery.agent;
+    const probe = (): void => {
+      if (!current()) { if (idleRecoveries.get(paneId) === recovery) cancelIdleRecovery(paneId); return; }
+      // This may itself discover another replacement. Recheck ownership before
+      // reading or settling anything from the refreshed reader.
+      const selected = paneAgentFor(binding);
+      if (!current() || selected !== recovery.agent) return;
+      const live = getAgentInfo(paneId);
+      const identity = sessionIdentity(live);
+      const pinned = readerIdentityOf(selected);
+      if (!live || !identity || (pinned && pinned !== identity)) {
+        // Metadata outage / unresolved pin is not a contradictory transcript.
+      } else if (live?.agent_status !== "working") {
+        const communicator = agentSources.get(selected)?.communicator;
+        if (communicator && (communicator.readerKind === "scrape" || !communicator.canIsolateLastAnswer())) {
+          // No reliable user-prompt boundary; waiting cannot make this history safe to replay.
+          abandonTurn(binding);
+          return;
+        }
+        if (communicator) {
+          const logged = communicator.getLastLoggedPrompt();
+          if (!current()) return;
+          const prompt = submittedPrompts.get(paneId)?.text.trim();
+          if (logged && logged !== prompt) { abandonTurn(binding); return; }
+          if (logged && logged === prompt) {
+            const answer = communicator.getLastAnswer().trim();
+            if (!current()) return;
+            if (answer) {
+              cancelIdleRecovery(paneId);
+              void deliverFinal(binding, { type: "final", text: answer, source: "snapshot", reason: "idle" }, selected)
+                .catch((err) => log.error("Slack answer delivery failed", { paneId, message: String(err) }));
+              return;
+            }
+          }
+        }
+      }
+      if (!current()) return;
+      const remaining = recovery.deadline - Date.now();
+      if (remaining <= 0) { abandonTurn(binding); return; }
+      clearTimeout(recovery.timer);
+      recovery.timer = setTimeout(probe, Math.min(1_000, remaining));
+      recovery.timer.unref();
+    };
+    clearTimeout(recovery.timer);
+    probe();
+  };
+
   const adoptExternalTurn = (paneId: string, submittedPrompt?: string): boolean => {
     // Slack owns setup until handleMessage starts observation with its prompt.
     if (startingTurns.has(paneId)) return false;
@@ -1021,7 +1100,15 @@ export async function startSlackDaemon(
     if (!binding) return false;
     const agent = paneAgentFor(binding);
     if (!agent.noteExternalTurn(submittedPrompt)) return false;
-    turnOwners.set(paneId, {});
+    const recovery = idleRecoveries.get(paneId);
+    const carriesDebt = recovery?.binding === binding && recovery.turn === turnOwners.get(paneId)
+      && submittedPrompts.get(paneId)?.binding === binding && pendingTurns.isOpen(paneId);
+    const owner = {};
+    turnOwners.set(paneId, owner);
+    // This adoption follows the same sent Slack question into a working
+    // replacement; it is not a new Slack dispatch. Keep its original deadline
+    // while allowing only the newly adopted owner to settle that debt.
+    if (carriesDebt && recovery) recovery.turn = owner;
     cancelFinalRetry(agent);
     // Adopted means the thread is following it; losing it to a restart is
     // the same silence as losing a question asked in the thread.
@@ -1281,6 +1368,7 @@ export async function startSlackDaemon(
     const paneId = binding.pane_id;
     const owner = {};
     turnOwners.set(paneId, owner);
+    cancelIdleRecovery(paneId);
     // Reserve arrival order before any asynchronous Slack setup. Even a setup
     // failure must not let later inputs overtake an earlier pending dispatch.
     const previousDispatch = inputDispatches.get(paneId) ?? Promise.resolve();
@@ -2073,6 +2161,7 @@ export async function startSlackDaemon(
         cancelFinalRetry(agent);
       }
       agents.clear();
+      for (const paneId of idleRecoveries.keys()) cancelIdleRecovery(paneId);
       submittedPrompts.clear();
       for (const bot of bots.values()) await bot.client.stop();
     },
