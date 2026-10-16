@@ -111,6 +111,28 @@ afterEach(async () => {
 });
 
 describe("Slack session routing — real observe loops", () => {
+  it("expires an idle recovery on its original deadline even when async metadata hangs", async () => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\nmax_total_wait_s = 1\n");
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-hung-a.jsonl"), "");
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex", agent_session: { kind: "id", id: "hung-a" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "recover this", "2.0");
+    const prompt = vi.mocked(sendText).mock.calls.at(-1)![1];
+    let resolve!: (value: AgentInfo | null) => void;
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    mocks.live = { ...mocks.live!, agent_session: { kind: "id", id: "hung-b" } };
+    await mocks.client!.onUserMessage(thread, "U1", "!last", "3.0");
+    mocks.post.mockClear();
+    writeFileSync(join(sessions, "rollout-hung-b.jsonl"), codexTurn(prompt, "too late"));
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
+    expect(mocks.post).not.toHaveBeenCalled();
+    resolve(mocks.live);
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(mocks.post).not.toHaveBeenCalled();
+  });
   it("recovers a submitted prompt when an idle replacement transcript arrives late", async () => {
     const sessions = join(dir, ".codex", "sessions");
     mkdirSync(sessions, { recursive: true });
