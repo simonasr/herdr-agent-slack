@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
   post: vi.fn(async (_thread: { channel: string; threadTs: string }, _text: string) => "answer-ts"),
   upload: vi.fn(async () => {}),
   status: vi.fn(async () => {}),
-  react: vi.fn(async () => true),
+  react: vi.fn(async (_channel: string, _ts: string, _name: string, _on: boolean) => true),
   dispatch: undefined as undefined | ((text: string) => Promise<boolean>),
 }));
 
@@ -99,7 +99,7 @@ async function flush() {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
-  vi.mocked(getAgentInfoAsync).mockImplementation(async () => mocks.live);
+  vi.mocked(getAgentInfoAsync).mockReset().mockImplementation(async () => mocks.live);
   vi.mocked(getAgentInfo).mockImplementation(() => mocks.live);
   mocks.panes.length = 0;
   mocks.client = undefined;
@@ -124,11 +124,10 @@ afterEach(async () => {
 });
 
 describe("Slack daemon — session replacement in the same pane", () => {
-  it.each([2, 3])("keeps a complete unsent answer when async identity check %s is unavailable once", async (dropAt) => {
+  it("keeps a complete unsent answer when pre-dispatch identity is unavailable once", async () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await mocks.client!.onUserMessage(thread, "U1", "owed question", "2.0");
-    let checks = 0;
-    vi.mocked(getAgentInfoAsync).mockImplementation(async () => ++checks === dropAt ? null : mocks.live);
+    vi.mocked(getAgentInfoAsync).mockResolvedValueOnce(null);
     mocks.post.mockClear();
     vi.mocked(getAgentInfo).mockClear();
     mocks.panes[0].opts.emit({ type: "final", text: "complete retained answer", source: "delta", reason: "idle" });
@@ -140,6 +139,21 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "complete retained answer");
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
     expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+  });
+
+  it("does not share a hung verification with a later captured final", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    let release!: (info: AgentInfo | null) => void;
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { release = r; }));
+    mocks.panes[0].opts.emit({ type: "final", text: "first answer", source: "delta", reason: "idle" });
+    await flush();
+    await mocks.client!.onUserMessage(thread, "U1", "next question", "2.0");
+    mocks.panes[0].opts.emit({ type: "final", text: "second answer", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "second answer");
+    release(mocks.live);
+    await flush();
+    expect(mocks.post).toHaveBeenCalledOnce();
   });
 
   it("routes progress and a final for a supported sessionless scrape pane", async () => {
@@ -159,21 +173,71 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(getAgentInfo).not.toHaveBeenCalled();
   });
 
-  it("resumes remaining chunks without duplicating the first after one unavailable check", async () => {
+  it("continues remaining chunks best effort after an unavailable post-dispatch check", async () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await mocks.client!.onUserMessage(thread, "U1", "long answer question", "2.0");
-    let checks = 0;
-    vi.mocked(getAgentInfoAsync).mockImplementation(async () => ++checks === 4 ? null : mocks.live);
     const text = "answer line\n".repeat(900);
     mocks.post.mockClear();
+    mocks.post.mockImplementationOnce(async () => {
+      vi.mocked(getAgentInfoAsync).mockResolvedValueOnce(null);
+      return "answer-ts";
+    });
     mocks.panes[0].opts.emit({ type: "final", text, source: "delta", reason: "idle" });
     await flush();
-    expect(mocks.post).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(5_100);
     expect(mocks.post.mock.calls.map(([, packet]) => packet)).toEqual(formatForSlack(text.trim()).map(packet => packet.text));
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
     expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked).toEqual({});
+  });
+
+  it.each(["available", "unavailable", "unbound"])("keeps dispatched work in its captured thread with %s metadata/binding", async (phase) => {
+    const other = { channel: "C1", threadTs: "4.0" };
+    const statePath = join(dir, "state.json");
+    const initial = JSON.parse(readFileSync(statePath, "utf8"));
+    initial.threads["default|C1:4.0"] = { ...initial.threads["default|C1:1.0"], thread_ts: "4.0" };
+    writeFileSync(statePath, JSON.stringify(initial));
+    mocks.live = { ...mocks.live!, cwd: dir };
+    writeFileSync(join(dir, "one.txt"), "one");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "Q1 in A", "2.0");
+    mocks.post.mockClear();
+    mocks.upload.mockClear();
+    let release!: (ts: string) => void;
+    mocks.post.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const prose = "answer line\n".repeat(900) + "@default !last";
+    mocks.panes[0].opts.emit({ type: "final", text: "answer line\n".repeat(900) + "@@send: one.txt\n@default !last", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledOnce();
+    await mocks.client!.onUserMessage(other, "U1", "Q2 in B", "5.0");
+    const q2 = JSON.parse(readFileSync(statePath, "utf8"));
+    const pending = readFileSync(join(dir, "pending-turns.json"), "utf8");
+    const statusCalls = mocks.status.mock.calls.length;
+    const reactionCalls = mocks.react.mock.calls.length;
+    expect(q2.marked["w1:p1"].ts).toBe("5.0");
+    expect(mocks.panes).toHaveLength(1);
+    if (phase === "unbound") await mocks.client!.onUserMessage(thread, "U1", "!unbind", "6.0");
+    if (phase === "unavailable") vi.mocked(getAgentInfoAsync).mockResolvedValueOnce(null);
+    const postsBeforeRelease = mocks.post.mock.calls.length;
+    release("chunk-one-ts");
+    await flush();
+    if (phase === "unbound") {
+      expect(mocks.post).toHaveBeenCalledTimes(postsBeforeRelease);
+      expect(mocks.upload).not.toHaveBeenCalled();
+    } else {
+      expect(mocks.post.mock.calls).toEqual([
+        ...formatForSlack(prose).map(packet => [thread, packet.text]),
+        [thread, "old unrelated history"],
+      ]);
+      expect(mocks.upload).toHaveBeenCalledExactlyOnceWith(thread, join(dir, "one.txt"), "one.txt", "one.txt");
+    }
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(after.asked_from["w1:p1"]).toBe("default|C1:4.0");
+    expect(after.marked).toEqual(q2.marked);
+    expect(after.last_answer).toEqual(q2.last_answer);
+    expect(after.delivered).toEqual(q2.delivered);
+    expect(readFileSync(join(dir, "pending-turns.json"), "utf8")).toBe(pending);
+    expect(mocks.status).toHaveBeenCalledTimes(statusCalls);
+    expect(mocks.react).toHaveBeenCalledTimes(reactionCalls);
+    expect(mocks.panes).toHaveLength(1);
   });
 
   it("does not replay a dispatched chunk when the next identity check hangs past the deadline", async () => {
@@ -182,13 +246,11 @@ describe("Slack daemon — session replacement in the same pane", () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await mocks.client!.onUserMessage(thread, "U1", "long answer", "2.0");
     let release!: (info: AgentInfo | null) => void;
-    let checks = 0;
-    vi.mocked(getAgentInfoAsync).mockImplementation(async () => {
-      checks++;
-      if (checks === 4) return new Promise(r => { release = r; });
-      return mocks.live;
-    });
     mocks.post.mockClear();
+    mocks.post.mockImplementationOnce(async () => {
+      vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { release = r; }));
+      return "answer-ts";
+    });
     mocks.panes[0].opts.emit({ type: "final", text: "answer line\n".repeat(900), source: "delta", reason: "idle" });
     await flush();
     expect(mocks.post).toHaveBeenCalledOnce();
@@ -196,7 +258,7 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
     release(mocks.live);
     await flush();
-    expect(mocks.post).toHaveBeenCalledOnce();
+    expect(mocks.post.mock.calls.map(([, packet]) => packet)).toEqual(formatForSlack("answer line\n".repeat(900).trim()).map(packet => packet.text));
   });
 
   it("keeps a file batch and later handoff after metadata fails at settlement", async () => {
@@ -218,8 +280,6 @@ describe("Slack daemon — session replacement in the same pane", () => {
     mocks.panes[0].opts.emit({ type: "final", text: "files ready\n@@send: one.txt\n@default !last", source: "delta", reason: "idle" });
     await flush();
     expect(dropped).toBe(true);
-    expect(mocks.upload).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(5_100);
     expect(mocks.upload).toHaveBeenCalledExactlyOnceWith(thread, join(dir, "one.txt"), "one.txt", "one.txt");
     expect(mocks.post.mock.calls.map(([, text]) => text)).toEqual([
       ...formatForSlack("files ready\n@default !last").map(packet => packet.text), "old unrelated history",
@@ -244,8 +304,7 @@ describe("Slack daemon — session replacement in the same pane", () => {
     await flush();
     expect(mocks.upload).toHaveBeenCalledOnce();
     expect(dropped).toBe(true);
-    expect(mocks.post.mock.calls).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(5_100);
+    expect(mocks.post.mock.calls).toHaveLength(2);
     expect(mocks.upload).toHaveBeenCalledTimes(1);
     expect(mocks.post.mock.calls.map(([, text]) => text)).toEqual([
       ...formatForSlack("files ready\n@default !last").map(packet => packet.text), "old unrelated history",
@@ -296,6 +355,28 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(getAgentInfo).not.toHaveBeenCalled();
   });
 
+  it("bounds a burst of progress lookups without delaying independent final verification", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await flush();
+    mocks.status.mockClear();
+    let release!: (info: AgentInfo | null) => void;
+    vi.mocked(getAgentInfoAsync).mockClear();
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { release = r; }));
+    for (let i = 0; i < 12; i++) mocks.panes[0].opts.emit({ type: "working", text: `fragment ${i}` });
+    await flush();
+    expect(getAgentInfoAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.status).not.toHaveBeenCalledWith(thread, "is working…");
+    mocks.post.mockClear();
+    mocks.panes[0].opts.emit({ type: "final", text: "independent final", source: "delta", reason: "idle" });
+    await flush();
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "independent final");
+    const statusesAfterFinal = mocks.status.mock.calls.length;
+    release(mocks.live);
+    await flush();
+    expect(getAgentInfoAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.status).toHaveBeenCalledTimes(statusesAfterFinal);
+  });
+
   it("does not route delayed progress from a replaced session or block another timer", async () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await flush();
@@ -318,14 +399,13 @@ describe("Slack daemon — session replacement in the same pane", () => {
     expect(getAgentInfo).not.toHaveBeenCalled();
   });
 
-  it("bounds a hung delivery recheck after the initial event identity succeeds", async () => {
+  it("bounds a hung pre-dispatch verification without posting", async () => {
     const path = join(dir, "config.toml");
     writeFileSync(path, readFileSync(path, "utf8") + "max_total_wait_s = 1\n");
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await mocks.client!.onUserMessage(thread, "U1", "owed", "2.0");
     let resolve!: (info: AgentInfo | null) => void;
-    vi.mocked(getAgentInfoAsync).mockResolvedValueOnce(mocks.live)
-      .mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { resolve = r; }));
     mocks.panes[0].opts.emit({ type: "final", text: "late answer", source: "delta", reason: "idle" });
     await flush();
     expect(mocks.post).not.toHaveBeenCalled();
@@ -339,13 +419,13 @@ describe("Slack daemon — session replacement in the same pane", () => {
   it("retains Q2 settlement while Q1 verification is pending during Q2 setup", async () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     await mocks.client!.onUserMessage(thread, "U1", "Q1", "2.0");
-    let resolve!: (info: AgentInfo | null) => void;
-    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { resolve = r; }));
-    mocks.panes[0].opts.emit({ type: "final", text: "Q1 answer", source: "delta", reason: "idle" });
-    await flush();
     let release!: () => void;
     mocks.status.mockImplementationOnce(() => new Promise(r => { release = r; }));
     const q2 = mocks.client!.onUserMessage(thread, "U1", "Q2", "3.0");
+    await flush();
+    let resolve!: (info: AgentInfo | null) => void;
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    mocks.panes[0].opts.emit({ type: "final", text: "Q1 answer", source: "delta", reason: "idle" });
     await flush();
     resolve(mocks.live);
     await flush();
@@ -407,13 +487,11 @@ describe("Slack daemon — session replacement in the same pane", () => {
 
   it("stops later chunks when fresh async metadata reports a new session", async () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
-    const original = mocks.live;
-    let checks = 0;
-    vi.mocked(getAgentInfoAsync).mockImplementation(async () => {
-      checks++;
-      return checks <= 3 ? original : liveSession(sessionFile("replacement.jsonl", "other"));
-    });
     mocks.post.mockClear();
+    mocks.post.mockImplementationOnce(async () => {
+      mocks.live = liveSession(sessionFile("replacement.jsonl", "other"));
+      return "answer-ts";
+    });
     vi.mocked(getAgentInfo).mockClear();
     mocks.panes[0].opts.emit({ type: "final", text: "answer line\n".repeat(900), source: "delta", reason: "idle" });
     await flush();
@@ -503,9 +581,7 @@ describe("Slack daemon — session replacement in the same pane", () => {
   it("rejects an old final when the delivery lookup discovers replacement", async () => {
     daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
     const old = mocks.panes[0];
-    const original = mocks.live;
     mocks.live = liveSession(sessionFile("new.jsonl", "replacement output"));
-    vi.mocked(getAgentInfoAsync).mockImplementationOnce(async () => original);
     mocks.post.mockClear();
     old.opts.emit({ type: "final", text: "retired output", source: "delta", reason: "idle" });
     await flush();

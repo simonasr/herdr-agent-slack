@@ -111,6 +111,35 @@ afterEach(async () => {
 });
 
 describe("Slack session routing — real observe loops", () => {
+  it("replays a ready startup pane while another pane's identity is unavailable", async () => {
+    appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\nmax_total_wait_s = 2\n");
+    const sessions = join(dir, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "rollout-owed-a.jsonl"), codexTurn("question A", "owed A"));
+    writeFileSync(join(sessions, "rollout-owed-b.jsonl"), codexTurn("question B", "ready owed answer"));
+    const ready = { ...liveSession(oldPath, "idle"), agent: "codex", pane_id: "w1:p2",
+      agent_session: { kind: "id" as const, id: "owed-b" } };
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex",
+      agent_session: { kind: "id", id: "owed-a" } };
+    const statePath = join(dir, "state.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    state.threads["default|C1:2.0"] = { ...state.threads["default|C1:1.0"],
+      pane_id: "w1:p2", thread_ts: "2.0", label: "ready" };
+    writeFileSync(statePath, JSON.stringify(state));
+    writeFileSync(join(dir, "pending-turns.json"), JSON.stringify([
+      { pane_id: "w1:p1", started_at: new Date().toISOString() },
+      { pane_id: "w1:p2", started_at: new Date().toISOString() },
+    ]));
+    mocks.extraPanes.push({ pane_id: "w1:p2", label: "ready", agent: "pi", status: "idle" });
+    const { getAgentInfo } = await import("../src/herdr-client.js");
+    vi.mocked(getAgentInfo).mockImplementation(id => id === "w1:p2" ? ready : mocks.live);
+    vi.mocked(getAgentInfoAsync).mockImplementation(async id => id === "w1:p2" ? ready : null);
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith({ channel: "C1", threadTs: "2.0" },
+      expect.stringContaining("ready owed answer"));
+    expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
+  });
   it("expires an idle recovery on its original deadline even when async metadata hangs", async () => {
     appendFileSync(join(dir, "config.toml"), "relay_terminal_turns = false\nmax_total_wait_s = 1\n");
     const sessions = join(dir, ".codex", "sessions");
