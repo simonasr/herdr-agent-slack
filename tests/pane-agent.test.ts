@@ -1398,7 +1398,7 @@ describe("PaneAgent — asynchronous metadata and turn ownership", () => {
     const second = e.agent.handleMessage("second");
     expect(e.sent()).toBe(0);
     baseline.resolve(e.getInfo());
-    await Promise.all([first, second]);
+    expect(await Promise.all([first, second])).toEqual([true, true]);
     expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["ask", "second"]);
     expect(e.captured()).toBe(0);
     e.setAnswer("must settle normally");
@@ -1418,12 +1418,12 @@ describe("PaneAgent — asynchronous metadata and turn ownership", () => {
     e.agent[action]();
     expect(e.agent.isLoopActive()).toBe(false);
     baseline.resolve(e.getInfo());
-    await Promise.all([first, second]);
+    expect(await Promise.all([first, second])).toEqual([false, false]);
     expect(e.sent()).toBe(0);
     expect(e.captured()).toBe(0);
     expect(e.finals()).toHaveLength(0);
     if (action === "dispose") {
-      await e.agent.handleMessage("after disposal");
+      expect(await e.agent.handleMessage("after disposal")).toBe(false);
       e.agent.enableFollow(60_000);
       expect(e.sent()).toBe(0);
       expect(e.agent.isLoopActive()).toBe(false);

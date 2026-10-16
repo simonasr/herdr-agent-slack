@@ -444,11 +444,18 @@ export async function startSlackDaemon(
   }
 
   const agents = new Map<string, PaneAgent>();
-  /**
-   * Questions asked in a thread that have not been answered yet. Read at
-   * startup, so a daemon that died mid-turn pays its debt rather than leaving
-   * the thread waiting forever.
-   */
+  let stopping = false;
+  /** A reservation exists before the first asynchronous setup step. */
+  const inputDispatches = new Map<string, Promise<void>>();
+  const turnOwners = new Map<string, object>();
+  const startingTurns = new Map<string, number>();
+  /** Questions definitely not dispatched; restored entries remain owed. */
+  const setupOnlyTurns = new Set<string>();
+  const closePendingTurn = (paneId: string): void => {
+    setupOnlyTurns.delete(paneId);
+    pendingTurns.close(paneId);
+  };
+  /** Questions asked in a thread that have not been answered yet. */
   const pendingTurns = new PendingTurnLog(join(statePath, "pending-turns.json"), log);
   /** The bot a binding posts through. Bindings only exist for configured bots. */
   const botOf = (binding: ThreadBinding): Bot => bots.get(binding.bot) as Bot;
@@ -522,19 +529,23 @@ export async function startSlackDaemon(
    * running in the background — then the answer was an interim one, the mark
    * stays, and the status line says what is still going.
    */
-  const markDone = async (bot: Bot, paneId: string, thread: SlackThread): Promise<void> => {
+  const markDone = async (bot: Bot, paneId: string, thread: SlackThread, isCurrent: () => Promise<boolean>): Promise<void> => {
     const mark = state.marked[paneId];
-    if (!mark) return;
+    if (!mark || !await isCurrent()) return;
     const running = backgroundOn(paneId);
     if (running) {
+      if (!await isCurrent()) return;
       log.info("answer delivered, but work continues in the background", { paneId, running });
       await bot.client.setStatus(thread, `has ${running} still running in the background`);
       return;
     }
+    if (!await isCurrent() || state.marked[paneId] !== mark) return;
     delete state.marked[paneId];
     persist();
     await bot.client.react(mark.channel, mark.ts, mark.name ?? FALLBACK_WORKING, false);
+    if (!await isCurrent()) return;
     if (!(await bot.client.react(mark.channel, mark.ts, bot.cfg.markDone, true)) && bot.cfg.markDone !== FALLBACK_DONE) {
+      if (!await isCurrent()) return;
       await bot.client.react(mark.channel, mark.ts, FALLBACK_DONE, true);
     }
   };
@@ -546,10 +557,17 @@ export async function startSlackDaemon(
     return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
   };
 
+  // A later asker does not retire a dispatched answer's captured binding.
+  const bindingLive = (binding: ThreadBinding, owner: PaneAgent): boolean =>
+    !stopping && agents.get(binding.pane_id) === owner &&
+    state.threads[bindingKey(binding.bot, { channel: binding.channel, threadTs: binding.thread_ts })] === binding;
+  const localOwner = (binding: ThreadBinding, owner: PaneAgent): boolean =>
+    bindingLive(binding, owner) && bindingForPane(binding.pane_id) === binding;
   /** Deliver a finished turn into the thread it belongs to. */
   const deliverFinal = async (
     binding: ThreadBinding,
     event: Extract<OutputEvent, { type: "final" }>,
+    owner: PaneAgent,
     note = "",
     /** Whether somebody in the thread asked for this turn, and is waiting. */
     awaited = true,
@@ -559,11 +577,44 @@ export async function startSlackDaemon(
      * meant for now.
      */
     replay = false,
+    captured: { turn: object | undefined; duringSetup: boolean; binding: ThreadBinding; dispatched?: boolean } = {
+      turn: turnOwners.get(binding.pane_id), duringSetup: startingTurns.has(binding.pane_id), binding,
+    },
   ): Promise<void> => {
+    const paneId = binding.pane_id;
+    // Session ownership allows an already-started answer to finish; only
+    // captured turn ownership permits settlement of the ledger and marks.
+    const isCurrent = (): boolean => !captured.duringSetup && !startingTurns.has(paneId)
+      && turnOwners.get(paneId) === captured.turn && localOwner(binding, owner);
+    const closeOwned = (): void => {
+      if (!isCurrent()) return;
+      turnStartedAt.delete(paneId);
+      closePendingTurn(paneId);
+    };
+    // Until dispatch, missing evidence must retain the entire answer. After
+    // dispatch it is only a positive contradiction that stops later operations.
+    const nextOperation = async (): Promise<boolean> =>
+      captured.dispatched ? bindingLive(binding, owner) : localOwner(binding, owner);
+    const beginOperation = (): void => {
+      if (captured.dispatched) return;
+      captured.dispatched = true;
+      closeOwned();
+    };
+    const canSettle = async (): Promise<boolean> => {
+      if (!isCurrent()) return false;
+      return isCurrent();
+    };
+    if (!await nextOperation()) return;
     const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
+    if (event.duplicate) {
+      beginOperation();
+      log.info("suppressed a repeat of the last answer", { paneId });
+      if (isCurrent()) await botOf(binding).client.setStatus(thread, "");
+      return;
+    }
     // Accumulated turn output has already been through the snapshot filters;
     // a raw readback has not. The model's own text needs neither.
-    const cleaned = paneAgentFor(binding).verbatim
+    const cleaned = owner.verbatim
       ? event.text.trim()
       : event.source === "snapshot"
         ? cleanPaneOutput(event.text)
@@ -596,15 +647,17 @@ export async function startSlackDaemon(
     });
     if (messages.length === 0 && requestedFiles.length === 0) {
       if (event.reason === "aborted") {
+        beginOperation();
         await bot.client.post(thread, `${note}🛑 Stopped.`);
-        await markDone(bot, binding.pane_id, thread);
+        if (isCurrent()) await markDone(bot, paneId, thread, canSettle);
         return;
       }
       // Nothing said, but the pane is stuck on a question of its own — an
       // approval, a choice — which only the terminal can answer. That is
       // worth a message; show what it is asking.
-      const stuck = getAgentInfo(binding.pane_id)?.agent_status === "blocked" ? paneTail(binding.pane_id) : "";
+      const stuck = getAgentInfo(paneId)?.agent_status === "blocked" ? paneTail(paneId) : "";
       if (stuck) {
+        beginOperation();
         await bot.client.post(
           thread,
           `${note}⚠️ *${binding.label}* is waiting for an answer in the terminal:\n\`\`\`\n${stuck}\n\`\`\``,
@@ -615,13 +668,14 @@ export async function startSlackDaemon(
       // the pane started itself — a monitor firing, a false idle in a long
       // command — owes nothing, and "Done (no output)" only reads as an
       // answer to whatever was said last.
+      beginOperation();
       if (!awaited) {
-        log.info("a turn of the pane's own ended with nothing to say", { paneId: binding.pane_id });
-        await bot.client.setStatus(thread, "");
+        log.info("a turn of the pane's own ended with nothing to say", { paneId });
+        if (isCurrent()) await bot.client.setStatus(thread, "");
         return;
       }
       await bot.client.post(thread, `${note}✅ Done (no output).`);
-      await markDone(bot, binding.pane_id, thread);
+      if (isCurrent()) await markDone(bot, paneId, thread, canSettle);
       return;
     }
     // The question, when it was asked in the terminal and this thread never
@@ -629,21 +683,39 @@ export async function startSlackDaemon(
     const asked = event.prompt?.trim() ?? "";
     // Not twice: a question announced when the turn started is already above.
     const alreadyShown = asked.length > 0 && announcedPrompt.get(binding.pane_id) === asked;
-    if (alreadyShown) announcedPrompt.delete(binding.pane_id);
+    if (alreadyShown && isCurrent()) announcedPrompt.delete(binding.pane_id);
     const quoted = asked && !alreadyShown ? `${quoteForSlack(asked)}\n\n` : "";
     const prefix = note + quoted + (event.reason === "aborted" ? "🛑 Stopped.\n\n" : "");
     let lastTs = "";
     for (const [index, message] of messages.entries()) {
+      if (index > 0 && !await nextOperation()) return;
+      beginOperation();
       lastTs = await bot.client.post(thread, (index === 0 ? prefix : "") + message.text) || lastTs;
     }
-    if (lastTs) state.last_answer[binding.pane_id] = { channel: thread.channel, ts: lastTs };
-    state.delivered[binding.pane_id] = digest(event.text);
-    persist();
-    await markDone(bot, binding.pane_id, thread);
+    if (messages.length > 0 && isCurrent()) {
+      if (lastTs) state.last_answer[paneId] = { channel: thread.channel, ts: lastTs };
+      state.delivered[paneId] = digest(event.text);
+      persist();
+      await markDone(bot, paneId, thread, canSettle);
+    }
+    if (!bindingLive(binding, owner)) return;
     log.info("answer delivered", { bot: bot.name, paneId: binding.pane_id, messages: messages.length });
-    if (requestedFiles.length > 0) await deliverRequestedFiles(binding, thread, requestedFiles);
+    // These are dispatched operations: once started, finish their files or
+    // command/spawn/brief sequence rather than strand a partial side effect.
+    if (requestedFiles.length > 0) {
+      if (!await nextOperation()) return;
+      beginOperation();
+      await deliverRequestedFiles(binding, thread, requestedFiles);
+    }
+    if (messages.length === 0 && isCurrent() && captured.dispatched) {
+      state.delivered[paneId] = digest(event.text);
+      persist();
+      await markDone(bot, paneId, thread, canSettle);
+    }
     for (const handoff of handoffs) {
-      await handOff(bot, thread, handoff, binding.pane_id).catch((err) =>
+      if (!await nextOperation()) return;
+      beginOperation();
+      await handOff(bot, thread, handoff, paneId).catch((err) =>
         log.error("handoff failed", { from: bot.name, to: handoff.bot, message: String(err) }),
       );
     }
@@ -768,6 +840,20 @@ export async function startSlackDaemon(
     if (notes.length) await client.post(thread, notes.join("\n"));
   };
 
+  /** Release a cancelled turn without posting anything from its retired reader. */
+  const abandonTurn = (binding: ThreadBinding): void => {
+    const paneId = binding.pane_id;
+    closePendingTurn(paneId);
+    turnStartedAt.delete(paneId);
+    announcedPrompt.delete(paneId);
+    const mark = state.marked[paneId];
+    delete state.marked[paneId];
+    persist();
+    const client = botOf(binding).client;
+    void client.setStatus({ channel: binding.channel, threadTs: binding.thread_ts }, "");
+    if (mark) void client.react(mark.channel, mark.ts, mark.name ?? FALLBACK_WORKING, false);
+  };
+
   /** Lazily build the PaneAgent that owns a pane, wired to this thread. */
   const paneAgentFor = (binding: ThreadBinding): PaneAgent => {
     const existing = agents.get(binding.pane_id);
@@ -795,36 +881,24 @@ export async function startSlackDaemon(
       config: cfg,
       getCompletionInfo: () => getAgentInfoAsync(binding.pane_id),
       emit: (event) => {
-        // The agent is the pane's; the thread is whichever asked last. It is
-        // looked up now, not when this agent was built — the binding that
-        // built it may be one of many on a default pane, or gone.
-        const target = bindingForPane(binding.pane_id) ?? binding;
-        const thread: SlackThread = { channel: target.channel, threadTs: target.thread_ts };
-        // Progress never reaches Slack as messages: the whole turn arrives
-        // once, at the end. Each tick refreshes the status line instead —
-        // Slack drops one that is left alone for long — with the clock on
-        // it, which is what progress looks like without an output stream.
+        const paneId = binding.pane_id;
+        // Snapshot the destination and turn synchronously, not after Slack yields.
+        const captured = { turn: turnOwners.get(paneId), duringSetup: startingTurns.has(paneId),
+          binding: bindingForPane(paneId) ?? binding };
+        const valid = (): boolean => !stopping && agents.get(paneId) === agent
+          && bindingForPane(paneId) === captured.binding
+          && state.threads[bindingKey(captured.binding.bot, {
+            channel: captured.binding.channel, threadTs: captured.binding.thread_ts,
+          })] === captured.binding;
+        if (!valid()) return;
+        const thread: SlackThread = { channel: captured.binding.channel, threadTs: captured.binding.thread_ts };
         if (event.type !== "final") {
-          const elapsed = elapsedSince(turnStartedAt.get(target.pane_id));
-          void botOf(target).client.setStatus(thread, elapsed ? `is working… (${elapsed})` : "is working…");
+          const elapsed = elapsedSince(turnStartedAt.get(paneId));
+          void botOf(captured.binding).client.setStatus(thread, elapsed ? `is working… (${elapsed})` : "is working…");
           return;
         }
-        turnStartedAt.delete(target.pane_id);
-        // A final of any kind settles the question. Cleared before delivery,
-        // so a send that fails does not leave a debt that gets paid twice.
-        const asked = pendingTurns.isOpen(target.pane_id);
-        pendingTurns.close(target.pane_id);
-        // The turn re-produced the answer already in this thread. See
-        // `PaneAgent.forward`. Nothing is posted, so the status line has to
-        // be cleared by hand.
-        if (event.duplicate) {
-          log.info("suppressed a repeat of the last answer", { paneId: target.pane_id });
-          void botOf(target).client.setStatus(thread, "");
-          return;
-        }
-        void deliverFinal(target, event, "", asked).catch((err) =>
-          log.error("Slack answer delivery failed", { paneId: target.pane_id, message: String(err) }),
-        );
+        void deliverFinal(captured.binding, event, agent, "", pendingTurns.isOpen(paneId), false, captured)
+          .catch((err) => log.error("Slack event delivery failed", { paneId, message: String(err) }));
       },
     });
     agents.set(binding.pane_id, agent);
@@ -854,41 +928,50 @@ export async function startSlackDaemon(
   /** The question last announced for a pane, so the answer does not repeat it. */
   const announcedPrompt = new Map<string, string>();
 
+  const adoptExternalTurn = (paneId: string): boolean => {
+    // Slack owns setup until handleMessage starts observation with its prompt.
+    if (startingTurns.has(paneId)) return false;
+    const binding = bindingForPane(paneId);
+    if (!binding) return false;
+    const agent = paneAgentFor(binding);
+    if (!agent.noteExternalTurn()) return false;
+    const owner = {};
+    turnOwners.set(paneId, owner);
+    // Adopted means the thread is following it; losing it to a restart is
+    // the same silence as losing a question asked in the thread.
+    pendingTurns.open(paneId);
+    setupOnlyTurns.delete(paneId);
+    const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
+    // Say what was asked now, rather than when the answer lands: a turn can
+    // run for a quarter of an hour.
+    const asked = agent.getPendingPrompt().trim();
+    let announced: Promise<unknown> = Promise.resolve();
+    if (asked && announcedPrompt.get(paneId) !== asked) {
+      announcedPrompt.set(paneId, asked);
+      announced = botOf(binding).client.post(thread, TYPED_PREFIX + quoteForSlack(asked)).catch((err) =>
+        log.warn("could not announce a terminal turn", { paneId, detail: String(err) }),
+      );
+    }
+    // Posting clears the line, so it goes up after the announcement.
+    turnStartedAt.set(paneId, Date.now());
+    void announced.then(async () => {
+      if (agents.get(paneId) !== agent) return;
+      await botOf(binding).client.setStatus(thread, "is working…");
+      if (agents.get(paneId) !== agent) return;
+      // Nothing was asked here; the pane picked its own work back up. The
+      // previous answer is what this turn continues, so it carries the mark.
+      const previous = state.last_answer[paneId];
+      if (previous && previous.channel === thread.channel) {
+        await markWorking(botOf(binding), paneId, previous.channel, previous.ts, { replace: false });
+      }
+    });
+    return true;
+  };
+
   const paneWatcher = new PaneWatcher({
     listPanes: getAgents,
     isBound: (paneId) => bindingForPane(paneId) !== undefined,
-    onExternalTurn: (paneId) => {
-      const binding = bindingForPane(paneId);
-      if (!binding) return false;
-      const agent = paneAgentFor(binding);
-      if (!agent.noteExternalTurn()) return false;
-      // Adopted means the thread is following it; losing it to a restart is
-      // the same silence as losing a question asked in the thread.
-      pendingTurns.open(paneId);
-      const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
-      // Say what was asked now, rather than when the answer lands: a turn can
-      // run for a quarter of an hour.
-      const asked = agent.getPendingPrompt().trim();
-      let announced: Promise<unknown> = Promise.resolve();
-      if (asked && announcedPrompt.get(paneId) !== asked) {
-        announcedPrompt.set(paneId, asked);
-        announced = botOf(binding).client.post(thread, TYPED_PREFIX + quoteForSlack(asked)).catch((err) =>
-          log.warn("could not announce a terminal turn", { paneId, detail: String(err) }),
-        );
-      }
-      // Posting clears the line, so it goes up after the announcement.
-      turnStartedAt.set(paneId, Date.now());
-      void announced.then(async () => {
-        await botOf(binding).client.setStatus(thread, "is working…");
-        // Nothing was asked here; the pane picked its own work back up. The
-        // previous answer is what this turn continues, so it carries the mark.
-        const previous = state.last_answer[paneId];
-        if (previous && previous.channel === thread.channel) {
-          await markWorking(botOf(binding), paneId, previous.channel, previous.ts, { replace: false });
-        }
-      });
-      return true;
-    },
+    onExternalTurn: adoptExternalTurn,
     logger: log,
   });
 
@@ -935,6 +1018,7 @@ export async function startSlackDaemon(
     if (previous && previous.pane_id !== pane.pane_id && !bindingForPane(previous.pane_id)) {
       agents.get(previous.pane_id)?.dispose();
       agents.delete(previous.pane_id);
+      if (setupOnlyTurns.has(previous.pane_id)) abandonTurn(previous);
     }
     const cwd = getAgentInfo(pane.pane_id)?.cwd;
     await bot.client.rename(thread, cwd ? `${pane.label} · ${cwd}` : pane.label);
@@ -1097,17 +1181,55 @@ export async function startSlackDaemon(
     text: string,
     messageTs: string,
   ): Promise<void> => {
-    // This thread asked; the answer comes back here.
-    state.asked_from[binding.pane_id] = bindingKey(bot.name, thread);
-    binding.last_active = Date.now();
-    persist();
-    turnStartedAt.set(binding.pane_id, Date.now());
-    await bot.client.setStatus(thread, "is working…");
-    await markWorking(bot, binding.pane_id, thread.channel, messageTs);
-    log.info("turn started", { bot: bot.name, paneId: binding.pane_id, label: binding.label, thread: threadKey(thread) });
-    pendingTurns.open(binding.pane_id);
-    await dismissBlockingDialog(binding.pane_id);
-    await paneAgentFor(binding).handleMessage(await withThreadContext(binding, thread, text, messageTs));
+    const paneId = binding.pane_id;
+    const owner = {};
+    turnOwners.set(paneId, owner);
+    // Reserve arrival order before any asynchronous Slack setup. Even a setup
+    // failure must not let later inputs overtake an earlier pending dispatch.
+    const previousDispatch = inputDispatches.get(paneId) ?? Promise.resolve();
+    let releaseDispatch!: () => void;
+    const finished = new Promise<void>(resolve => { releaseDispatch = resolve; });
+    const dispatch = previousDispatch.then(() => finished);
+    inputDispatches.set(paneId, dispatch);
+    void dispatch.then(() => {
+      if (inputDispatches.get(paneId) === dispatch) inputDispatches.delete(paneId);
+    });
+    startingTurns.set(paneId, (startingTurns.get(paneId) ?? 0) + 1);
+    try {
+      // This thread asked; the answer comes back here.
+      state.asked_from[paneId] = bindingKey(bot.name, thread);
+      binding.last_active = Date.now();
+      persist();
+      paneAgentFor(binding);
+      turnStartedAt.set(paneId, Date.now());
+      await bot.client.setStatus(thread, "is working…");
+      await markWorking(bot, paneId, thread.channel, messageTs);
+      log.info("turn started", { bot: bot.name, paneId, label: binding.label, thread: threadKey(thread) });
+      if (!pendingTurns.isOpen(paneId)) setupOnlyTurns.add(paneId);
+      pendingTurns.open(paneId);
+      await dismissBlockingDialog(paneId);
+      const framed = await withThreadContext(binding, thread, text, messageTs);
+      await previousDispatch;
+      let sent = false;
+      if (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
+        const agent = paneAgentFor(binding);
+        if (await agent.handleMessage(framed) !== false) {
+          sent = true;
+          setupOnlyTurns.delete(paneId);
+        }
+      }
+      // A canceled last setup owns no future answer. Never release a later
+      // question's state, or a prior dispatched/recovered debt during shutdown.
+      if (!sent && (!stopping || setupOnlyTurns.has(paneId))
+        && turnOwners.get(paneId) === owner && startingTurns.get(paneId) === 1) {
+        abandonTurn(bindingForPane(paneId) ?? binding);
+      }
+    } finally {
+      const remaining = (startingTurns.get(paneId) ?? 1) - 1;
+      if (remaining > 0) startingTurns.set(paneId, remaining);
+      else startingTurns.delete(paneId);
+      releaseDispatch();
+    }
   };
 
   /**
@@ -1358,6 +1480,7 @@ export async function startSlackDaemon(
     if (!bindingForPane(binding.pane_id)) {
       agents.get(binding.pane_id)?.dispose();
       agents.delete(binding.pane_id);
+      if (setupOnlyTurns.has(binding.pane_id)) abandonTurn(binding);
     }
     listings.delete(bindingKey(bot.name, thread));
     log.info("thread unbound", { bot: bot.name, paneId: binding.pane_id, thread: threadKey(thread) });
@@ -1654,7 +1777,9 @@ export async function startSlackDaemon(
     for (const paneId of owed) {
       const binding = bindingForPane(paneId);
       const pane = byId.get(paneId);
-      if (!binding || !pane) { pendingTurns.close(paneId); continue; }
+      if (startingTurns.has(paneId)) continue;
+      if (!binding || !pane) { closePendingTurn(paneId); continue; }
+      setupOnlyTurns.delete(paneId);
       if (pane.status === "working") {
         paneAgentFor(binding).noteExternalTurn();
         log.info("resumed a turn a restart interrupted", { paneId });
@@ -1679,6 +1804,7 @@ export async function startSlackDaemon(
         await deliverFinal(
           binding,
           { type: "final", text: owed, reason: "idle", source: "snapshot" },
+          agent,
           LATE_PREFIX,
           true,
           true,
@@ -1687,7 +1813,7 @@ export async function startSlackDaemon(
       } catch (err) {
         log.warn("could not deliver a late answer", { paneId, message: String(err) });
       }
-      pendingTurns.close(paneId);
+      // A suspended replay owns its own settlement; never close a newer turn.
     }
   };
 
@@ -1816,6 +1942,11 @@ export async function startSlackDaemon(
 
   return {
     stop: async () => {
+      stopping = true;
+      for (const paneId of setupOnlyTurns) {
+        const binding = bindingForPane(paneId);
+        if (binding) abandonTurn(binding);
+      }
       clearInterval(heartbeat);
       clearInterval(idleSweep);
       paneWatcher.stop();
