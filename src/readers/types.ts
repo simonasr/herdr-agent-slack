@@ -8,13 +8,9 @@ export interface CompletedReaderTurn {
 
 export interface AgentOutputReader {
   readonly kind: string;
-  /** False while a deferred source is unresolved, not merely empty. Omitted means ready. */
-  readonly ready?: boolean;
   /** The session actually selected by a deferred structured reader, if resolved. */
   readonly session?: AgentSessionRef;
   read(maxLines: number): string;
-  /** One parsed snapshot and all output since the earliest pending submitted prompt; null if absent. */
-  readSincePrompts?(prompts: readonly string[], notBefore?: number): { snapshot: string; text: string } | null;
   /**
    * The question the agent is answering, or answered last. Only a source
    * that logs the user's side can offer it; a screen has its own extraction.

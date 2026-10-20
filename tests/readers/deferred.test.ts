@@ -29,38 +29,6 @@ describe("DeferredReader — a log that is not there yet", () => {
   });
 });
 
-describe("DeferredReader — readiness", () => {
-  it("distinguishes an unresolved source from a resolved empty transcript", () => {
-    let available = false;
-    let picks = 0;
-    const reader = new DeferredReader("x-jsonl", false, () => {
-      picks++;
-      return available ? { kind: "x-jsonl", read: () => "" } : null;
-    }, logger, "w1:p1");
-    expect(reader.ready).toBe(false);
-    expect(picks).toBe(0); // Inspecting readiness does not resolve or start the grace clock.
-    expect(reader.read(10)).toBe("");
-    expect(reader.ready).toBe(false);
-    available = true;
-    expect(reader.read(10)).toBe("");
-    expect(reader.ready).toBe(true);
-  });
-
-  it("becomes ready when the bounded fallback takes over, even if it is empty", () => {
-    let t = 0;
-    const reader = new DeferredReader("x-jsonl", false, () => null, logger, "w1:p1",
-      { kind: "scrape", read: () => "" }, 90_000, () => t);
-    expect(reader.read(10)).toBe("");
-    t = 90_000;
-    expect(reader.read(10)).toBe("");
-    expect(reader.ready).toBe(false);
-    t++;
-    expect(reader.read(10)).toBe("");
-    expect(reader.ready).toBe(true);
-    expect(reader.kind).toBe("scrape");
-  });
-});
-
 describe("DeferredReader — when the log never comes", () => {
   it("reads the screen after the grace period, and says so as a scrape", () => {
     let t = 1_000_000;
@@ -139,22 +107,44 @@ describe("Codex pane that has no session yet", () => {
     expect(reader.session).toEqual({ kind: "id", id });
   });
 
-  it("waits for a known Codex id's missing rollout and stays pinned to that id", () => {
+  it("keeps the immediate screen fallback for a known Codex id with no rollout", () => {
     const session = { kind: "id" as const, id: "known-before-rollout" };
     const reader = createAgentOutputReader({
       paneId: "w1:p1", agentName: "codex", session,
-      resolveSession: () => ({ kind: "id", id: "different-session" }),
-      readPane: () => "unrelated screen history", logger,
+      resolveSession: () => { throw new Error("a known id must not trigger discovery"); },
+      readPane: () => "screen answer", logger,
     });
-    expect(reader.kind).toBe("codex-jsonl");
-    expect(reader.read(100)).toBe("");
+    expect(reader.kind).toBe("scrape");
+    expect(reader.read(100)).toBe("screen answer");
     const sessions = join(home, ".codex", "sessions");
     mkdirSync(sessions, { recursive: true });
     writeFileSync(join(sessions, `rollout-${session.id}.jsonl`), JSON.stringify({
-      type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "the known session answer" }] },
+      type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "late rollout answer" }] },
     }) + "\n");
-    expect(reader.read(100)).toBe("the known session answer");
+    expect(reader.kind).toBe("scrape");
+    expect(reader.read(100)).toBe("screen answer");
+  });
+
+  it("exposes the resolved Claude session without following later metadata", () => {
+    let session: AgentSessionRef = undefined;
+    const reader = createAgentOutputReader({
+      paneId: "w1:p1", agentName: "claude", session,
+      resolveSession: () => session, readPane: () => "welcome banner", logger,
+    });
+    expect(reader.session).toBeUndefined();
+    expect(reader.read(100)).toBe("");
+    const project = join(home, ".claude", "projects", "test-project");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "resolved-claude.jsonl"), JSON.stringify({
+      type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "from transcript" }] },
+    }) + "\n");
+    session = { kind: "id", id: "resolved-claude" };
+    expect(reader.session).toBeUndefined();
+    expect(reader.read(100)).toBe("from transcript");
     expect(reader.session).toEqual(session);
+    session = { kind: "id", id: "replacement" };
+    expect(reader.read(100)).toBe("from transcript");
+    expect(reader.session).toEqual({ kind: "id", id: "resolved-claude" });
   });
 
   it("still scrapes when nobody can ask herdr again", () => {

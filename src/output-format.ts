@@ -231,15 +231,12 @@ function normalizeSpace(text: string): string {
  * that 251-character prompt and left every wrapped prompt shorter than 80
  * unanchored.
  */
-function consumePrompt(lines: string[], start: number, target: string, skipBlankLines = false): number | null {
-  const first = lines[start].trim();
-  // An explicit TUI marker ends the chrome; following $ or > is prompt text.
-  let accumulated = normalizeSpace(/^[❯›]\s/.test(first) ? first.slice(1) : dechromePrompt(first));
+function consumePrompt(lines: string[], start: number, target: string): number | null {
+  let accumulated = normalizeSpace(dechromePrompt(lines[start]));
   if (!accumulated || !target.startsWith(accumulated)) return null;
   let end = start;
   while (accumulated !== target && end + 1 < lines.length) {
     const next = normalizeSpace(lines[end + 1]);
-    if (!next && skipBlankLines) { end += 1; continue; }
     if (!next) break;
     const combined = normalizeSpace(`${accumulated} ${next}`);
     if (!target.startsWith(combined)) break;
@@ -249,8 +246,9 @@ function consumePrompt(lines: string[], start: number, target: string, skipBlank
   return accumulated === target ? end : null;
 }
 
-/** Locate the end of the last submitted-prompt echo, retaining ordinary single-prompt compatibility. */
-function submittedPromptEnd(lines: string[], userInput: string): number {
+/** Return only content after the last occurrence of the submitted prompt. */
+export function extractResponseSince(content: string, userInput: string): string {
+  const lines = content.split("\n");
   const userLines = userInput.split("\n").filter((line) => line.trim());
   const anchor = userLines.at(-1) ?? userInput;
   const target = normalizeSpace(anchor);
@@ -269,13 +267,6 @@ function submittedPromptEnd(lines: string[], userInput: string): number {
     if (lines[i].includes(anchor)) { index = i; break; }
     if (anchor.length > 80 && lines[i].includes(anchor.slice(0, 80))) { index = i; break; }
   }
-  return index;
-}
-
-/** Return only content after the last occurrence of the submitted prompt. */
-export function extractResponseSince(content: string, userInput: string): string {
-  const lines = content.split("\n");
-  const index = submittedPromptEnd(lines, userInput);
   if (index < 0) return "";
   // Stop at the next prompt: everything past it belongs to a later turn (or
   // is a prompt the user has typed but not sent). Without this bound the
@@ -567,49 +558,6 @@ export function extractScreenResponse(content: string, userInput: string): strin
   // correlation anchor for this turn.
   const dechromed = content.replace(/^[ \t┃│▏▕]+/gm, "");
   return cleanPaneOutput(extractResponseSince(dechromed, userInput));
-}
-
-/** Bound one deferred screen turn by ordered submitted echoes, not quoted prose or attachments. */
-export function extractSubmittedScreenResponses(content: string, submitted: readonly string[]): string {
-  const lines = content.replace(/^[ \t┃│▏▕]+/gm, "").split("\n");
-  // Screens have no timestamp identity. Keep each latest echo in its latest send
-  // position, using matching's normalization but retaining raw fallback text.
-  const latest = new Map<string, string>();
-  for (const prompt of [...submitted].reverse()) {
-    const key = normalizeSpace(prompt);
-    if (!latest.has(key)) latest.set(key, prompt);
-  }
-  const prompts = [...latest.values()].reverse();
-  const anchors: Array<{ start: number; end: number }> = [];
-  for (let p = 0; p < prompts.length; p++) {
-    const floor = anchors.at(-1)?.end ?? -1;
-    const target = normalizeSpace(prompts[p]);
-    let found = false;
-    for (let i = lines.length - 1; i > floor; i--) {
-      if (!/^[❯›]\s/.test(lines[i].trim())) continue;
-      const end = consumePrompt(lines, i, target, true);
-      if (end === null) continue;
-      anchors.push({ start: i, end });
-      found = true;
-      break;
-    }
-    // Only the initial anchor retains the ordinary truncated/unmarked-prompt fallback.
-    if (p === 0 && !found) {
-      const end = submittedPromptEnd(lines, prompts[p]);
-      if (end >= 0) anchors.push({ start: end, end });
-    }
-  }
-  return anchors.map((anchor, i) => {
-    let end = anchors[i + 1]?.start ?? lines.length;
-    for (let j = anchor.end + 1; j < end; j++) {
-      const line = lines[j].trim();
-      // Codex uses › for prompts and file chrome. Only prompts end this answer;
-      // keep this distinction local rather than changing shared screen parsing.
-      const codexPrompt = /^›(\s|$)/.test(line) && !/^›\s+\[file\](\s|$)/.test(line);
-      if (PROMPT_LINE.test(line) || codexPrompt || TURN_END_LINE.test(line)) { end = j; break; }
-    }
-    return cleanPaneOutput(stripStatusBar(lines.slice(anchor.end + 1, end).join("\n")));
-  }).filter(answer => answer.trim()).join("\n\n");
 }
 
 /**
