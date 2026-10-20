@@ -976,8 +976,11 @@ export class AgentCommunicator {
     return this.getAgentOutput(4000);
   }
 
-  /** Final readback must not bypass a deferred-to-screen submitted-prompt fence. */
+  /** Final readback must not bypass a deferred submitted-prompt fence. */
   getFinalFallbackOutput(): string {
+    if (this.readerKind !== "scrape") {
+      return this.deferredInputGroup ? this.getTurnResponse() : this.getLastAnswer();
+    }
     const snapshot = this.getLatestOutput();
     return this.deferredInputGroup && this.readerKind === "scrape" ? this.deferredScreenAnswer(snapshot) : snapshot;
   }

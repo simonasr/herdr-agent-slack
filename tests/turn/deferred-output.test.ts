@@ -53,8 +53,8 @@ function makeEnv(agent: "codex" | "claude", opts: {
       communicator.sendInput(prompt);
       controller!.markUserInput();
     },
-    appendTurn(prompt: string, answer: string, timestamp = Date.now()) {
-      appendFileSync(path, [{ role: "user", text: prompt }, { role: "assistant", text: answer }]
+    appendTurn(prompt: string | null, answer: string, timestamp = Date.now()) {
+      appendFileSync(path, [...(prompt === null ? [] : [{ role: "user", text: prompt }]), { role: "assistant", text: answer }]
         .map(({ role, text }) => JSON.stringify({ timestamp: new Date(timestamp).toISOString(),
           ...(agent === "codex"
             ? { type: "response_item", payload: { type: "message", role, content: [{ type: "text", text }] } }
@@ -110,6 +110,48 @@ describe("deferred submitted output — finalization", () => {
     await done;
     expect(env.communicator.getTurnResponse()).toBe("ANSWER A\n\nANSWER B");
     expect(env.finals()).toEqual([{ type: "final", text: "ANSWER A\n\nANSWER B", reason: "idle", source: "delta" }]);
+  });
+
+  it.each([
+    ["codex", "idle", "full-turn"], ["claude", "idle", "full-turn"],
+    ["codex", "ceiling", "full-turn"], ["claude", "ceiling", "full-turn"],
+    ["codex", "aborted", "full-turn"], ["claude", "aborted", "full-turn"],
+    ["codex", "idle", "last-delta"], ["claude", "idle", "last-delta"],
+    ["codex", "ceiling", "last-delta"], ["claude", "ceiling", "last-delta"],
+    ["codex", "aborted", "last-delta"], ["claude", "aborted", "last-delta"],
+  ] as const)("does not replay %s history for an empty URL-leading prompt on %s in %s mode", async (agent, reason, finalPayload) => {
+    const env = makeEnv(agent, { maxTurnMs: reason === "ceiling" ? 30_000 : 1_800_000, finalPayload });
+    env.appendTurn("old question", "OLD HISTORICAL ANSWER", Date.now() - 10_000);
+    env.submit("<https://example.com/review> review this");
+    env.appendTurn("<https://example.com/review> review this", "");
+    env.resolve();
+    const done = env.controller.start();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(env.communicator.outputReady).toBe(true);
+    expect(env.communicator.getTurnResponse()).toBe("");
+    if (reason === "aborted") env.controller.abort();
+    await vi.advanceTimersByTimeAsync(15_000);
+    await done;
+    expect(env.finals()).toEqual([{ type: "final", text: "", reason, source: "snapshot" }]);
+  });
+
+  it.each([
+    ["codex", "full-turn"], ["claude", "full-turn"],
+    ["codex", "last-delta"], ["claude", "last-delta"],
+  ] as const)("retains a late %s answer after an empty match in %s mode", async (agent, finalPayload) => {
+    const env = makeEnv(agent, { finalPayload });
+    env.appendTurn("old question", "OLD HISTORICAL ANSWER", Date.now() - 10_000);
+    env.submit("<https://example.com/review> review this");
+    env.appendTurn("<https://example.com/review> review this", "");
+    env.resolve();
+    const done = env.controller.start();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(env.communicator.outputReady).toBe(true);
+    env.appendTurn(null, "CURRENT ANSWER");
+    env.controller.abort();
+    await vi.advanceTimersByTimeAsync(15_000);
+    await done;
+    expect(env.finals()).toEqual([{ type: "final", text: "CURRENT ANSWER", reason: "aborted", source: finalPayload === "full-turn" ? "delta" : "snapshot" }]);
   });
 
   it.each(["full-turn", "last-delta"] as const)("bounds an unmatched command wait in %s mode without releasing old history", async finalPayload => {

@@ -563,7 +563,7 @@ export class ObserveLoopController {
       // when this turn produced no output. Screens retain their readback.
       const latest = this.communicator.readerKind === "scrape"
         ? this.communicator.getFinalFallbackOutput()
-        : this.communicator.outputReady && this.communicator.canIsolateLastAnswer() ? this.communicator.getLastAnswer() : "";
+        : this.communicator.outputReady && this.communicator.canIsolateLastAnswer() ? this.communicator.getFinalFallbackOutput() : "";
       if (latest.trim().length === 0) {
         text = "";
       } else if (this.finalPayload === "full-turn") {
