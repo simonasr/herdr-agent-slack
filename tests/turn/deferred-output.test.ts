@@ -45,7 +45,7 @@ function makeEnv(agent: "codex" | "claude", opts: {
     finalPayload: opts.finalPayload ?? "full-turn", isAgentBusy: opts.isAgentBusy,
   });
   return {
-    communicator, controller, fallback,
+    communicator, controller, fallback, events,
     resolve: () => { available = true; },
     finals: () => events.filter(event => event.type === "final"),
     submit(prompt: string) {
@@ -152,6 +152,46 @@ describe("deferred submitted output — finalization", () => {
     await vi.advanceTimersByTimeAsync(15_000);
     await done;
     expect(env.finals()).toEqual([{ type: "final", text: "CURRENT ANSWER", reason: "aborted", source: finalPayload === "full-turn" ? "delta" : "snapshot" }]);
+  });
+
+  it.each([
+    ["codex", "full-turn", false], ["claude", "full-turn", false],
+    ["codex", "last-delta", false], ["claude", "last-delta", false],
+    ["codex", "full-turn", true], ["claude", "full-turn", true],
+    ["codex", "last-delta", true], ["claude", "last-delta", true],
+  ] as const)("recovers unmatched %s output on abort in %s mode (source resolved early: %s)", async (agent, finalPayload, earlySource) => {
+    const env = makeEnv(agent, { finalPayload });
+    env.appendTurn("continue", "OLD HISTORICAL ANSWER", Date.now() - 10_000);
+    env.submit("continue");
+    if (earlySource) env.resolve();
+    const done = env.controller.start();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(env.communicator.outputReady).toBe(false);
+    env.appendTurn("continue", "CURRENT ANSWER");
+    env.resolve();
+    env.controller.abort();
+    await vi.advanceTimersByTimeAsync(15_000);
+    await done;
+    expect(env.finals()).toEqual([{ type: "final", text: "CURRENT ANSWER", reason: "aborted", source: finalPayload === "full-turn" ? "delta" : "snapshot" }]);
+    expect(env.events.filter(event => event.type === "delta")).toEqual([]);
+    // Final readback is pure: it neither opens the polling fence nor consumes output.
+    expect(env.communicator.outputReady).toBe(false);
+    expect(env.communicator.getNewOutput()).toBe("CURRENT ANSWER");
+    expect(env.communicator.getNewOutput()).toBe("");
+  });
+
+  it.each(["codex", "claude"] as const)("keeps old repeated %s history fenced on streaming abort", async agent => {
+    const env = makeEnv(agent, { finalPayload: "last-delta" });
+    env.appendTurn("continue", "OLD HISTORICAL ANSWER", Date.now() - 10_000);
+    env.submit("continue");
+    const done = env.controller.start();
+    await vi.advanceTimersByTimeAsync(15_000);
+    env.resolve();
+    env.controller.abort();
+    await vi.advanceTimersByTimeAsync(15_000);
+    await done;
+    expect(env.finals()).toEqual([{ type: "final", text: "", reason: "aborted", source: "snapshot" }]);
+    expect(env.communicator.outputReady).toBe(false);
   });
 
   it.each(["full-turn", "last-delta"] as const)("bounds an unmatched command wait in %s mode without releasing old history", async finalPayload => {

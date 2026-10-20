@@ -157,7 +157,7 @@ describe("ObserveLoopController — unresolved output retains explicit terminati
   it.each(["deadline", "ceiling", "aborted"] as const)("still terminates for %s while the reader is unresolved", async (reason) => {
     const env = makeEnv({
       snapshots: [],
-      reader: { kind: "deferred", ready: false, read: () => "" },
+      reader: { kind: "deferred", ready: false, read: () => "", lastAnswer: () => "OLD HISTORICAL ANSWER" },
       maxTurnMs: reason === "ceiling" ? 100 : undefined,
     });
     if (reason === "deadline") env.controller.updateDeadline(100);

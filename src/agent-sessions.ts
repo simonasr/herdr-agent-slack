@@ -979,7 +979,7 @@ export class AgentCommunicator {
   /** Final readback must not bypass a deferred submitted-prompt fence. */
   getFinalFallbackOutput(): string {
     if (this.readerKind !== "scrape") {
-      return this.deferredInputGroup ? this.getTurnResponse() : this.getLastAnswer();
+      return this.deferredInputGroup ? this.getTurnResponse() : this.outputReady ? this.getLastAnswer() : "";
     }
     const snapshot = this.getLatestOutput();
     return this.deferredInputGroup && this.readerKind === "scrape" ? this.deferredScreenAnswer(snapshot) : snapshot;
@@ -1060,8 +1060,15 @@ export class AgentCommunicator {
       if (this.deferredInputGroup) {
         // Finalization (including abort/ceiling) must respect the same fence as
         // polling: a matching old lastPrompt is not proof of a current answer.
+        if (!this.deferredInputGroup.ready) {
+          // Abort can arrive after the reply was logged but before polling
+          // matched it. Read one coherent, dispatch-floored match without
+          // consuming diff output or opening the polling fence.
+          const turn = this.reader.readSincePrompts?.(this.deferredInputGroup.prompts, this.deferredInputGroup.startedAt);
+          return turn && turn.snapshot.endsWith(turn.text) ? turn.text : "";
+        }
         const prefix = this.deferredInputGroup.snapshotPrefix;
-        if (!this.deferredInputGroup.ready || prefix === undefined) return "";
+        if (prefix === undefined) return "";
         const snapshot = this.getAgentOutput(4000);
         return snapshot.startsWith(prefix) ? snapshot.slice(prefix.length).trim() : "";
       }
