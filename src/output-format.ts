@@ -594,7 +594,11 @@ export function extractSubmittedScreenResponses(content: string, submitted: read
   return anchors.map((anchor, i) => {
     let end = anchors[i + 1]?.start ?? lines.length;
     for (let j = anchor.end + 1; j < end; j++) {
-      if (PROMPT_LINE.test(lines[j].trim()) || TURN_END_LINE.test(lines[j].trim())) { end = j; break; }
+      const line = lines[j].trim();
+      // Codex uses › for prompts and file chrome. Only prompts end this answer;
+      // keep this distinction local rather than changing shared screen parsing.
+      const codexPrompt = /^›(\s|$)/.test(line) && !/^›\s+\[file\](\s|$)/.test(line);
+      if (PROMPT_LINE.test(line) || codexPrompt || TURN_END_LINE.test(line)) { end = j; break; }
     }
     return cleanPaneOutput(stripStatusBar(lines.slice(anchor.end + 1, end).join("\n")));
   }).filter(answer => answer.trim()).join("\n\n");
