@@ -759,9 +759,13 @@ export class AgentCommunicator {
   get readerKind(): string {
     return this.reader.kind;
   }
-  /** Whether a source and any deferred submitted-prompt boundary are ready. */
+  /** Whether a source has resolved, independent of a submitted-prompt match. */
+  get sourceReady(): boolean {
+    return this.reader.ready !== false;
+  }
+  /** Whether output can be read without crossing an unresolved prompt fence. */
   get outputReady(): boolean {
-    return this.reader.ready !== false && this.deferredInputGroup?.ready !== false;
+    return this.sourceReady && this.deferredInputGroup?.ready !== false;
   }
   /** Whether the reader's text is the model's own, needing no pane filters. */
   get verbatim(): boolean {
@@ -1047,8 +1051,12 @@ export class AgentCommunicator {
     if (this.readerKind !== "scrape") {
       // A delayed source can contain several inputs from this active turn.
       // Re-reading only its last answer would lose the earlier input's output.
-      if (this.deferredInputGroup?.ready) {
-        return this.reader.readSincePrompts?.(this.deferredInputGroup.prompts, this.deferredInputGroup.startedAt)?.text ?? "";
+      if (this.deferredInputGroup) {
+        // Finalization (including abort/ceiling) must respect the same fence as
+        // polling: a matching old lastPrompt is not proof of a current answer.
+        return this.deferredInputGroup.ready
+          ? this.reader.readSincePrompts?.(this.deferredInputGroup.prompts, this.deferredInputGroup.startedAt)?.text ?? ""
+          : "";
       }
       const asked = this.reader.lastPrompt?.().trim() ?? "";
       if (!asked || !this.reader.lastAnswer) return "";

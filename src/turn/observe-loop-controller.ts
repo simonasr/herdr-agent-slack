@@ -180,6 +180,9 @@ export interface ObserveLoopControllerDeps {
 /** Suffix prepended when the snapshot is truncated for the final payload. */
 const ELLIPSIS_PREFIX = "…\n";
 
+/** A resolved log may never echo a submitted command literally (e.g. /compact). */
+const UNMATCHED_PROMPT_GRACE_MS = 90_000;
+
 /**
  * One ObserveLoopController owns ONE polling loop. start() is idempotent;
  * a second call returns the same promise. updateDeadline / markUserInput
@@ -327,6 +330,7 @@ export class ObserveLoopController {
       // is stable so the stability window can elapse.
       let lastChangeAt = startedAt;
       let inputRevision = this.inputRevision;
+      let unmatchedPromptSince: number | null = null;
       // lastDeltaText remembers the most recent non-empty chunk we
       // emitted as a delta. The final payload falls back to this when
       // the pane goes idle — it's the most recent content the user has
@@ -355,9 +359,15 @@ export class ObserveLoopController {
         if (inputRevision !== this.inputRevision) {
           inputRevision = this.inputRevision;
           lastChangeAt = now;
+          unmatchedPromptSince = null;
         }
         const elapsedMs = now - startedAt;
         const fresh = this.communicator.getNewOutput();
+        if (this.communicator.sourceReady && !this.communicator.outputReady) {
+          unmatchedPromptSince ??= now;
+        } else {
+          unmatchedPromptSince = null;
+        }
         const unseen = resumed && fresh ? `${resumed}\n${fresh}` : resumed || fresh;
         resumed = "";
 
@@ -419,6 +429,7 @@ export class ObserveLoopController {
         if (inputRevision !== this.inputRevision) {
           inputRevision = this.inputRevision;
           lastChangeAt = checkedAt;
+          unmatchedPromptSince = null;
           continue;
         }
         const state: StopState = {
@@ -438,9 +449,16 @@ export class ObserveLoopController {
           // retain their existing stop rules.
           if (this.waitUntilIdle && !state.completionConfirmed) {
             resumed = this.communicator.getNewOutput();
-            // An unresolved source is not stable empty output. Keep polling
-            // until it resolves or its bounded screen fallback takes over.
-            if (resumed || !this.communicator.outputReady) continue;
+            if (resumed) continue;
+            if (!this.communicator.outputReady) {
+              // Missing files still get their reader's bounded screen fallback.
+              if (!this.communicator.sourceReady) continue;
+              // A resolved log may omit or transform the prompt. Bound that
+              // wait too, but leave outputReady false: settling empty must not
+              // authorize a historical lastAnswer or cumulative snapshot.
+              unmatchedPromptSince ??= checkedAt;
+              if (checkedAt - unmatchedPromptSince < UNMATCHED_PROMPT_GRACE_MS) continue;
+            }
           }
           // Distinguish "idle" vs "deadline" in the final reason. The
           // single rule: if waitUntilIdle is true, the idle gate was

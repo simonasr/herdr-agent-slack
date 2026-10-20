@@ -117,6 +117,45 @@ afterEach(async () => {
 });
 
 describe("Slack session routing — real observe loops", () => {
+  it.each(["codex", "claude"] as const)("does not post a repeated historical %s answer at the full-turn ceiling", async agent => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "final"\nmax_total_wait_s = 1\n');
+    const sessionId = "old-only-repeated-prompt";
+    mocks.live = { ...liveSession(oldPath, "idle"), agent, agent_session: { kind: "id", id: sessionId } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const submittedAt = Date.now();
+    await mocks.client!.onUserMessage(thread, "U1", "continue", "2.0");
+    const sessions = agent === "codex" ? join(dir, ".codex", "sessions") : join(dir, ".claude", "projects", "project");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, `${sessionId}.jsonl`), agent === "codex"
+      ? codexTurnAt("continue", "OLD HISTORICAL ANSWER", submittedAt - 10_000)
+      : [{ role: "user", text: "continue" }, { role: "assistant", text: "OLD HISTORICAL ANSWER" }]
+        .map(({ role, text }) => JSON.stringify({ type: role, timestamp: new Date(submittedAt - 10_000).toISOString(),
+          message: { role, content: [{ type: "text", text }] },
+        })).join("\n") + "\n");
+    await vi.advanceTimersByTimeAsync(1_300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "✅ Done (no output).");
+  });
+
+  it.each(["stream", "final"] as const)("settles a completed deferred Claude command in %s mode without replaying history", async mode => {
+    appendFileSync(join(dir, "config.toml"), `output_mode = "${mode}"\n`);
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "claude", agent_session: { kind: "id", id: "compact-session" } };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "/compact", "2.0");
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", "/compact");
+    const project = join(dir, ".claude", "projects", "project");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "compact-session.jsonl"), [
+      { type: "user", message: { role: "user", content: "old question" } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "OLD HISTORICAL ANSWER" }] } },
+      { type: "user", message: { role: "user", content: "<command-name>/compact</command-name>" } },
+      { type: "user", message: { role: "user", content: "<local-command-stdout>Compacted</local-command-stdout>" } },
+    ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    await vi.advanceTimersByTimeAsync(89_900);
+    expect(mocks.post).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "✅ Done (no output).");
+  });
+
   it.each([
     ["❯", "repeat"], ["›", "repeat"],
     ["❯", "absent"], ["›", "absent"],
