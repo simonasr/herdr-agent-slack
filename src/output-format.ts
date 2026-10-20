@@ -572,8 +572,14 @@ export function extractScreenResponse(content: string, userInput: string): strin
 /** Bound one deferred screen turn by ordered submitted echoes, not quoted prose or attachments. */
 export function extractSubmittedScreenResponses(content: string, submitted: readonly string[]): string {
   const lines = content.replace(/^[ \t┃│▏▕]+/gm, "").split("\n");
-  // Screens have no timestamp identity. Keep each latest echo in its latest send position.
-  const prompts = [...new Set([...submitted].reverse())].reverse();
+  // Screens have no timestamp identity. Keep each latest echo in its latest send
+  // position, using matching's normalization but retaining raw fallback text.
+  const latest = new Map<string, string>();
+  for (const prompt of [...submitted].reverse()) {
+    const key = normalizeSpace(prompt);
+    if (!latest.has(key)) latest.set(key, prompt);
+  }
+  const prompts = [...latest.values()].reverse();
   const anchors: Array<{ start: number; end: number }> = [];
   for (let p = 0; p < prompts.length; p++) {
     const floor = anchors.at(-1)?.end ?? -1;

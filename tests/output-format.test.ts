@@ -851,6 +851,25 @@ describe("extractSubmittedScreenResponses — deferred turn boundaries", () => {
       .toBe(`FIRST ANSWER\n${prompt}\nStill the first answer.`);
   });
 
+  it.each([
+    ["❯", "\n"], ["›", "\n"], ["❯", "\t "], ["›", "\t "],
+  ])("deduplicates whitespace-equivalent %s echoes (%j)", (marker, gap) => {
+    const screen = [
+      `${marker} first question`, "EARLIER ANSWER",
+      `${marker} second question`, "SECOND ANSWER",
+      `${marker} first question`, "LATEST ANSWER",
+      `${marker} unrelated question`, "UNRELATED ANSWER",
+    ].join("\n");
+    expect(extractSubmittedScreenResponses(screen, [`first${gap}question `, "second question", "first question"]))
+      .toBe("SECOND ANSWER\n\nLATEST ANSWER");
+  });
+
+  it("keeps the latest raw multiline prompt for an offscreen-first-line fallback", () => {
+    const screen = ["specific-tail", "LATEST ANSWER", "❯ unrelated", "UNRELATED ANSWER"].join("\n");
+    expect(extractSubmittedScreenResponses(screen, ["first specific-tail", "first\nspecific-tail"]))
+      .toBe("LATEST ANSWER");
+  });
+
   it.each(["❯", "›"])("keeps prose after attachments under a %s prompt", marker => {
     const screen = [
       `${marker} bridge question`, "Here are the documents.",
