@@ -194,6 +194,21 @@ describe("deferred submitted output — finalization", () => {
     expect(env.communicator.outputReady).toBe(false);
   });
 
+  it.each(["full-turn", "last-delta"] as const)("keeps a screen answer when abort readback resolves the fallback in %s mode", async finalPayload => {
+    const env = makeEnv("codex", { finalPayload, isAgentBusy: () => true });
+    env.fallback.read.mockReturnValue("› current question\nCURRENT SCREEN ANSWER\n› unrelated question\nUNRELATED ANSWER");
+    env.submit("current question");
+    const done = env.controller.start();
+    await vi.advanceTimersByTimeAsync(91_000);
+    expect(env.communicator.sourceReady).toBe(false);
+    env.controller.abort();
+    await vi.advanceTimersByTimeAsync(14_000);
+    await done;
+    expect(env.finals()).toEqual([{ type: "final", text: "CURRENT SCREEN ANSWER", reason: "aborted", source: "snapshot" }]);
+    expect(env.events.filter(event => event.type === "delta")).toEqual([]);
+    expect(env.communicator.readerKind).toBe("scrape");
+  });
+
   it.each(["full-turn", "last-delta"] as const)("bounds an unmatched command wait in %s mode without releasing old history", async finalPayload => {
     const env = makeEnv("claude", { finalPayload });
     env.appendTurn("earlier question", "OLD HISTORICAL ANSWER", Date.now() - 10_000);

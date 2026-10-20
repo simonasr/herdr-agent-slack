@@ -979,7 +979,10 @@ export class AgentCommunicator {
   /** Final readback must not bypass a deferred submitted-prompt fence. */
   getFinalFallbackOutput(): string {
     if (this.readerKind !== "scrape") {
-      return this.deferredInputGroup ? this.getTurnResponse() : this.outputReady ? this.getLastAnswer() : "";
+      const answer = this.deferredInputGroup ? this.getTurnResponse() : this.outputReady ? this.getLastAnswer() : "";
+      // The fenced read can activate the deferred screen fallback. Honor the
+      // newly selected source here too, including in last-delta mode.
+      if (this.readerKind !== "scrape") return answer;
     }
     const snapshot = this.getLatestOutput();
     return this.deferredInputGroup && this.readerKind === "scrape" ? this.deferredScreenAnswer(snapshot) : snapshot;
