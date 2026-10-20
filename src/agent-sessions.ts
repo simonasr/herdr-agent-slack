@@ -15,7 +15,7 @@
  * scrape reader. Once selected, the reader is permanent — runtime read
  * failures return empty output (not a fallback to readPane).
  */
-import { extractLatestScreenPrompt, extractLatestScreenResponse, extractLatestScreenTurn, extractScreenResponse, extractSubmittedScreenResponses, lastTurnMark } from "./output-format.js";
+import { extractLatestScreenPrompt, extractLatestScreenResponse, extractLatestScreenTurn, extractScreenResponse, lastTurnMark } from "./output-format.js";
 import { readFileSync, existsSync, statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -268,8 +268,6 @@ export function findClaudeSessionByPrompt(cwd: string | undefined, prompts: Iter
 export interface AgentOutputReader {
   /** Short identifier for logs ("scrape", "jsonl", "opencode-db"). */
   readonly kind: string;
-  /** False while a deferred source is unresolved, not merely empty. Omitted means ready. */
-  readonly ready?: boolean;
   /** The session actually selected by a deferred structured reader, if resolved. */
   readonly session?: AgentSessionRef;
   /**
@@ -278,8 +276,6 @@ export interface AgentOutputReader {
    * be swallowed and surfaced via the communicator's logger.
    */
   read(_maxLines: number): string;
-  /** One parsed snapshot and all output since the earliest pending submitted prompt; null if absent. */
-  readSincePrompts?(prompts: readonly string[], notBefore?: number): { snapshot: string; text: string } | null;
   /**
    * The question the agent is answering, or answered last. Only a source
    * that logs the user's side can offer it; a screen has its own extraction.
@@ -759,14 +755,6 @@ export class AgentCommunicator {
   get readerKind(): string {
     return this.reader.kind;
   }
-  /** Whether a source has resolved, independent of a submitted-prompt match. */
-  get sourceReady(): boolean {
-    return this.reader.ready !== false;
-  }
-  /** Whether output can be read without crossing an unresolved prompt fence. */
-  get outputReady(): boolean {
-    return this.sourceReady && this.deferredInputGroup?.ready !== false;
-  }
   /** Whether the reader's text is the model's own, needing no pane filters. */
   get verbatim(): boolean {
     return this.reader.verbatim === true;
@@ -805,8 +793,6 @@ export class AgentCommunicator {
   private initialized = false;
   /** Most recent text handed to the pane, used to anchor a turn's response. */
   private lastInput = "";
-  /** This turn's input group: structured anchors freeze; screens retain later inputs until the next fresh consumer. */
-  private deferredInputGroup: { prompts: string[]; ready: boolean; startedAt: number; snapshotPrefix?: string } | null = null;
   /**
    * Whether the turn under way was started outside the bridge — somebody typed
    * in the pane itself. There is no submitted text to anchor on, so the answer
@@ -885,18 +871,6 @@ export class AgentCommunicator {
     }
   }
 
-  /** Capture an inactive turn's literal baseline before dispatch, never after it. */
-  seedOutputBaseline(): void {
-    this.sentTail = tailOf(this.getAgentOutput(4000), SENT_TAIL_MAX);
-    this.initialized = true;
-    this.deferredInputGroup = this.reader.ready === false ? { prompts: [], ready: false, startedAt: Date.now() } : null;
-  }
-
-  /** A new follow window must not inherit an ended submitted turn's unresolved boundary. */
-  clearPendingInputBoundary(): void {
-    this.deferredInputGroup = null;
-  }
-
   /**
    * Stateful diff reader for polling consumers (follow loop, turn
    * controller, etc.).
@@ -912,36 +886,11 @@ export class AgentCommunicator {
    *     first error after a clean seed will look like "snapshot went
    *     empty", which `deriveUnseen` handles by returning "".
    *
-   * Submitted turns seedOutputBaseline before sending, so even their first
-   * poll can return a fast reply. Deferred sources first exclude prior prompts.
    * Multiple calls after the baseline seed each return only what has
    * appeared since the previous successful call, so a polling consumer
    * that calls this every tick will see each new chunk exactly once.
    */
   getNewOutput(): string {
-    if (this.deferredInputGroup && !this.deferredInputGroup.ready) {
-      const turn = this.reader.readSincePrompts?.(this.deferredInputGroup.prompts, this.deferredInputGroup.startedAt);
-      if (turn && turn.snapshot.endsWith(turn.text)) {
-        // Consume the same snapshot that supplied the entire pending input group.
-        this.sentTail = tailOf(turn.snapshot, SENT_TAIL_MAX);
-        this.initialized = true;
-        // Freeze this occurrence, not its prompt text: a later identical input
-        // must not move full-turn readback past an earlier current answer.
-        this.deferredInputGroup.snapshotPrefix = turn.snapshot.slice(0, turn.snapshot.length - turn.text.length);
-        this.deferredInputGroup.ready = true;
-        return turn.text;
-      }
-      if (this.readerKind !== "scrape") return "";
-    }
-    // A new source needs its own literal baseline. Retain an already-complete
-    // answer, but never treat the first screen's historical scrollback as new.
-    if (this.deferredInputGroup && this.readerKind === "scrape" && (!this.deferredInputGroup.ready || !this.sentTail)) {
-      const screen = this.getAgentOutput(4000);
-      this.sentTail = tailOf(screen, SENT_TAIL_MAX);
-      this.initialized = true;
-      this.deferredInputGroup.ready = true;
-      return this.deferredScreenAnswer(screen);
-    }
     const snapshot = this.getAgentOutput(4000);
     if (!this.initialized) {
       this.sentTail = tailOf(snapshot, SENT_TAIL_MAX);
@@ -974,23 +923,6 @@ export class AgentCommunicator {
    */
   getLatestOutput(): string {
     return this.getAgentOutput(4000);
-  }
-
-  /** Final readback must not bypass a deferred submitted-prompt fence. */
-  getFinalFallbackOutput(): string {
-    if (this.readerKind !== "scrape") {
-      const answer = this.deferredInputGroup ? this.getTurnResponse() : this.outputReady ? this.getLastAnswer() : "";
-      // The fenced read can activate the deferred screen fallback. Honor the
-      // newly selected source here too, including in last-delta mode.
-      if (this.readerKind !== "scrape") return answer;
-    }
-    const snapshot = this.getLatestOutput();
-    return this.deferredInputGroup && this.readerKind === "scrape" ? this.deferredScreenAnswer(snapshot) : snapshot;
-  }
-
-  private deferredScreenAnswer(screen: string): string {
-    // Untimed screen echoes cannot disambiguate repeated/coalesced identical prompts.
-    return extractSubmittedScreenResponses(screen, this.deferredInputGroup?.prompts ?? []);
   }
 
   /** Pure pre-dispatch capture: does not consume or seed ordinary diff output. */
@@ -1028,9 +960,6 @@ export class AgentCommunicator {
       );
     }
     this.lastInput = text;
-    if (this.deferredInputGroup) {
-      if (!this.deferredInputGroup.ready || this.readerKind === "scrape") this.deferredInputGroup.prompts.push(text);
-    }
     this.externalTurn = false;
     this.remember(text);
     this.sentTexts.push(text);
@@ -1058,23 +987,6 @@ export class AgentCommunicator {
    */
   getTurnResponse(): string {
     if (this.readerKind !== "scrape") {
-      // A delayed source can contain several inputs from this active turn.
-      // Re-reading only its last answer would lose the earlier input's output.
-      if (this.deferredInputGroup) {
-        // Finalization (including abort/ceiling) must respect the same fence as
-        // polling: a matching old lastPrompt is not proof of a current answer.
-        if (!this.deferredInputGroup.ready) {
-          // Abort can arrive after the reply was logged but before polling
-          // matched it. Read one coherent, dispatch-floored match without
-          // consuming diff output or opening the polling fence.
-          const turn = this.reader.readSincePrompts?.(this.deferredInputGroup.prompts, this.deferredInputGroup.startedAt);
-          return turn && turn.snapshot.endsWith(turn.text) ? turn.text : "";
-        }
-        const prefix = this.deferredInputGroup.snapshotPrefix;
-        if (prefix === undefined) return "";
-        const snapshot = this.getAgentOutput(4000);
-        return snapshot.startsWith(prefix) ? snapshot.slice(prefix.length).trim() : "";
-      }
       const asked = this.reader.lastPrompt?.().trim() ?? "";
       if (!asked || !this.reader.lastAnswer) return "";
       const isNew = this.lastInput.trim()
@@ -1088,7 +1000,7 @@ export class AgentCommunicator {
       // agent settles, the screen may not show one yet; the mark above the
       // prompt belongs to the turn before, and is not this turn's.
       this.readMark = lastTurnMark(screen, { afterPrompt: this.lastInput });
-      return this.deferredInputGroup ? this.deferredScreenAnswer(screen) : extractScreenResponse(screen, this.lastInput);
+      return extractScreenResponse(screen, this.lastInput);
     }
     // Only a turn we were told is external falls back to the screen's own
     // prompt. A `/follow` window has no input either, and its loop is not
@@ -1244,7 +1156,6 @@ export class AgentCommunicator {
 
   beginExternalTurn(): void {
     this.lastInput = "";
-    this.deferredInputGroup = null;
     this.externalTurn = true;
     this.readMark = "";
     if (this.readerKind !== "scrape") return;

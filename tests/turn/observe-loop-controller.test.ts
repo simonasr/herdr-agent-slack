@@ -20,6 +20,10 @@
  * in tests/observe-loop.test.ts so the behaviour parity stays obvious.
  */
 import { describe, it, expect } from "vitest";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { PiJsonlReader } from "../../src/readers/jsonl.js";
 import {
   ObserveLoopController,
   type OutputEvent,
@@ -153,25 +157,6 @@ function makeEnv(opts: {
   };
 }
 
-describe("ObserveLoopController — unresolved output retains explicit termination", () => {
-  it.each(["deadline", "ceiling", "aborted"] as const)("still terminates for %s while the reader is unresolved", async (reason) => {
-    const env = makeEnv({
-      snapshots: [],
-      reader: { kind: "deferred", ready: false, read: () => "", lastAnswer: () => "OLD HISTORICAL ANSWER" },
-      maxTurnMs: reason === "ceiling" ? 100 : undefined,
-    });
-    if (reason === "deadline") env.controller.updateDeadline(100);
-    else env.controller.markUserInput();
-    const done = env.controller.start();
-    if (reason === "aborted") env.controller.abort();
-    await env.drive();
-    await done;
-    expect(env.events.filter(e => e.type === "final")).toEqual([
-      { type: "final", text: "", reason, source: "snapshot" },
-    ]);
-  });
-});
-
 describe("ObserveLoopController — deadline state", () => {
   it("reports whether a deadline is currently armed", () => {
     const env = makeEnv({ snapshots: ["stable"] });
@@ -203,11 +188,11 @@ describe("ObserveLoopController — cumulative history is not a fallback answer"
     expect(env.events.filter(e => e.type === "delta")).toEqual([]);
   });
 
-  it("still delivers newly appended output from a cumulative reader", async () => {
+  it.each(["full-turn", "last-delta"] as const)("still delivers newly observed cumulative output in %s mode", async finalPayload => {
     const env = makeEnv({
       snapshots: ["old unrelated answer", "old unrelated answer\n\nnew reply"],
       isolateLastAnswer: false,
-      finalPayload: "full-turn",
+      finalPayload,
     });
     env.controller.markUserInput();
     const done = env.controller.start();
@@ -216,6 +201,56 @@ describe("ObserveLoopController — cumulative history is not a fallback answer"
     const finals = env.events.filter(e => e.type === "final");
     expect(finals).toHaveLength(1);
     expect(finals[0].text.trim()).toBe("new reply");
+  });
+});
+
+describe("ObserveLoopController — cumulative abort fallback policy", () => {
+  it.each(["full-turn", "last-delta"] as const)("retains observed output on %s abort", async finalPayload => {
+    const env = makeEnv({
+      snapshots: ["history", "history\n\nOBSERVED REPLY"],
+      isolateLastAnswer: false,
+      finalPayload,
+      completedOutput: () => { env.controller.abort(); return null; },
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    const finals = env.events.filter(e => e.type === "final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ reason: "aborted", source: "delta" });
+    expect(finals[0].text.trim()).toBe("OBSERVED REPLY");
+  });
+
+  it.each([
+    ["pi", "full-turn", false], ["pi", "last-delta", false],
+    ["omp", "full-turn", false], ["omp", "last-delta", false],
+    ["pi", "full-turn", true], ["pi", "last-delta", true],
+    ["omp", "full-turn", true], ["omp", "last-delta", true],
+  ] as const)("does not dump the %s log on %s abort (unread reply: %s)", async (agent, finalPayload, unread) => {
+    const dir = mkdtempSync(join(tmpdir(), "cumulative-abort-"));
+    try {
+      const path = join(dir, "session.jsonl");
+      const message = (text: string) => JSON.stringify({
+        type: "message", message: { role: "assistant", content: [{ type: "text", text }] },
+      }) + "\n";
+      writeFileSync(path, message("OLD HISTORICAL ANSWER"));
+      const env = makeEnv({ snapshots: [], finalPayload, reader: new PiJsonlReader(path, noopLogger, "test", agent) });
+      env.controller.markUserInput();
+      const done = env.controller.start();
+      if (unread) appendFileSync(path, message("UNOBSERVED REPLY"));
+      env.controller.abort();
+      await env.drive();
+      await done;
+      // Deliberate narrow policy: abort retains observed output, but does not
+      // drain unread cumulative output by falling back to the entire history.
+      expect(env.events.filter(e => e.type === "final")).toEqual([
+        { type: "final", text: "", reason: "aborted", source: "snapshot" },
+      ]);
+      expect(env.events.filter(e => e.type === "delta")).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

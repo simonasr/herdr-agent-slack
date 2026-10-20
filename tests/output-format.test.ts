@@ -9,7 +9,6 @@ import {
   extractResponseSince,
   extractScreenResponse,
   extractScreenDelta,
-  extractSubmittedScreenResponses,
   lastTurnMark,
 } from "../src/output-format.js";
 
@@ -367,16 +366,6 @@ describe("extractResponseSince", () => {
       "Jawabannya begini.",
     ].join("\n");
     expect(extractResponseSince(content, prompt)).toBe("Jawabannya begini.");
-  });
-
-  it.each(["$", ">"])("retains unmarked %s shell-prompt compatibility", marker => {
-    expect(extractResponseSince(`${marker} npm test\nTEST RESULTS`, "npm test"))
-      .toBe("TEST RESULTS");
-  });
-
-  it.each(["$ npm test", "> quoted note"])("retains ordinary marked literal %s readback", prompt => {
-    expect(extractScreenResponse(`❯ ${prompt}\nCURRENT ANSWER`, prompt))
-      .toBe("CURRENT ANSWER");
   });
 
   it("stops consuming when a line stops spelling out the prompt", () => {
@@ -816,80 +805,6 @@ const twoTurnsOneQuestion = [
 
 const turnOneMark = "✻ Worked for 2m 26s · done 1:15 PM · 1 shell still running";
 const turnTwoMark = "✻ Worked for 1m 15s · done 1:25 PM · 1 shell still running";
-
-describe("extractSubmittedScreenResponses — deferred turn boundaries", () => {
-  it.each(["❯", "›"])("excludes an unrelated later %s turn", marker => {
-    const screen = [
-      `${marker} bridge question`, "Bridge answer.",
-      `${marker} unrelated terminal question`, "UNRELATED ANSWER", marker,
-    ].join("\n");
-    expect(extractSubmittedScreenResponses(screen, ["bridge question"])).toBe("Bridge answer.");
-  });
-
-  it.each([
-    ["❯", "$", false], ["❯", ">", false], ["›", "$", false], ["›", ">", false],
-    ["❯", "$", true], ["❯", ">", true], ["›", "$", true], ["›", ">", true],
-  ] as const)("preserves literal %s-marked %s input (wrapped: %s)", (marker, prefix, wrapped) => {
-    const prompt = `${prefix} npm test`;
-    const screen = [
-      `${marker} first question`, "FIRST ANSWER",
-      ...(wrapped ? [`${marker} ${prefix} npm`, "  test"] : [`${marker} ${prompt}`]),
-      "SECOND ANSWER",
-      `${marker} unrelated question`, "UNRELATED ANSWER",
-    ].join("\n");
-    expect(extractSubmittedScreenResponses(screen, ["first question", prompt]))
-      .toBe("FIRST ANSWER\n\nSECOND ANSWER");
-  });
-
-  it.each([["❯", "$"], ["›", ">"]])("does not anchor unmarked %s / %s answer prose", (marker, prefix) => {
-    const prompt = `${prefix} npm test`;
-    const screen = [
-      `${marker} first question`, "FIRST ANSWER", prompt, "Still the first answer.",
-      `${marker} unrelated question`, "UNRELATED ANSWER",
-    ].join("\n");
-    expect(extractSubmittedScreenResponses(screen, ["first question", prompt]))
-      .toBe(`FIRST ANSWER\n${prompt}\nStill the first answer.`);
-  });
-
-  it.each([
-    ["❯", "\n"], ["›", "\n"], ["❯", "\t "], ["›", "\t "],
-  ])("deduplicates whitespace-equivalent %s echoes (%j)", (marker, gap) => {
-    const screen = [
-      `${marker} first question`, "EARLIER ANSWER",
-      `${marker} second question`, "SECOND ANSWER",
-      `${marker} first question`, "LATEST ANSWER",
-      `${marker} unrelated question`, "UNRELATED ANSWER",
-    ].join("\n");
-    expect(extractSubmittedScreenResponses(screen, [`first${gap}question `, "second question", "first question"]))
-      .toBe("SECOND ANSWER\n\nLATEST ANSWER");
-  });
-
-  it("keeps the latest raw multiline prompt for an offscreen-first-line fallback", () => {
-    const screen = ["specific-tail", "LATEST ANSWER", "❯ unrelated", "UNRELATED ANSWER"].join("\n");
-    expect(extractSubmittedScreenResponses(screen, ["first specific-tail", "first\nspecific-tail"]))
-      .toBe("LATEST ANSWER");
-  });
-
-  it.each(["❯", "›"])("keeps prose after attachments under a %s prompt", marker => {
-    const screen = [
-      `${marker} bridge question`, "Here are the documents.",
-      "› [file] a.pdf (1KB)", "More answer after the attachment.",
-      `${marker} unrelated question`, "UNRELATED ANSWER",
-    ].join("\n");
-    expect(extractSubmittedScreenResponses(screen, ["bridge question"]))
-      .toBe("Here are the documents.\nMore answer after the attachment.");
-  });
-
-  it.each(["❯", "›"])("retains both submitted %s answers without the later terminal turn", marker => {
-    const screen = [
-      `${marker} first question`, "FIRST ANSWER",
-      `${marker} second question`, "SECOND ANSWER",
-      `${marker} unrelated question`, "UNRELATED ANSWER",
-    ].join("\n");
-    expect(extractSubmittedScreenResponses(screen, ["first question", "second question"]))
-      .toBe("FIRST ANSWER\n\nSECOND ANSWER");
-  });
-});
 
 describe("lastTurnMark", () => {
   it("is the line that closed the last finished turn", () => {

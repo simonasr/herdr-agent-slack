@@ -154,10 +154,10 @@ export interface ObserveLoopControllerDeps {
    */
   finalPayload?: "last-delta" | "full-turn";
   /**
-   * A submitted turn or ceiling continuation shares a previously captured diff
-   * baseline. Carry any undelivered full-turn output and retain the first read
-   * as new instead of treating it as historical seed. Empty string retains
-   * the first read without carrying old output.
+   * A ceiling continuation shares the communicator's existing diff baseline.
+   * Carry its undelivered full-turn output and retain the first read as new
+   * output instead of treating it as historical seed. Empty string resumes
+   * without carrying old output (streaming consumers already received it).
    */
   initialOutput?: string;
   /**
@@ -179,9 +179,6 @@ export interface ObserveLoopControllerDeps {
 
 /** Suffix prepended when the snapshot is truncated for the final payload. */
 const ELLIPSIS_PREFIX = "…\n";
-
-/** A resolved log may never echo a submitted command literally (e.g. /compact). */
-const UNMATCHED_PROMPT_GRACE_MS = 90_000;
 
 /**
  * One ObserveLoopController owns ONE polling loop. start() is idempotent;
@@ -264,9 +261,9 @@ export class ObserveLoopController {
    * event (idle / deadline / aborted).
    *
    * The very first action inside the loop is a single
-   * `communicator.getNewOutput()` call. Fresh follow/adoption loops discard
-   * that seed to avoid history replay; submitted turns and continuations retain
-   * it against their captured baseline, including replies arriving during send.
+   * `communicator.getNewOutput()` call which seeds the communicator's
+   * baseline. Fresh loops emit no event for that seed, avoiding historical
+   * replay. Ceiling continuations retain it as output from the ongoing turn.
    */
   start(): Promise<void> {
     if (this.started) return this.started;
@@ -318,8 +315,8 @@ export class ObserveLoopController {
    */
   private async run(): Promise<void> {
     try {
-      // Fresh follow/adoption loops ignore their seed so history is not replayed.
-      // Submitted turns and continuations inherit a baseline: output since it
+      // Fresh loops ignore their seed so history is not replayed. A ceiling
+      // continuation inherits the diff baseline: output since the last poll
       // is new, even if it appeared while the busy/idle decision was pending.
       const seeded = this.communicator.getNewOutput();
       let resumed = this.initialOutput === undefined ? "" : seeded;
@@ -330,7 +327,6 @@ export class ObserveLoopController {
       // is stable so the stability window can elapse.
       let lastChangeAt = startedAt;
       let inputRevision = this.inputRevision;
-      let unmatchedPromptSince: number | null = null;
       // lastDeltaText remembers the most recent non-empty chunk we
       // emitted as a delta. The final payload falls back to this when
       // the pane goes idle — it's the most recent content the user has
@@ -359,15 +355,9 @@ export class ObserveLoopController {
         if (inputRevision !== this.inputRevision) {
           inputRevision = this.inputRevision;
           lastChangeAt = now;
-          unmatchedPromptSince = null;
         }
         const elapsedMs = now - startedAt;
         const fresh = this.communicator.getNewOutput();
-        if (this.communicator.sourceReady && !this.communicator.outputReady) {
-          unmatchedPromptSince ??= now;
-        } else {
-          unmatchedPromptSince = null;
-        }
         const unseen = resumed && fresh ? `${resumed}\n${fresh}` : resumed || fresh;
         resumed = "";
 
@@ -429,7 +419,6 @@ export class ObserveLoopController {
         if (inputRevision !== this.inputRevision) {
           inputRevision = this.inputRevision;
           lastChangeAt = checkedAt;
-          unmatchedPromptSince = null;
           continue;
         }
         const state: StopState = {
@@ -450,15 +439,6 @@ export class ObserveLoopController {
           if (this.waitUntilIdle && !state.completionConfirmed) {
             resumed = this.communicator.getNewOutput();
             if (resumed) continue;
-            if (!this.communicator.outputReady) {
-              // Missing files still get their reader's bounded screen fallback.
-              if (!this.communicator.sourceReady) continue;
-              // A resolved log may omit or transform the prompt. Bound that
-              // wait too, but leave outputReady false: settling empty must not
-              // authorize a historical lastAnswer or cumulative snapshot.
-              unmatchedPromptSince ??= checkedAt;
-              if (checkedAt - unmatchedPromptSince < UNMATCHED_PROMPT_GRACE_MS) continue;
-            }
           }
           // Distinguish "idle" vs "deadline" in the final reason. The
           // single rule: if waitUntilIdle is true, the idle gate was
@@ -562,8 +542,8 @@ export class ObserveLoopController {
       // even through getLastAnswer(). Never replay that history as a reply
       // when this turn produced no output. Screens retain their readback.
       const latest = this.communicator.readerKind === "scrape"
-        ? this.communicator.getFinalFallbackOutput()
-        : this.communicator.canIsolateLastAnswer() ? this.communicator.getFinalFallbackOutput() : "";
+        ? this.communicator.getLatestOutput()
+        : this.communicator.canIsolateLastAnswer() ? this.communicator.getLastAnswer() : "";
       if (latest.trim().length === 0) {
         text = "";
       } else if (this.finalPayload === "full-turn") {
