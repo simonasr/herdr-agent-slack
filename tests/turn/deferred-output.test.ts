@@ -89,6 +89,29 @@ describe("deferred submitted output — finalization", () => {
     expect(env.finals()).toEqual([{ type: "final", text: "", reason, source: "snapshot" }]);
   });
 
+  it.each([
+    ["codex", true], ["claude", true], ["codex", false], ["claude", false],
+  ] as const)("retains earlier %s output after a repeated prompt (bridge input: %s)", async (agent, bridgeInput) => {
+    const env = makeEnv(agent);
+    env.appendTurn("old question", "OLD HISTORICAL ANSWER", Date.now() - 10_000);
+    env.submit("continue");
+    env.appendTurn("continue", "ANSWER A");
+    env.resolve();
+    const done = env.controller.start();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(env.communicator.outputReady).toBe(true);
+    expect(env.communicator.getTurnResponse()).toBe("ANSWER A");
+    if (bridgeInput) {
+      env.communicator.sendInput("continue");
+      env.controller.markUserInput();
+    }
+    env.appendTurn("continue", "ANSWER B");
+    await vi.advanceTimersByTimeAsync(45_000);
+    await done;
+    expect(env.communicator.getTurnResponse()).toBe("ANSWER A\n\nANSWER B");
+    expect(env.finals()).toEqual([{ type: "final", text: "ANSWER A\n\nANSWER B", reason: "idle", source: "delta" }]);
+  });
+
   it.each(["full-turn", "last-delta"] as const)("bounds an unmatched command wait in %s mode without releasing old history", async finalPayload => {
     const env = makeEnv("claude", { finalPayload });
     env.appendTurn("earlier question", "OLD HISTORICAL ANSWER", Date.now() - 10_000);

@@ -806,7 +806,7 @@ export class AgentCommunicator {
   /** Most recent text handed to the pane, used to anchor a turn's response. */
   private lastInput = "";
   /** This turn's input group: structured anchors freeze; screens retain later inputs until the next fresh consumer. */
-  private deferredInputGroup: { prompts: string[]; ready: boolean; startedAt: number } | null = null;
+  private deferredInputGroup: { prompts: string[]; ready: boolean; startedAt: number; snapshotPrefix?: string } | null = null;
   /**
    * Whether the turn under way was started outside the bridge — somebody typed
    * in the pane itself. There is no submitted text to anchor on, so the answer
@@ -925,6 +925,9 @@ export class AgentCommunicator {
         // Consume the same snapshot that supplied the entire pending input group.
         this.sentTail = tailOf(turn.snapshot, SENT_TAIL_MAX);
         this.initialized = true;
+        // Freeze this occurrence, not its prompt text: a later identical input
+        // must not move full-turn readback past an earlier current answer.
+        this.deferredInputGroup.snapshotPrefix = turn.snapshot.slice(0, turn.snapshot.length - turn.text.length);
         this.deferredInputGroup.ready = true;
         return turn.text;
       }
@@ -1054,9 +1057,10 @@ export class AgentCommunicator {
       if (this.deferredInputGroup) {
         // Finalization (including abort/ceiling) must respect the same fence as
         // polling: a matching old lastPrompt is not proof of a current answer.
-        return this.deferredInputGroup.ready
-          ? this.reader.readSincePrompts?.(this.deferredInputGroup.prompts, this.deferredInputGroup.startedAt)?.text ?? ""
-          : "";
+        const prefix = this.deferredInputGroup.snapshotPrefix;
+        if (!this.deferredInputGroup.ready || prefix === undefined) return "";
+        const snapshot = this.getAgentOutput(4000);
+        return snapshot.startsWith(prefix) ? snapshot.slice(prefix.length).trim() : "";
       }
       const asked = this.reader.lastPrompt?.().trim() ?? "";
       if (!asked || !this.reader.lastAnswer) return "";
