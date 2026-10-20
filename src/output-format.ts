@@ -232,7 +232,9 @@ function normalizeSpace(text: string): string {
  * unanchored.
  */
 function consumePrompt(lines: string[], start: number, target: string, skipBlankLines = false): number | null {
-  let accumulated = normalizeSpace(dechromePrompt(lines[start]));
+  const first = lines[start].trim();
+  // An explicit TUI marker ends the chrome; following $ or > is prompt text.
+  let accumulated = normalizeSpace(/^[❯›]\s/.test(first) ? first.slice(1) : dechromePrompt(first));
   if (!accumulated || !target.startsWith(accumulated)) return null;
   let end = start;
   while (accumulated !== target && end + 1 < lines.length) {

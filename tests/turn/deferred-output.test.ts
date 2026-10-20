@@ -194,6 +194,29 @@ describe("deferred submitted output — finalization", () => {
     expect(env.communicator.outputReady).toBe(false);
   });
 
+  it.each([
+    ["full-turn", "$"], ["last-delta", "$"],
+    ["full-turn", ">"], ["last-delta", ">"],
+  ] as const)("retains literal screen prompt %s / %s answers on abort", async (finalPayload, prefix) => {
+    const env = makeEnv("codex", { finalPayload, isAgentBusy: () => true });
+    const prompt = `${prefix} npm test`;
+    env.fallback.read.mockReturnValue([
+      "› first question", "FIRST ANSWER",
+      `› ${prompt}`, "SECOND ANSWER",
+      "› unrelated question", "UNRELATED ANSWER",
+    ].join("\n"));
+    env.submit("first question");
+    env.communicator.sendInput(prompt);
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await vi.advanceTimersByTimeAsync(91_000);
+    env.controller.abort();
+    await vi.advanceTimersByTimeAsync(14_000);
+    await done;
+    expect(env.finals()).toEqual([{ type: "final", text: "FIRST ANSWER\n\nSECOND ANSWER", reason: "aborted", source: "snapshot" }]);
+    expect(env.events.filter(event => event.type === "delta")).toEqual([]);
+  });
+
   it.each(["full-turn", "last-delta"] as const)("keeps a screen answer when abort readback resolves the fallback in %s mode", async finalPayload => {
     const env = makeEnv("codex", { finalPayload, isAgentBusy: () => true });
     env.fallback.read.mockReturnValue("› current question\nCURRENT SCREEN ANSWER\n› unrelated question\nUNRELATED ANSWER");
