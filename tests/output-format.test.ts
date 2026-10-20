@@ -369,6 +369,16 @@ describe("extractResponseSince", () => {
     expect(extractResponseSince(content, prompt)).toBe("Jawabannya begini.");
   });
 
+  it.each(["$", ">"])("retains unmarked %s shell-prompt compatibility", marker => {
+    expect(extractResponseSince(`${marker} npm test\nTEST RESULTS`, "npm test"))
+      .toBe("TEST RESULTS");
+  });
+
+  it.each(["$ npm test", "> quoted note"])("retains ordinary marked literal %s readback", prompt => {
+    expect(extractScreenResponse(`❯ ${prompt}\nCURRENT ANSWER`, prompt))
+      .toBe("CURRENT ANSWER");
+  });
+
   it("stops consuming when a line stops spelling out the prompt", () => {
     // The answer must not be eaten just because it follows the prompt.
     const prompt = "satu dua tiga";
@@ -814,6 +824,31 @@ describe("extractSubmittedScreenResponses — deferred turn boundaries", () => {
       `${marker} unrelated terminal question`, "UNRELATED ANSWER", marker,
     ].join("\n");
     expect(extractSubmittedScreenResponses(screen, ["bridge question"])).toBe("Bridge answer.");
+  });
+
+  it.each([
+    ["❯", "$", false], ["❯", ">", false], ["›", "$", false], ["›", ">", false],
+    ["❯", "$", true], ["❯", ">", true], ["›", "$", true], ["›", ">", true],
+  ] as const)("preserves literal %s-marked %s input (wrapped: %s)", (marker, prefix, wrapped) => {
+    const prompt = `${prefix} npm test`;
+    const screen = [
+      `${marker} first question`, "FIRST ANSWER",
+      ...(wrapped ? [`${marker} ${prefix} npm`, "  test"] : [`${marker} ${prompt}`]),
+      "SECOND ANSWER",
+      `${marker} unrelated question`, "UNRELATED ANSWER",
+    ].join("\n");
+    expect(extractSubmittedScreenResponses(screen, ["first question", prompt]))
+      .toBe("FIRST ANSWER\n\nSECOND ANSWER");
+  });
+
+  it.each([["❯", "$"], ["›", ">"]])("does not anchor unmarked %s / %s answer prose", (marker, prefix) => {
+    const prompt = `${prefix} npm test`;
+    const screen = [
+      `${marker} first question`, "FIRST ANSWER", prompt, "Still the first answer.",
+      `${marker} unrelated question`, "UNRELATED ANSWER",
+    ].join("\n");
+    expect(extractSubmittedScreenResponses(screen, ["first question", prompt]))
+      .toBe(`FIRST ANSWER\n${prompt}\nStill the first answer.`);
   });
 
   it.each(["❯", "›"])("keeps prose after attachments under a %s prompt", marker => {
