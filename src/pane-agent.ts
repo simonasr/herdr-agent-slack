@@ -270,14 +270,16 @@ export class PaneAgent {
    * A user message arrived. Prepares metadata without blocking and forwards
    * input in arrival order, unless stop/dispose cancels it before dispatch.
    * The returned promise resolves true after dispatch, false on cancellation.
+   * stillWanted is a pure synchronous check, rechecked after metadata waits
+   * and immediately before sending; it cannot undo an already sent input.
    * If no loop is active, starts one with deadline=null and
    * waitUntilIdle=true (idle-based stop). If a loop is already active
    * (turn in flight, follow in flight, …), just marks waitUntilIdle on
    * it — the deadline gate (if any) is preserved untouched so a
    * follow timer keeps ticking through user messages.
    */
-  handleMessage(text: string): Promise<boolean> {
-    if (this.disposed) return Promise.resolve(false);
+  handleMessage(text: string, stillWanted: () => boolean = () => true): Promise<boolean> {
+    if (this.disposed || !stillWanted()) return Promise.resolve(false);
     // Invalidate on arrival, not after queued metadata or reader callbacks.
     const generation = ++this.turnGeneration;
     this.fastTurn = null;
@@ -288,7 +290,7 @@ export class PaneAgent {
     const epoch = this.inputEpoch;
     this.pendingInputs++;
     const prepared = this.inputTail.then(async () => {
-      const active = () => !this.disposed && this.inputEpoch === epoch;
+      const active = () => !this.disposed && this.inputEpoch === epoch && stillWanted();
       if (!active()) return false;
       // The preceding controller built a final, but its busy/idle decision may
       // still own that answer. Finish it before changing the reader's prompt.
