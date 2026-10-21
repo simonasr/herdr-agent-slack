@@ -29,7 +29,7 @@ import { formatForSlack } from "./slack-format.js";
 import { cleanPaneDelta, cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { createAgentCommunicator, findClaudeSessionByPrompt } from "./agent-sessions.js";
 import { closeTab, createTab, getAgents, getAgentInfo, getAgentInfoAsync, readPane, renameAgent, renameTab, sendKeys, startAgent } from "./herdr-client.js";
-import type { AgentSessionRef } from "./herdr-client.js";
+import type { AgentInfo, AgentSessionRef } from "./herdr-client.js";
 import { PaneAgent } from "./pane-agent.js";
 import { PaneWatcher } from "./turn/pane-watcher.js";
 import { PendingTurnLog } from "./turn/pending-turns.js";
@@ -444,9 +444,16 @@ export async function startSlackDaemon(
   }
 
   const agents = new Map<string, PaneAgent>();
+  const sources = new WeakMap<PaneAgent, {
+    agent?: string;
+    session: () => AgentSessionRef;
+    retired: boolean;
+    retirement?: Promise<void>;
+    metadata?: Promise<AgentInfo | null>;
+  }>();
   let stopping = false;
-  /** Started answer text must drain before its Slack client is stopped. */
-  const textBatches = new Set<Promise<void>>();
+  /** Started answer text must drain before its client or reader is retired. */
+  const textBatches = new Map<Promise<void>, string>();
   /** A reservation exists before the first asynchronous setup step. */
   const inputDispatches = new Map<string, Promise<void>>();
   const turnOwners = new Map<string, object>();
@@ -570,7 +577,7 @@ export async function startSlackDaemon(
     agents.get(binding.pane_id) === owner &&
     state.threads[bindingKey(binding.bot, { channel: binding.channel, threadTs: binding.thread_ts })] === binding;
   const bindingLive = (binding: ThreadBinding, owner: PaneAgent): boolean =>
-    !stopping && bindingAttached(binding, owner);
+    !stopping && !sources.get(owner)?.retired && bindingAttached(binding, owner);
   const localOwner = (binding: ThreadBinding, owner: PaneAgent): boolean =>
     bindingLive(binding, owner) && bindingForPane(binding.pane_id) === binding;
   /** Deliver a finished turn into the thread it belongs to. */
@@ -706,7 +713,7 @@ export async function startSlackDaemon(
     let lastTs = "";
     let finishText!: () => void;
     const textDone = new Promise<void>(resolve => { finishText = resolve; });
-    textBatches.add(textDone);
+    textBatches.set(textDone, paneId);
     try {
       for (const [index, message] of messages.entries()) {
         // Shutdown drains started text, but an actual binding/owner loss
@@ -878,13 +885,67 @@ export async function startSlackDaemon(
     if (mark) void client.react(mark.channel, mark.ts, mark.name ?? FALLBACK_WORKING, false);
   };
 
+  const knownSession = (session: AgentSessionRef): AgentSessionRef => {
+    const value = session?.kind === "path" ? session.path : session?.id;
+    return value?.trim() ? { ...session! } : undefined;
+  };
+
+  /** A lookup belongs to its reader; late results cannot retire a successor. */
+  const readSource = (paneId: string, owner: PaneAgent): Promise<AgentInfo | null> => {
+    const source = sources.get(owner);
+    if (!source || stopping || agents.get(paneId) !== owner) return Promise.resolve(null);
+    if (source.retired) return (source.retirement ?? Promise.resolve()).then(() => null);
+    if (source.metadata) return source.metadata;
+    source.metadata = (async () => {
+      let info: AgentInfo | null;
+      try { info = await getAgentInfoAsync(paneId); } catch { return null; }
+      if (stopping || agents.get(paneId) !== owner || source.retired) return info;
+      const pinned = source.session();
+      const live = knownSession(info?.agent_session);
+      // Different reference kinds can be aliases for the same session.
+      const changed = !!source.agent && !!info?.agent && (source.agent !== info.agent ||
+        (pinned?.kind === "path" && live?.kind === "path" && pinned.path !== live.path) ||
+        (pinned?.kind === "id" && live?.kind === "id" && pinned.id !== live.id));
+      if (!changed) return info;
+      const binding = bindingForPane(paneId);
+      const owed = pendingTurns.isOpen(paneId) && !setupOnlyTurns.has(paneId);
+      source.retired = true;
+      // Keep the registry entry as a lease for text already being posted.
+      // New events, input and settlement are rejected immediately.
+      owner.dispose();
+      if (binding) abandonTurn(binding);
+      source.retirement = (async () => {
+        await Promise.all([...textBatches].filter(([, pane]) => pane === paneId).map(([done]) => done));
+        if (stopping || agents.get(paneId) !== owner) return;
+        agents.delete(paneId);
+        const current = bindingForPane(paneId);
+        if (current) paneAgentFor(current, info!);
+        if (owed && binding && current === binding) {
+          void botOf(binding).client.post({ channel: binding.channel, threadTs: binding.thread_ts },
+            "⚠️ The pane's session changed or no longer matches its reader. Check the terminal for the unfinished answer, or ask again.")
+            .catch(err => log.warn("session-change notice failed", { paneId, message: String(err) }));
+        }
+      })();
+      await source.retirement;
+      return info;
+    })().finally(() => { source.metadata = undefined; });
+    return source.metadata;
+  };
+
   /** Lazily build the PaneAgent that owns a pane, wired to this thread. */
-  const paneAgentFor = (binding: ThreadBinding): PaneAgent => {
+  const paneAgentFor = (binding: ThreadBinding, snapshot?: AgentInfo): PaneAgent => {
     const existing = agents.get(binding.pane_id);
     if (existing) return existing;
+    let info: AgentInfo | null = snapshot ?? null;
+    if (!snapshot) { try { info = getAgentInfo(binding.pane_id); } catch { /* unknown is not replacement */ } }
+    let firstLookup = true;
     const communicator = createAgentCommunicator({
       paneId: binding.pane_id,
-      getAgentInfo,
+      getAgentInfo: target => {
+        if (!firstLookup) return getAgentInfo(target);
+        firstLookup = false;
+        return info;
+      },
       readPane,
       agentPaths: cfg.agentPaths,
       opencodeReadOptions: {
@@ -899,17 +960,17 @@ export async function startSlackDaemon(
     // The communicator seals an idle pane's last question itself; a working
     // one it cannot tell apart from a terminal turn — the ledger can.
     if (pendingTurns.isOpen(binding.pane_id)) communicator.sealAnsweredPrompt();
-    const agent = new PaneAgent({
+    const agent: PaneAgent = new PaneAgent({
       paneId: binding.pane_id,
       communicator,
       config: cfg,
-      getCompletionInfo: () => getAgentInfoAsync(binding.pane_id),
+      getCompletionInfo: () => readSource(binding.pane_id, agent),
       emit: (event) => {
         const paneId = binding.pane_id;
         // Snapshot the destination and turn synchronously, not after Slack yields.
         const captured = { turn: turnOwners.get(paneId), duringSetup: startingTurns.has(paneId),
           binding: bindingForPane(paneId) ?? binding };
-        const valid = (): boolean => !stopping && agents.get(paneId) === agent
+        const valid = (): boolean => !stopping && !sources.get(agent)?.retired && agents.get(paneId) === agent
           && bindingForPane(paneId) === captured.binding
           && state.threads[bindingKey(captured.binding.bot, {
             channel: captured.binding.channel, threadTs: captured.binding.thread_ts,
@@ -924,6 +985,13 @@ export async function startSlackDaemon(
         void deliverFinal(captured.binding, event, agent, "", pendingTurns.isOpen(paneId), false, captured)
           .catch((err) => log.error("Slack event delivery failed", { paneId, message: String(err) }));
       },
+    });
+    let pinned = knownSession(info?.agent_session);
+    sources.set(agent, {
+      agent: info?.agent, retired: false,
+      // This names the log actually being read, including a deferred selection.
+      // It is never evidence that any submitted prompt belongs to that log.
+      session: () => pinned ??= knownSession(communicator.readerSession),
     });
     agents.set(binding.pane_id, agent);
     return agent;
@@ -1222,6 +1290,7 @@ export async function startSlackDaemon(
     });
     startingTurns.set(paneId, (startingTurns.get(paneId) ?? 0) + 1);
     let sent = false;
+    let inputOwner: PaneAgent | undefined;
     try {
       setup: {
         // This thread asked; the answer comes back here.
@@ -1233,7 +1302,11 @@ export async function startSlackDaemon(
         await bot.client.setStatus(thread, "is working…");
         if (stopping) break setup;
         await previousDispatch;
+        const prior = agents.get(paneId);
+        const retirement = prior && sources.get(prior)?.retirement;
+        if (retirement) await retirement;
         if (stopping) break setup;
+        inputOwner = paneAgentFor(binding);
         await markWorking(bot, paneId, thread.channel, messageTs);
         if (stopping) break setup;
         log.info("turn started", { bot: bot.name, paneId, label: binding.label, thread: threadKey(thread) });
@@ -1242,9 +1315,10 @@ export async function startSlackDaemon(
         await dismissBlockingDialog(paneId);
         if (stopping) break setup;
         const framed = await withThreadContext(binding, thread, text, messageTs);
-        if (stillWanted()) {
-          const agent = paneAgentFor(binding);
-          if (await agent.handleMessage(framed.text, stillWanted) !== false) {
+        if (!stillWanted()) break setup;
+        await readSource(paneId, inputOwner);
+        if (stillWanted() && agents.get(paneId) === inputOwner && !sources.get(inputOwner)?.retired) {
+          if (await inputOwner.handleMessage(framed.text, stillWanted) !== false) {
             sent = true;
             // Commit only the context prepared for an input actually sent,
             // before the next queued input can decide what it still needs.
@@ -1264,6 +1338,10 @@ export async function startSlackDaemon(
       // An unsent question can abandon only positively setup-only debt, not
       // an earlier dispatched/restored question sharing the same ledger entry.
       if (!sent) {
+        if (inputOwner && sources.get(inputOwner)?.retired && stillWanted()) {
+          void bot.client.post(thread, "⚠️ The pane's session changed before this input was sent. Please send it again.")
+            .catch(err => log.warn("session-change notice failed", { paneId, message: String(err) }));
+        }
         if (setupOnlyTurns.has(paneId)
           && turnOwners.get(paneId) === owner && startingTurns.get(paneId) === 1) {
           abandonTurn(bindingForPane(paneId) ?? binding);
@@ -1687,7 +1765,9 @@ export async function startSlackDaemon(
     if (word === "last") {
       // Rendered like any other answer: `!last` exists to show the answer
       // again, so it should not look different from the one that was missed.
+      await readSource(binding.pane_id, paneAgentFor(binding));
       const agent = paneAgentFor(binding);
+      if (!bindingLive(binding, agent)) return true;
       const raw = agent.verbatim
         ? agent.getLastAnswer().trim()
         : cleanPaneOutput(stripStatusBar(agent.getLastAnswer()));
@@ -2029,7 +2109,7 @@ export async function startSlackDaemon(
       clearInterval(idleSweep);
       paneWatcher.stop();
       for (const agent of agents.values()) agent.dispose();
-      await Promise.all(textBatches);
+      await Promise.all(textBatches.keys());
       agents.clear();
       for (const bot of bots.values()) await bot.client.stop();
     },
