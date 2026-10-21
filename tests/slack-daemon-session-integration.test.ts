@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import type { AgentInfo } from "../src/herdr-client.js";
@@ -140,13 +140,13 @@ describe("Slack input cancellation — real observe loops", () => {
     ? JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8")) : [];
 
   it.each([
-    { cancel: "same-bind", sample: 1 }, { cancel: "same-bind", sample: 2 },
+    { cancel: "same-bind", sample: 1 }, { cancel: "same-bind", sample: 2 }, { cancel: "same-bind", sample: 3 },
     { cancel: "shared-unbind", sample: 1 }, { cancel: "last-unbind", sample: 1 },
     { cancel: "stop", sample: 1 },
   ])("does not send after $cancel during metadata sample $sample", async ({ cancel, sample }) => {
     writeFileSync(oldPath, codexTurn("old question", "old answer"));
     mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex" };
-    if (sample === 2) {
+    if (sample >= 2) {
       writeFileSync(oldPath, JSON.stringify({ type: "message", id: "prior-record", message: {
         role: "assistant", content: [{ type: "text", text: "old answer" }],
       } }) + "\n");
@@ -382,6 +382,222 @@ describe("Slack context commits — real observe loops", () => {
     expect(inputs()[1]).toBe("second");
     expect(mocks.history).toHaveBeenCalledTimes(1);
     expect(flags().context_sent).toBe(true);
+  });
+});
+
+describe("Confirmed reader replacement — real observe loops", () => {
+  type Kind = "pi" | "codex" | "claude";
+  const ask = (text: string, ts = "2.0") => mocks.client!.onUserMessage(thread, "U1", text, ts);
+  const pending = () => existsSync(join(dir, "pending-turns.json"))
+    ? JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8")) : [];
+  function transcript(kind: Kind, prompt: string, answer: string): string {
+    if (kind === "codex") return codexTurn(prompt, answer);
+    if (kind === "pi") return message(answer);
+    return [
+      { type: "user", message: { role: "user", content: prompt } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: answer }] } },
+    ].map(line => JSON.stringify(line)).join("\n") + "\n";
+  }
+  function session(kind: Kind, id: string, status = "idle") {
+    const path = kind === "codex" ? join(dir, ".codex", "sessions", `rollout-${id}.jsonl`)
+      : kind === "claude" ? join(dir, ".claude", "projects", "project", `${id}.jsonl`)
+      : join(dir, `${id}.jsonl`);
+    mkdirSync(dirname(path), { recursive: true });
+    const info: AgentInfo = { ...liveSession(path, status), agent: kind,
+      agent_session: kind === "pi" ? { kind: "path", path } : { kind: "id", id } };
+    return { path, info };
+  }
+
+  it.each([
+    ["pi", "pi"], ["codex", "codex"], ["claude", "claude"], ["codex", "claude"],
+  ] as const)("retires %s output on confirmed %s replacement and observes only fresh input", async (oldKind, newKind) => {
+    const old = session(oldKind, "old-session", "working");
+    const next = session(newKind, "new-session");
+    writeFileSync(old.path, transcript(oldKind, "old prompt", "old history"));
+    writeFileSync(next.path, transcript(newKind, "unrelated prompt", "UNRELATED_REPLACEMENT_HISTORY"));
+    mocks.live = old.info;
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("Q1");
+    appendFileSync(old.path, transcript(oldKind, "Q1", "WRONG_RETIRED_OUTPUT"));
+    mocks.live = next.info;
+    await vi.advanceTimersByTimeAsync(500);
+    const posts = mocks.post.mock.calls.map(c => c[1]).join("\n");
+    expect(posts).not.toContain("WRONG_RETIRED_OUTPUT");
+    expect(posts).not.toContain("UNRELATED_REPLACEMENT_HISTORY");
+    expect(posts).toMatch(/session.*changed|switched sessions/i);
+    expect(pending()).toEqual([]);
+    expect(sendText).toHaveBeenCalledTimes(1);
+    await ask("Q2", "3.0");
+    appendFileSync(next.path, transcript(newKind, "Q2", "FRESH_REPLACEMENT_ANSWER"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).toContain("FRESH_REPLACEMENT_ANSWER");
+    expect(sendText).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["unavailable", "missing session"])("keeps its reader when metadata is %s, without a false replacement notice", async missing => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("Q1");
+    mocks.live = missing === "unavailable" ? null : { ...mocks.live!, agent_status: "idle", agent_session: undefined };
+    appendFileSync(oldPath, message("SAME_SESSION_ANSWER"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1])).toEqual(["SAME_SESSION_ANSWER"]);
+    expect(sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels input when replacement is discovered inside its metadata await and makes retry visible", async () => {
+    mocks.live = liveSession(oldPath, "idle");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    let release!: (info: AgentInfo | null) => void;
+    let calls = 0;
+    vi.mocked(getAgentInfoAsync).mockImplementation(async () => {
+      if (++calls === 2) return new Promise(resolve => { release = resolve; });
+      return mocks.live;
+    });
+    const sending = ask("never sent");
+    for (let i = 0; i < 160; i++) await Promise.resolve();
+    expect(release).toBeTypeOf("function");
+    const next = session("pi", "next"); writeFileSync(next.path, message("unrelated history"));
+    mocks.live = next.info; release(next.info); await sending;
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pending()).toEqual([]);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).toMatch(/session.*changed|switched sessions/i);
+    await ask("retry", "3.0");
+    appendFileSync(next.path, message("RETRY_ANSWER")); await vi.advanceTimersByTimeAsync(500);
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(mocks.post.mock.calls.map(c => c[1])).toContain("RETRY_ANSWER");
+  });
+
+  it.each([true, false])("cancels the first input after an idle swap and observes its explicit retry, terminal relay=%s", async relay => {
+    appendFileSync(join(dir, "config.toml"), `relay_terminal_turns = ${relay}\n`);
+    mocks.live = liveSession(oldPath, "idle");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("Q1"); appendFileSync(oldPath, message("Q1 answer"));
+    await vi.advanceTimersByTimeAsync(500); mocks.post.mockClear();
+    const next = session("pi", "idle-next"); writeFileSync(next.path, message("DO_NOT_REPLAY"));
+    mocks.live = next.info; await vi.advanceTimersByTimeAsync(5000);
+    await ask("Q2", "3.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).toMatch(/session.*changed|switched sessions/i);
+    mocks.post.mockClear();
+    await ask("retry Q2", "4.0"); appendFileSync(next.path, message("NEW_IDLE_READER_ANSWER"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1])).toEqual(["NEW_IDLE_READER_ANSWER"]);
+  });
+
+  it("does not mistake Codex path/id aliases for a different session", async () => {
+    const old = session("codex", "alias-session", "working");
+    writeFileSync(old.path, codexTurn("old question", "old history")); mocks.live = old.info;
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("Q1");
+    mocks.live = { ...old.info, agent_status: "idle", agent_session: { kind: "path", path: old.path } };
+    appendFileSync(old.path, codexTurn("Q1", "SAME_ROLLOUT_ANSWER"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1])).toEqual(["SAME_ROLLOUT_ANSWER"]);
+  });
+
+  it("pins a deferred reader only after it selects a source, then detects its replacement", async () => {
+    const old = session("codex", "deferred-old", "working");
+    writeFileSync(old.path, codexTurn("old question", "old history"));
+    mocks.live = { ...old.info, agent_session: undefined };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("Q1"); mocks.live = { ...old.info, agent_status: "idle" };
+    appendFileSync(old.path, codexTurn("Q1", "DEFERRED_FIRST_ANSWER"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1])).toEqual(["DEFERRED_FIRST_ANSWER"]);
+    const next = session("codex", "deferred-next");
+    writeFileSync(next.path, codexTurn("unrelated", "wrong old history")); mocks.live = next.info;
+    await ask("Q2", "3.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).toMatch(/session.*changed|switched sessions/i);
+  });
+
+  it("rejects a prompt-guessed Claude source that conflicts with later authoritative metadata", async () => {
+    const guessed = session("claude", "guessed-source", "working");
+    const prompt = "Question initially found in a guessed transcript";
+    writeFileSync(guessed.path, transcript("claude", prompt, ""));
+    mocks.live = { ...guessed.info, agent_session: undefined, cwd: dir };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask(prompt); await vi.advanceTimersByTimeAsync(100);
+    const actual = session("claude", "actual-source");
+    writeFileSync(actual.path, transcript("claude", "different question", "unrelated answer"));
+    appendFileSync(guessed.path, transcript("claude", prompt, "WRONG_GUESSED_SOURCE_OUTPUT"));
+    mocks.live = actual.info; await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).not.toContain("WRONG_GUESSED_SOURCE_OUTPUT");
+    expect(pending()).toEqual([]);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).toMatch(/session.*changed|switched sessions/i);
+  });
+
+  it("checks a stream-mode follow-up before dispatch without relying on a baseline sample", async () => {
+    appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir }); await ask("Q1");
+    const next = session("pi", "stream-next"); writeFileSync(next.path, message("old history")); mocks.live = next.info;
+    await ask("unsent Q2", "3.0");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(pending()).toEqual([]);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).toContain("before this input was sent");
+  });
+
+  it("constructs the replacement from confirmed async metadata rather than a stale synchronous snapshot", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir }); await ask("Q1");
+    const next = session("pi", "async-next"); writeFileSync(next.path, message("old history"));
+    vi.mocked(getAgentInfoAsync).mockResolvedValue(next.info); // getAgentInfo still reports the old path
+    await vi.advanceTimersByTimeAsync(500);
+    await ask("Q2", "3.0"); appendFileSync(next.path, message("ASYNC_SELECTED_SOURCE_ANSWER"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1])).toContain("ASYNC_SELECTED_SOURCE_ANSWER");
+    expect(sendText).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not wait for another pane's started text when replacing this reader", async () => {
+    mocks.live = liveSession(oldPath, "idle");
+    const peer = session("pi", "peer", "idle");
+    peer.info = { ...peer.info, pane_id: "w1:p2" };
+    writeFileSync(peer.path, message("peer history"));
+    mocks.liveByPane.set("w1:p2", peer.info);
+    mocks.extraPanes.push({ pane_id: "w1:p2", label: "peer", agent: "pi", status: "idle" });
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    state.threads["default|C2:other"] = { ...state.threads["default|C1:1.0"], pane_id: "w1:p2", channel: "C2", thread_ts: "other" };
+    writeFileSync(join(dir, "state.json"), JSON.stringify(state));
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("Q1"); appendFileSync(oldPath, message("Q1 answer")); await vi.advanceTimersByTimeAsync(500);
+    await mocks.client!.onUserMessage({ channel: "C2", threadTs: "other" }, "U1", "peer question", "2.0");
+    let release!: (ts: string) => void;
+    mocks.post.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    appendFileSync(peer.path, message("abcdefghijklmnopqrstuvwxyz ".repeat(270)));
+    await vi.advanceTimersByTimeAsync(500); expect(release).toBeTypeOf("function");
+    const next = session("pi", "independent"); writeFileSync(next.path, message("old history")); mocks.live = next.info;
+    let completed = false;
+    const checking = ask("canceled Q2", "3.0").then(() => { completed = true; });
+    for (let i = 0; i < 160; i++) await Promise.resolve();
+    const completedBeforePeer = completed;
+    release("peer-first-chunk"); await checking; await vi.advanceTimersByTimeAsync(500);
+    expect(completedBeforePeer).toBe(true);
+  });
+
+  it("finishes already-started answer text before retiring that reader", async () => {
+    mocks.live = liveSession(oldPath, "idle");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("Q1");
+    let release!: (ts: string) => void;
+    mocks.post.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const answer = "abcdefghijklmnopqrstuvwxyz ".repeat(270);
+    writeFileSync(join(dir, "after.txt"), "file requested by the retired answer");
+    appendFileSync(oldPath, message(answer + "\n@@send: after.txt")); await vi.advanceTimersByTimeAsync(500);
+    expect(release).toBeTypeOf("function");
+    const next = session("pi", "after-text"); next.info.cwd = dir;
+    writeFileSync(next.path, message("old history"));
+    mocks.live = next.info;
+    const canceled = ask("Q2", "3.0");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(mocks.post).toHaveBeenCalledTimes(1);
+    release("first-chunk"); await canceled; await vi.advanceTimersByTimeAsync(500);
+    const text = mocks.post.mock.calls.map(c => c[1]).filter(t => !/session.*changed|switched sessions/i.test(t));
+    expect(text).toEqual(formatForSlack(answer.trim()).map(c => c.text));
+    expect(mocks.upload).not.toHaveBeenCalled(); // a new file batch must not start after retirement
+    expect(sendText).toHaveBeenCalledTimes(1);
+    await ask("retry Q2", "4.0"); appendFileSync(next.path, message("AFTER_DRAIN_ANSWER"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1])).toContain("AFTER_DRAIN_ANSWER");
   });
 });
 
