@@ -337,8 +337,8 @@ interface SlackState {
   /** Per pane, the ts of its last delivered answer: what a self-started turn marks. */
   last_answer: Record<string, { channel: string; ts: string }>;
   /**
-   * Per pane, a hash of the last answer delivered. What a restart finds
-   * owed is compared against it: the same text was not lost, it was sent.
+   * Per pane, a hash of the last answer submitted for delivery, recorded at
+   * send-attempt start alongside debt settlement. A restart must not replay it.
    */
   delivered: Record<string, string>;
   /**
@@ -582,29 +582,36 @@ export async function startSlackDaemon(
     },
   ): Promise<void> => {
     const paneId = binding.pane_id;
-    // Session ownership allows an already-started answer to finish; only
-    // captured turn ownership permits settlement of the ledger and marks.
+    // A dispatched answer can pay its debt during a newer setup, but only
+    // captured turn ownership permits changing that setup's marks and status.
     const isCurrent = (): boolean => !captured.duringSetup && !startingTurns.has(paneId)
       && turnOwners.get(paneId) === captured.turn && localOwner(binding, owner);
-    const closeOwned = (): void => {
-      if (!isCurrent()) return;
-      turnStartedAt.delete(paneId);
-      closePendingTurn(paneId);
-    };
     // Until dispatch, missing evidence must retain the entire answer. After
     // dispatch it is only a positive contradiction that stops later operations.
-    const nextOperation = async (): Promise<boolean> =>
+    const nextOperation = (): boolean =>
       captured.dispatched ? bindingLive(binding, owner) : localOwner(binding, owner);
-    const beginOperation = (): void => {
+    const beginOperation = (rememberAnswer = false): void => {
       if (captured.dispatched) return;
       captured.dispatched = true;
-      closeOwned();
+      // No await before this first send attempt: a later input cannot dispatch
+      // between capturing the final and converting the paid debt to setup-only.
+      if (captured.duringSetup) setupOnlyTurns.add(paneId);
+      else if (isCurrent()) {
+        turnStartedAt.delete(paneId);
+        closePendingTurn(paneId);
+      }
+      // Match ledger settlement at send-attempt start. A suspended old post
+      // must not overwrite the digest recorded by a newer final.
+      if (rememberAnswer) {
+        state.delivered[paneId] = digest(event.text);
+        persist();
+      }
     };
     const canSettle = async (): Promise<boolean> => {
       if (!isCurrent()) return false;
       return isCurrent();
     };
-    if (!await nextOperation()) return;
+    if (!nextOperation()) return;
     const thread: SlackThread = { channel: binding.channel, threadTs: binding.thread_ts };
     if (event.duplicate) {
       beginOperation();
@@ -688,13 +695,12 @@ export async function startSlackDaemon(
     const prefix = note + quoted + (event.reason === "aborted" ? "🛑 Stopped.\n\n" : "");
     let lastTs = "";
     for (const [index, message] of messages.entries()) {
-      if (index > 0 && !await nextOperation()) return;
-      beginOperation();
+      if (index > 0 && !nextOperation()) return;
+      beginOperation(true);
       lastTs = await bot.client.post(thread, (index === 0 ? prefix : "") + message.text) || lastTs;
     }
     if (messages.length > 0 && isCurrent()) {
       if (lastTs) state.last_answer[paneId] = { channel: thread.channel, ts: lastTs };
-      state.delivered[paneId] = digest(event.text);
       persist();
       await markDone(bot, paneId, thread, canSettle);
     }
@@ -703,17 +709,15 @@ export async function startSlackDaemon(
     // These are dispatched operations: once started, finish their files or
     // command/spawn/brief sequence rather than strand a partial side effect.
     if (requestedFiles.length > 0) {
-      if (!await nextOperation()) return;
-      beginOperation();
+      if (!nextOperation()) return;
+      beginOperation(true);
       await deliverRequestedFiles(binding, thread, requestedFiles);
     }
     if (messages.length === 0 && isCurrent() && captured.dispatched) {
-      state.delivered[paneId] = digest(event.text);
-      persist();
       await markDone(bot, paneId, thread, canSettle);
     }
     for (const handoff of handoffs) {
-      if (!await nextOperation()) return;
+      if (!nextOperation()) return;
       beginOperation();
       await handOff(bot, thread, handoff, paneId).catch((err) =>
         log.error("handoff failed", { from: bot.name, to: handoff.bot, message: String(err) }),
@@ -1203,13 +1207,13 @@ export async function startSlackDaemon(
       paneAgentFor(binding);
       turnStartedAt.set(paneId, Date.now());
       await bot.client.setStatus(thread, "is working…");
+      await previousDispatch;
       await markWorking(bot, paneId, thread.channel, messageTs);
       log.info("turn started", { bot: bot.name, paneId, label: binding.label, thread: threadKey(thread) });
       if (!pendingTurns.isOpen(paneId)) setupOnlyTurns.add(paneId);
       pendingTurns.open(paneId);
       await dismissBlockingDialog(paneId);
       const framed = await withThreadContext(binding, thread, text, messageTs);
-      await previousDispatch;
       let sent = false;
       if (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
         const agent = paneAgentFor(binding);
@@ -1218,11 +1222,21 @@ export async function startSlackDaemon(
           setupOnlyTurns.delete(paneId);
         }
       }
-      // A canceled last setup owns no future answer. Never release a later
-      // question's state, or a prior dispatched/recovered debt during shutdown.
-      if (!sent && (!stopping || setupOnlyTurns.has(paneId))
-        && turnOwners.get(paneId) === owner && startingTurns.get(paneId) === 1) {
-        abandonTurn(bindingForPane(paneId) ?? binding);
+      // An unsent question can abandon only positively setup-only debt, not
+      // an earlier dispatched/restored question sharing the same ledger entry.
+      if (!sent) {
+        if (setupOnlyTurns.has(paneId)
+          && turnOwners.get(paneId) === owner && startingTurns.get(paneId) === 1) {
+          abandonTurn(bindingForPane(paneId) ?? binding);
+        } else {
+          // Do not let the older answer complete the cancelled input's mark.
+          const mark = state.marked[paneId];
+          if (mark?.channel === thread.channel && mark.ts === messageTs) {
+            delete state.marked[paneId];
+            persist();
+            await bot.client.react(mark.channel, mark.ts, mark.name ?? FALLBACK_WORKING, false);
+          }
+        }
       }
     } finally {
       const remaining = (startingTurns.get(paneId) ?? 1) - 1;

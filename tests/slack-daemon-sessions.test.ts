@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import type { AgentInfo } from "../src/herdr-client.js";
 import type { PaneAgentOptions } from "../src/pane-agent.js";
 import type { SlackClientDeps } from "../src/slack-client.js";
@@ -169,7 +170,7 @@ describe("Slack daemon — captured same-session settlement", () => {
     const after = JSON.parse(readFileSync(statePath, "utf8"));
     expect(after.marked["w1:p1"]).toEqual(adopted.marked["w1:p1"]);
     expect(after.last_answer["w1:p1"]).toEqual(adopted.last_answer["w1:p1"]);
-    expect(after.delivered["w1:p1"]).toBeUndefined();
+    expect(after.delivered["w1:p1"]).toBe(createHash("sha1").update("first answer").digest("hex"));
     expect(mocks.react).not.toHaveBeenCalled();
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
   });
@@ -190,7 +191,7 @@ describe("Slack daemon — captured same-session settlement", () => {
     const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
     expect(state.marked["w1:p1"].ts).toBe("3.0");
     expect(state.last_answer["w1:p1"]).toBeUndefined();
-    expect(state.delivered["w1:p1"]).toBeUndefined();
+    expect(state.delivered["w1:p1"]).toBe(createHash("sha1").update("complete old answer").digest("hex"));
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toHaveLength(1);
   });
 

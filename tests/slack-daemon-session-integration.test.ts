@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import type { AgentInfo } from "../src/herdr-client.js";
 import type { SlackClientDeps, SlackThread, ThreadMessage } from "../src/slack-client.js";
 
@@ -13,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   extraPanes: [] as Array<{ pane_id: string; label: string; agent: string; status: string }>,
   post: vi.fn(async (_thread: SlackThread, _text: string) => "answer-ts"),
   status: vi.fn(async () => {}),
+  react: vi.fn(async (_channel: string, _ts: string, _name: string, _on: boolean) => true),
   upload: vi.fn(async (_thread: SlackThread, _path: string, _name: string, _title: string) => {}),
   history: vi.fn(async (): Promise<ThreadMessage[]> => []),
   start: vi.fn(async () => {}),
@@ -47,7 +49,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
     post = mocks.post;
     setStatus = mocks.status;
     upload = mocks.upload;
-    react = vi.fn(async () => {});
+    react = mocks.react;
     unreact = vi.fn(async () => {});
   },
 }));
@@ -84,6 +86,11 @@ function liveSession(path: string, status = "working"): AgentInfo {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  mocks.status.mockReset().mockResolvedValue(undefined);
+  mocks.post.mockReset().mockResolvedValue("answer-ts");
+  mocks.history.mockReset().mockResolvedValue([]);
+  mocks.start.mockReset().mockResolvedValue(undefined);
+  mocks.stop.mockReset().mockResolvedValue(undefined);
   dir = mkdtempSync(join(tmpdir(), "slack-session-integration-"));
   mocks.home = dir;
   mocks.screen = "";
@@ -193,8 +200,8 @@ describe("Slack session routing — real observe loops", () => {
     expect(release).toBeTypeOf("function");
     const second = mocks.client!.onUserMessage(thread, "U1", "second past setup", "2.1");
     await vi.advanceTimersByTimeAsync(0);
-    // Both handlers have reached setup: Q2 has finished its status and mark,
-    // but it cannot overtake the earlier reservation before Q1 is released.
+    // Q2 can set its status, but cannot mark, frame or dispatch its input
+    // ahead of Q1's reservation.
     expect(mocks.status).toHaveBeenCalledTimes(2);
     expect(vi.mocked(sendText)).not.toHaveBeenCalled();
     release();
@@ -297,4 +304,155 @@ describe("Slack session routing — real observe loops", () => {
   });
 
 
+  describe("follow-up ownership and debt", () => {
+    const state = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    const pending = () => JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"));
+    const digest = (text: string) => createHash("sha1").update(text.trim()).digest("hex");
+    const ask = (text: string, ts: string) => mocks.client!.onUserMessage(thread, "U1", text, ts);
+    function selectCodex() {
+      const sessions = join(dir, ".codex", "sessions");
+      mkdirSync(sessions, { recursive: true });
+      const path = join(sessions, "rollout-followup.jsonl");
+      writeFileSync(path, "");
+      mocks.live = { ...liveSession(path, "idle"), agent: "codex", agent_session: { kind: "id", id: "followup" } };
+      return path;
+    }
+    function pauseStatus() {
+      let release!: () => void;
+      mocks.status.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+      return () => release();
+    }
+
+    it("does not replay an already-posted answer when its unsent follow-up is canceled on shutdown", async () => {
+      const path = selectCodex();
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      await ask("Q1", "2.0");
+      const release = pauseStatus();
+      const q2 = ask("Q2", "3.0");
+      await vi.advanceTimersByTimeAsync(0);
+      appendFileSync(path, codexTurn("Q1", "paid Q1 answer"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "paid Q1 answer");
+      await daemon.stop(); daemon = undefined;
+      release(); await q2;
+      expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", "Q1");
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "paid Q1 answer");
+      expect(pending()).toEqual([]);
+      expect(state().delivered["w1:p1"]).toBe(digest("paid Q1 answer"));
+    });
+
+    it.each(["mark", "context"] as const)("orders the %s with the first and last dispatched input", async aspect => {
+      const path = selectCodex();
+      const fresh = state();
+      fresh.threads["default|C1:1.0"].context_sent = false;
+      fresh.threads["default|C1:1.0"].note_version = 0;
+      writeFileSync(join(dir, "state.json"), JSON.stringify(fresh));
+      mocks.history.mockResolvedValue([{ author: "Reviewer", userId: "U0", ts: "0.5", text: "IMPORTANT CONTEXT" }]);
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      const release = pauseStatus();
+      const q1 = ask("Q1", "2.0"); await vi.advanceTimersByTimeAsync(0);
+      const q2 = ask("Q2", "3.0"); await vi.advanceTimersByTimeAsync(0);
+      expect(sendText).not.toHaveBeenCalled();
+      release(); await Promise.all([q1, q2]);
+      const prompts = vi.mocked(sendText).mock.calls.map(([, text]) => text);
+      expect(prompts[0]).toMatch(/Q1$/); expect(prompts[1]).toMatch(/Q2$/);
+      appendFileSync(path, codexTurn(prompts[1], "Q2 final"));
+      await vi.advanceTimersByTimeAsync(300);
+      if (aspect === "mark") {
+        const done = mocks.react.mock.calls.filter(([, , name, on]) => name === "white_check_mark" && on);
+        expect(done.map(([, ts]) => ts)).toEqual(["3.0"]);
+      } else {
+        expect(prompts[0]).toContain("IMPORTANT CONTEXT");
+        expect(prompts[0]).toContain("[Slack bridge:");
+        expect(prompts[1]).toBe("Q2");
+      }
+    });
+
+    it.each([
+      ["rebind", "dispatched"], ["unbind", "dispatched"],
+      ["rebind", "restored"], ["unbind", "restored"],
+    ] as const)("preserves unanswered debt on %s cancellation, prior=%s", async (cancel, prior) => {
+      const path = selectCodex();
+      if (cancel === "unbind") {
+        const shared = state(); shared.threads["default|C2:other"] = {
+          ...shared.threads["default|C1:1.0"], channel: "C2", thread_ts: "other",
+        };
+        writeFileSync(join(dir, "state.json"), JSON.stringify(shared));
+      }
+      if (prior === "restored") {
+        writeFileSync(join(dir, "pending-turns.json"), JSON.stringify([
+          { pane_id: "w1:p1", started_at: new Date().toISOString() },
+        ]));
+        mocks.live = { ...mocks.live!, agent_status: "working" };
+      }
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      if (prior === "dispatched") await ask("Q1", "2.0");
+      expect(pending()).toHaveLength(1);
+      mocks.live = { ...mocks.live!, agent_status: "working" };
+      const release = pauseStatus();
+      const q2 = ask("Q2", "3.0"); await vi.advanceTimersByTimeAsync(0);
+      await ask(cancel === "rebind" ? "!bind project" : "!unbind", "4.0");
+      release(); await q2;
+      expect(vi.mocked(sendText).mock.calls).toEqual(prior === "dispatched" ? [["w1:p1", "Q1"]] : []);
+      expect(pending()).toEqual([expect.objectContaining({ pane_id: "w1:p1" })]);
+      expect(state().marked["w1:p1"]?.ts).not.toBe("3.0");
+      // An empty restored answer still owes a completion notice; losing its
+      // ledger entry would incorrectly classify it as an unawaited turn.
+      const answer = prior === "restored" ? "" : "Q1 answer after cancellation";
+      appendFileSync(path, codexTurn("Q1", answer));
+      mocks.live = { ...mocks.live!, agent_status: "idle" };
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mocks.post.mock.calls.some(([, text]) => text.includes(answer || "✅ Done (no output)."))).toBe(true);
+      expect(pending()).toEqual([]);
+      expect(mocks.react.mock.calls.filter(([, ts, name, on]) => ts === "3.0" && name === "white_check_mark" && on)).toEqual([]);
+    });
+
+    it("retains a newer dispatched debt after paying the old answer during setup", async () => {
+      const path = selectCodex();
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      await ask("Q1", "2.0");
+      const release = pauseStatus();
+      const q2 = ask("Q2", "3.0"); await vi.advanceTimersByTimeAsync(0);
+      appendFileSync(path, codexTurn("Q1", "paid Q1 answer"));
+      await vi.advanceTimersByTimeAsync(300);
+      release(); await q2;
+      mocks.live = { ...mocks.live!, agent_status: "working" };
+      await daemon.stop(); daemon = undefined;
+      expect(pending()).toHaveLength(1);
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      appendFileSync(path, codexTurn("Q2", "recovered Q2 answer"));
+      mocks.live = { ...mocks.live!, agent_status: "idle" };
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mocks.post.mock.calls.filter(([, text]) => text.includes("paid Q1 answer"))).toHaveLength(1);
+      expect(mocks.post.mock.calls.filter(([, text]) => text.includes("recovered Q2 answer"))).toHaveLength(1);
+      expect(pending()).toEqual([]);
+    });
+
+    it("does not let an older suspended post overwrite a newer delivery hash", async () => {
+      const path = selectCodex();
+      // A newer answer may equal the hash from before Q1: value comparison
+      // alone cannot prove that no newer delivery has run (the ABA case).
+      const initial = state(); initial.delivered = { "w1:p1": digest("newest answer") };
+      writeFileSync(join(dir, "state.json"), JSON.stringify(initial));
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      await ask("Q1", "2.0");
+      const release = pauseStatus();
+      const q2 = ask("Q2", "3.0"); await vi.advanceTimersByTimeAsync(0);
+      let finishPost!: (ts: string) => void;
+      mocks.post.mockImplementationOnce(() => new Promise<string>(resolve => { finishPost = resolve; }));
+      appendFileSync(path, codexTurn("Q1", "older answer"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(finishPost).toBeTypeOf("function");
+      release(); await q2;
+      appendFileSync(path, codexTurn("Q2", "newest answer"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(state().delivered["w1:p1"]).toBe(digest("newest answer"));
+      finishPost("older-post-ts"); await vi.advanceTimersByTimeAsync(0);
+      expect(state().delivered["w1:p1"]).toBe(digest("newest answer"));
+      expect(state().last_answer["w1:p1"].ts).toBe("answer-ts");
+      expect(pending()).toEqual([]);
+    });
+  });
 });
