@@ -491,21 +491,24 @@ export async function startSlackDaemon(
     ts: string,
     opts: { replace: boolean } = { replace: true },
   ): Promise<void> => {
-    if (!ts) return;
+    if (!ts || stopping) return;
     const previous = state.marked[paneId];
     if (previous && (previous.ts !== ts || previous.channel !== channel)) {
       // A question still waiting keeps its mark through the pane's own
       // continuations; only a new question takes it over.
       if (!opts.replace) return;
       await bot.client.react(previous.channel, previous.ts, previous.name ?? FALLBACK_WORKING, false);
+      if (stopping) return;
     }
     // The configured emoji, or the one every workspace has when it is not
     // there; which one stuck is remembered so it can be taken off again.
     let name = bot.cfg.markWorking;
     if (!(await bot.client.react(channel, ts, name, true)) && name !== FALLBACK_WORKING) {
+      if (stopping) return;
       name = FALLBACK_WORKING;
       await bot.client.react(channel, ts, name, true);
     }
+    // Record an add already issued so cancellation can remove its reaction.
     state.marked[paneId] = { channel, ts, name };
     persist();
   };
@@ -1205,7 +1208,9 @@ export async function startSlackDaemon(
     text: string,
     messageTs: string,
   ): Promise<void> => {
+    if (stopping) return;
     const paneId = binding.pane_id;
+    const stillWanted = () => !stopping && state.threads[bindingKey(bot.name, thread)] === binding;
     const owner = {};
     turnOwners.set(paneId, owner);
     // Reserve arrival order before any asynchronous Slack setup. Even a setup
@@ -1219,32 +1224,38 @@ export async function startSlackDaemon(
       if (inputDispatches.get(paneId) === dispatch) inputDispatches.delete(paneId);
     });
     startingTurns.set(paneId, (startingTurns.get(paneId) ?? 0) + 1);
+    let sent = false;
     try {
-      // This thread asked; the answer comes back here.
-      state.asked_from[paneId] = bindingKey(bot.name, thread);
-      binding.last_active = Date.now();
-      persist();
-      paneAgentFor(binding);
-      turnStartedAt.set(paneId, Date.now());
-      await bot.client.setStatus(thread, "is working…");
-      await previousDispatch;
-      await markWorking(bot, paneId, thread.channel, messageTs);
-      log.info("turn started", { bot: bot.name, paneId, label: binding.label, thread: threadKey(thread) });
-      if (!pendingTurns.isOpen(paneId)) setupOnlyTurns.add(paneId);
-      pendingTurns.open(paneId);
-      await dismissBlockingDialog(paneId);
-      const framed = await withThreadContext(binding, thread, text, messageTs);
-      let sent = false;
-      if (!stopping && state.threads[bindingKey(bot.name, thread)] === binding) {
-        const agent = paneAgentFor(binding);
-        if (await agent.handleMessage(framed) !== false) {
-          sent = true;
-          deferredResumes.delete(paneId);
-          if (setupOnlyTurns.delete(paneId)) {
-            // Earlier debt was paid (or this entry was only setup). The
-            // newly dispatched question starts its own recovery clock.
-            pendingTurns.close(paneId);
-            pendingTurns.open(paneId);
+      setup: {
+        // This thread asked; the answer comes back here.
+        state.asked_from[paneId] = bindingKey(bot.name, thread);
+        binding.last_active = Date.now();
+        persist();
+        paneAgentFor(binding);
+        turnStartedAt.set(paneId, Date.now());
+        await bot.client.setStatus(thread, "is working…");
+        if (stopping) break setup;
+        await previousDispatch;
+        if (stopping) break setup;
+        await markWorking(bot, paneId, thread.channel, messageTs);
+        if (stopping) break setup;
+        log.info("turn started", { bot: bot.name, paneId, label: binding.label, thread: threadKey(thread) });
+        if (!pendingTurns.isOpen(paneId)) setupOnlyTurns.add(paneId);
+        pendingTurns.open(paneId);
+        await dismissBlockingDialog(paneId);
+        if (stopping) break setup;
+        const framed = await withThreadContext(binding, thread, text, messageTs);
+        if (stillWanted()) {
+          const agent = paneAgentFor(binding);
+          if (await agent.handleMessage(framed, stillWanted) !== false) {
+            sent = true;
+            deferredResumes.delete(paneId);
+            if (setupOnlyTurns.delete(paneId)) {
+              // Earlier debt was paid (or this entry was only setup). The
+              // newly dispatched question starts its own recovery clock.
+              pendingTurns.close(paneId);
+              pendingTurns.open(paneId);
+            }
           }
         }
       }
@@ -1390,6 +1401,8 @@ export async function startSlackDaemon(
           || !(await answerStartupMenu(tab.pane_id))) throw err;
       }
     } catch (err) {
+      // Shutdown cancels startup; it must not destroy the tab we just opened.
+      if (stopping) return;
       const message = err instanceof Error ? err.message : String(err);
       log.error("spawn failed", { bot: bot.name, dir, kind, message });
       if (tab) { try { closeTab(tab.tab_id); } catch { /* it may already be gone */ } }
@@ -1437,18 +1450,22 @@ export async function startSlackDaemon(
    * shows something else, which is then a real failure.
    */
   const answerStartupMenu = async (paneId: string): Promise<boolean> => {
+    if (stopping) return false;
     let screen = "";
     try { screen = readPane(paneId, 40); } catch { return false; }
     const choice = startupMenuChoice(screen);
     if (!choice) return false;
     log.info("spawn: answering a startup menu", { paneId, ...choice });
     for (let i = 0; i < choice.downs; i++) {
+      if (stopping) return false;
       sendKeys(paneId, "Down");
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
+    if (stopping) return false;
     sendKeys(paneId, "Enter");
     for (let attempt = 0; attempt < 60; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (stopping) return false;
       const status = getAgentInfo(paneId)?.agent_status;
       if (status === "idle" || status === "done") return true;
       // One menu can follow another — trust, then a version notice.
@@ -1466,6 +1483,7 @@ export async function startSlackDaemon(
    * answer, so close it (Esc cancels it) before sending anything.
    */
   const dismissBlockingDialog = async (paneId: string): Promise<void> => {
+    if (stopping) return;
     let screen = "";
     try { screen = readPane(paneId, 25); } catch { return; }
     // A menu the bridge knows the answer to — a version notice can appear
@@ -1739,6 +1757,7 @@ export async function startSlackDaemon(
         if (isAside(caption)) { log.info("aside ignored", { thread: threadKey(thread), files: files.length }); return; }
         noteHuman(bot, thread, userId);
         const binding = state.threads[bindingKey(bot.name, thread)] ?? await autoBind(bot, thread, userId);
+        if (stopping) return;
         if (!binding) {
           await client.post(thread, "This thread is not bound to a pane yet. Use !bind <label>.");
           return;
@@ -1751,12 +1770,14 @@ export async function startSlackDaemon(
         const saved: string[] = [];
         const notes: string[] = [];
         for (const file of files) {
+          if (stopping) return;
           if (file.size > MAX_INBOUND_BYTES) {
             notes.push(`⚠️ ${file.name} — larger than the 20 MB receive limit`);
             continue;
           }
           try {
             const bytes = await client.downloadFile(file.urlPrivateDownload);
+            if (stopping) return;
             const target = inboxTarget(cwd, file.name);
             mkdirSync(dirname(target.absolute), { recursive: true });
             writeFileSync(target.absolute, bytes);
@@ -1766,6 +1787,7 @@ export async function startSlackDaemon(
             notes.push(`⚠️ ${file.name} — ${err instanceof Error ? err.message : String(err)}`);
           }
         }
+        if (stopping) return;
         if (notes.length) await client.post(thread, notes.join("\n"));
         if (saved.length === 0) return;
         // A lone audio clip is a voice message however Slack labels it, and it
@@ -1787,6 +1809,7 @@ export async function startSlackDaemon(
           return;
         }
         binding ??= await autoBind(bot, thread, userId, text);
+        if (stopping) return;
         if (!binding) {
           // An unbound thread cannot route a question anywhere; say so rather
           // than guessing a pane.
