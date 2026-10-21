@@ -304,6 +304,87 @@ describe("Slack input cancellation — real observe loops", () => {
   });
 });
 
+describe("Slack context commits — real observe loops", () => {
+  const state = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  const flags = () => state().threads["default|C1:1.0"];
+  const ask = (text: string, ts = "2.0") => mocks.client!.onUserMessage(thread, "U1", text, ts);
+  const inputs = () => vi.mocked(sendText).mock.calls.map(c => c[1]);
+  const history: ThreadMessage[] = [{ author: "User", userId: "U1", text: "earlier thread detail", ts: "1.5" }];
+  function freshContext() {
+    const saved = state();
+    saved.threads["default|C1:1.0"].context_sent = false;
+    saved.threads["default|C1:1.0"].note_version = 0;
+    writeFileSync(join(dir, "state.json"), JSON.stringify(saved));
+    mocks.history.mockResolvedValue(history);
+  }
+
+  it("preserves context through shutdown during history and sends it on retry after restart", async () => {
+    freshContext();
+    let release!: (messages: ThreadMessage[]) => void;
+    mocks.history.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const sending = ask("never dispatched");
+    for (let i = 0; i < 160; i++) await Promise.resolve();
+    expect(release).toBeTypeOf("function");
+    expect(sendText).not.toHaveBeenCalled();
+    await daemon.stop(); release(history); await sending;
+    expect({ context: flags().context_sent, version: flags().note_version }).toEqual({ context: false, version: 0 });
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("retry after restart", "3.0");
+    expect(inputs()).toHaveLength(1);
+    expect(inputs()[0]).toContain("earlier thread detail");
+    expect(inputs()[0]).toContain("Slack bridge:");
+    expect(flags().context_sent).toBe(true);
+  });
+
+  it.each([false, true])("retains context after a failed dispatch for the next input, already queued=%s", async queued => {
+    freshContext();
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    vi.mocked(sendText).mockImplementationOnce(() => { throw new Error("stdin dispatch failed"); });
+    const failed = expect(ask("failed attempt")).rejects.toThrow("stdin dispatch failed");
+    const next = queued ? ask("next attempt", "3.0") : undefined;
+    await failed;
+    if (!queued) {
+      expect({ context: flags().context_sent, version: flags().note_version }).toEqual({ context: false, version: 0 });
+      await ask("next attempt", "3.0");
+    } else await next;
+    expect(inputs()).toHaveLength(2);
+    expect(inputs()[1]).toContain("earlier thread detail");
+    expect(inputs()[1]).toContain("Slack bridge:");
+    expect(flags().context_sent).toBe(true);
+  });
+
+  it("commits a successful input before preparing its queued successor", async () => {
+    freshContext();
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await Promise.all([ask("first"), ask("second", "3.0")]);
+    expect(inputs()).toHaveLength(2);
+    expect(inputs()[0]).toContain("earlier thread detail");
+    expect(inputs()[0]).toContain("Slack bridge:");
+    expect(inputs()[1]).toBe("second");
+    expect(mocks.history).toHaveBeenCalledTimes(1);
+    expect({ context: flags().context_sent, version: flags().note_version }).toEqual({ context: true, version: 3 });
+  });
+
+  it("does not downgrade an already sent newer bridge note", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("bare input");
+    expect(inputs()).toEqual(["bare input"]);
+    expect(flags().note_version).toBe(999);
+    expect(mocks.history).not.toHaveBeenCalled();
+  });
+
+  it("keeps best-effort history-fetch failure behavior after a successful bare send", async () => {
+    freshContext(); mocks.history.mockRejectedValueOnce(new Error("history unavailable"));
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await ask("first"); await ask("second", "3.0");
+    expect(inputs()[0]).toContain("Slack bridge:");
+    expect(inputs()[1]).toBe("second");
+    expect(mocks.history).toHaveBeenCalledTimes(1);
+    expect(flags().context_sent).toBe(true);
+  });
+});
+
 describe("Slack session routing — real observe loops", () => {
   it("preserves last-delta delivery for an ordinary anchored stream-mode question", async () => {
     appendFileSync(join(dir, "config.toml"), 'output_mode = "stream"\n');
