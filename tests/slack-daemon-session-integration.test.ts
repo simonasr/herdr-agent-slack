@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
   client: undefined as SlackClientDeps | undefined,
   clients: new Map<string, SlackClientDeps>(),
   liveByPane: new Map<string, AgentInfo>(),
-  extraPanes: [] as Array<{ pane_id: string; label: string; agent: string; status: string }>,
+  extraPanes: [] as Array<{ pane_id: string; label: string; agent: string; status: string; name?: string; title?: string; cwd?: string }>,
   post: vi.fn(async (_thread: SlackThread, _text: string) => "answer-ts"),
   status: vi.fn(async (_thread: SlackThread, _status: string) => {}),
   react: vi.fn(async (_channel: string, _ts: string, _name: string, _on: boolean) => true),
@@ -132,6 +132,45 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe("Pane discovery", () => {
+  it("distinguishes identical labels in the list, unbound chooser and ambiguous bind reply", async () => {
+    mocks.extraPanes.push(
+      { pane_id: "w2:p1", label: "1", name: "payments-fix", agent: "pi", status: "working", cwd: join(dir, "payments/fix") },
+      { pane_id: "w3:p1", label: "1", name: "payments-review", agent: "claude", status: "idle", cwd: join(dir, "payments/review") },
+    );
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const unbound = { channel: "C1", threadTs: "other" };
+    for (const prompt of ["!panes", "where can I bind?", "!bind 1"]) {
+      mocks.post.mockClear();
+      await mocks.client!.onUserMessage(unbound, "U1", prompt, "2.0");
+      const text = mocks.post.mock.calls.at(-1)![1];
+      expect(text).toContain("*payments-fix* — pi · working");
+      expect(text).toContain("*payments-review* — claude · idle");
+      expect(text).toContain("~/payments/fix");
+      expect(text).toContain("~/payments/review");
+      expect(text).toContain("`!bind w2:p1`");
+      expect(text).toContain("`!bind w3:p1`");
+    }
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain('"1" matches 2 panes');
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("falls back to titles or labels, escapes Slack mentions and only abbreviates the actual home", async () => {
+    mocks.extraPanes.push({
+      pane_id: "w2:p1", label: "1", title: "Fix <@UBAD>\nnext", agent: "pi", status: "blocked", cwd: dir + "-other",
+    }, { pane_id: "w3:p1", label: "home", agent: "pi", status: "done", cwd: dir });
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "!panes", "2.0");
+    const text = mocks.post.mock.calls.at(-1)![1];
+    expect(text).toContain("*Fix &lt;@UBAD&gt; next* — pi · blocked");
+    expect(text).not.toContain("<@UBAD>");
+    expect(text).toContain(dir + "-other");
+    expect(text).toContain("*home* — pi · done\n    ~\n");
+    expect(text).toContain("*project* — pi · working"); // old metadata without a name/title/cwd
+    expect(text).not.toContain("undefined");
+  });
 });
 
 describe("Slack input cancellation — real observe loops", () => {

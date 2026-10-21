@@ -120,6 +120,9 @@ export function parseAgentList(raw: string, tabLabels?: Map<string, string>): Pa
         agent: a.agent ?? "?",
         tab_id: tabId,
         workspace_id: String(a.workspace_id),
+        name: nonemptyString(a.name) ? a.name : undefined,
+        title: nonemptyString(a.terminal_title_stripped) ? a.terminal_title_stripped : undefined,
+        cwd: nonemptyString(a.foreground_cwd) ? a.foreground_cwd : nonemptyString(a.cwd) ? a.cwd : undefined,
         status: String(a.agent_status || "unknown") as PaneInfo["status"],
       };
     });

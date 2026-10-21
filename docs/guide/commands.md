@@ -7,7 +7,7 @@ per turn, and turns you start in the terminal arrive here too.
 | Command | What it does |
 | --- | --- |
 | `!help` | Print this list. |
-| `!panes` | List the panes herdr reports. |
+| `!panes` | List panes with names, agent/status, working directories and copyable bind commands. |
 | `!tracking` | Every thread the bridge is bound in — channel, link, pane — from any thread. |
 | `!bind <label\|pane id>` | Bind this thread to a pane, by label or by id (`!bind w4:p7`). Rebinding moves the thread. |
 | `!spawn [dir] [agent] [-- args]` | Open a pane for this bot and bind it here. See below. |
@@ -19,6 +19,12 @@ per turn, and turns you start in the terminal arrive here too.
 | `# <text>` | In the DM: an aside, left in the thread, never sent to the pane. |
 
 An unrecognised `!word` replies with this list.
+
+Pane lists use the agent's name, falling back to its terminal title or tab
+label when unavailable. These names are for identification, not new binding
+aliases: copy the `!bind <pane id>` command to avoid ambiguous labels such as
+`1`. Existing unique tab labels still work. Working directories are shown when
+herdr reports them, with your home directory shortened to `~`.
 
 A DM thread forwards everything you type in it, so `#` is how you talk
 *about* the work in the same place — "# jangan di-merge dulu ya" stays in
