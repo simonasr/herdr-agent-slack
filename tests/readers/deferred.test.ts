@@ -87,6 +87,7 @@ describe("Codex pane that has no session yet", () => {
       logger,
     });
     expect(reader.kind).toBe("codex-jsonl");
+    expect(reader.session).toBeUndefined();
     expect(reader.read(100)).toBe("");
     // The first prompt: herdr learns the id, and the rollout appears.
     const id = `late-${Date.now()}`;
@@ -97,7 +98,53 @@ describe("Codex pane that has no session yet", () => {
       payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "from rollout" }] },
     }) + "\n");
     session = { kind: "id", id };
+    // Metadata alone does not pin the reader; resolving the on-disk log does.
+    expect(reader.session).toBeUndefined();
     expect(reader.read(100)).toBe("from rollout");
+    expect(reader.session).toEqual({ kind: "id", id });
+    session = { kind: "id", id: "replacement" };
+    expect(reader.read(100)).toBe("from rollout");
+    expect(reader.session).toEqual({ kind: "id", id });
+  });
+
+  it("keeps the immediate screen fallback for a known Codex id with no rollout", () => {
+    const session = { kind: "id" as const, id: "known-before-rollout" };
+    const reader = createAgentOutputReader({
+      paneId: "w1:p1", agentName: "codex", session,
+      resolveSession: () => { throw new Error("a known id must not trigger discovery"); },
+      readPane: () => "screen answer", logger,
+    });
+    expect(reader.kind).toBe("scrape");
+    expect(reader.read(100)).toBe("screen answer");
+    const sessions = join(home, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, `rollout-${session.id}.jsonl`), JSON.stringify({
+      type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "late rollout answer" }] },
+    }) + "\n");
+    expect(reader.kind).toBe("scrape");
+    expect(reader.read(100)).toBe("screen answer");
+  });
+
+  it("exposes the resolved Claude session without following later metadata", () => {
+    let session: AgentSessionRef = undefined;
+    const reader = createAgentOutputReader({
+      paneId: "w1:p1", agentName: "claude", session,
+      resolveSession: () => session, readPane: () => "welcome banner", logger,
+    });
+    expect(reader.session).toBeUndefined();
+    expect(reader.read(100)).toBe("");
+    const project = join(home, ".claude", "projects", "test-project");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "resolved-claude.jsonl"), JSON.stringify({
+      type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "from transcript" }] },
+    }) + "\n");
+    session = { kind: "id", id: "resolved-claude" };
+    expect(reader.session).toBeUndefined();
+    expect(reader.read(100)).toBe("from transcript");
+    expect(reader.session).toEqual(session);
+    session = { kind: "id", id: "replacement" };
+    expect(reader.read(100)).toBe("from transcript");
+    expect(reader.session).toEqual({ kind: "id", id: "resolved-claude" });
   });
 
   it("still scrapes when nobody can ask herdr again", () => {

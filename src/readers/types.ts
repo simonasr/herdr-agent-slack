@@ -8,6 +8,8 @@ export interface CompletedReaderTurn {
 
 export interface AgentOutputReader {
   readonly kind: string;
+  /** The session actually selected by a deferred structured reader, if resolved. */
+  readonly session?: AgentSessionRef;
   read(maxLines: number): string;
   /**
    * The question the agent is answering, or answered last. Only a source

@@ -20,6 +20,10 @@
  * in tests/observe-loop.test.ts so the behaviour parity stays obvious.
  */
 import { describe, it, expect } from "vitest";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { PiJsonlReader } from "../../src/readers/jsonl.js";
 import {
   ObserveLoopController,
   type OutputEvent,
@@ -42,10 +46,12 @@ const noopLogger = {
  * returns the next snapshot from the array, or the last element if
  * exhausted. This models an agent that keeps appending to a pane.
  */
-function makeFakeReader(snapshots: string[]) {
+function makeFakeReader(snapshots: string[], isolateLastAnswer = true) {
   let i = 0;
   const reader: AgentOutputReader & { calls: number; append(extra: string[]): void } = {
     kind: "fake",
+    // Most fallback tests model a reader that can isolate one answer.
+    ...(isolateLastAnswer ? { lastAnswer: () => reader.read(4000) } : {}),
     calls: 0,
     append(extra: string[]) {
       snapshots.push(...extra);
@@ -73,6 +79,7 @@ function makeFakeReader(snapshots: string[]) {
  */
 function makeEnv(opts: {
   snapshots: string[];
+  reader?: AgentOutputReader;
   progressIntervalMs?: number;
   stabilityMs?: number;
   formatWorkingSuffix?: (elapsedMs: number) => string;
@@ -81,10 +88,11 @@ function makeEnv(opts: {
   finalPayload?: "last-delta" | "full-turn";
   completedOutput?: () => string | null | Promise<string | null>;
   maxTurnMs?: number;
+  isolateLastAnswer?: boolean;
 }) {
   const progressIntervalMs = opts.progressIntervalMs ?? 100;
   const stabilityMs = opts.stabilityMs ?? 100;
-  const reader = makeFakeReader(opts.snapshots);
+  const reader = opts.reader ?? makeFakeReader(opts.snapshots, opts.isolateLastAnswer);
   const communicator = new AgentCommunicator(reader, noopLogger);
   const events: OutputEvent[] = [];
   const pending: Array<() => void> = [];
@@ -160,6 +168,89 @@ describe("ObserveLoopController — deadline state", () => {
 
     env.controller.updateDeadline(null);
     expect(env.controller.hasDeadline()).toBe(false);
+  });
+});
+
+describe("ObserveLoopController — cumulative history is not a fallback answer", () => {
+  it.each(["full-turn", "last-delta"] as const)("does not replay history in %s mode", async (finalPayload) => {
+    const env = makeEnv({
+      snapshots: ["old unrelated answer\n\nolder conversation"],
+      isolateLastAnswer: false,
+      finalPayload,
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    expect(env.events.filter(e => e.type === "final")).toEqual([
+      { type: "final", text: "", reason: "idle", source: "snapshot" },
+    ]);
+    expect(env.events.filter(e => e.type === "delta")).toEqual([]);
+  });
+
+  it.each(["full-turn", "last-delta"] as const)("still delivers newly observed cumulative output in %s mode", async finalPayload => {
+    const env = makeEnv({
+      snapshots: ["old unrelated answer", "old unrelated answer\n\nnew reply"],
+      isolateLastAnswer: false,
+      finalPayload,
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    const finals = env.events.filter(e => e.type === "final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text.trim()).toBe("new reply");
+  });
+});
+
+describe("ObserveLoopController — cumulative abort fallback policy", () => {
+  it.each(["full-turn", "last-delta"] as const)("retains observed output on %s abort", async finalPayload => {
+    const env = makeEnv({
+      snapshots: ["history", "history\n\nOBSERVED REPLY"],
+      isolateLastAnswer: false,
+      finalPayload,
+      completedOutput: () => { env.controller.abort(); return null; },
+    });
+    env.controller.markUserInput();
+    const done = env.controller.start();
+    await env.drive();
+    await done;
+    const finals = env.events.filter(e => e.type === "final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ reason: "aborted", source: "delta" });
+    expect(finals[0].text.trim()).toBe("OBSERVED REPLY");
+  });
+
+  it.each([
+    ["pi", "full-turn", false], ["pi", "last-delta", false],
+    ["omp", "full-turn", false], ["omp", "last-delta", false],
+    ["pi", "full-turn", true], ["pi", "last-delta", true],
+    ["omp", "full-turn", true], ["omp", "last-delta", true],
+  ] as const)("does not dump the %s log on %s abort (unread reply: %s)", async (agent, finalPayload, unread) => {
+    const dir = mkdtempSync(join(tmpdir(), "cumulative-abort-"));
+    try {
+      const path = join(dir, "session.jsonl");
+      const message = (text: string) => JSON.stringify({
+        type: "message", message: { role: "assistant", content: [{ type: "text", text }] },
+      }) + "\n";
+      writeFileSync(path, message("OLD HISTORICAL ANSWER"));
+      const env = makeEnv({ snapshots: [], finalPayload, reader: new PiJsonlReader(path, noopLogger, "test", agent) });
+      env.controller.markUserInput();
+      const done = env.controller.start();
+      if (unread) appendFileSync(path, message("UNOBSERVED REPLY"));
+      env.controller.abort();
+      await env.drive();
+      await done;
+      // Deliberate narrow policy: abort retains observed output, but does not
+      // drain unread cumulative output by falling back to the entire history.
+      expect(env.events.filter(e => e.type === "final")).toEqual([
+        { type: "final", text: "", reason: "aborted", source: "snapshot" },
+      ]);
+      expect(env.events.filter(e => e.type === "delta")).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
