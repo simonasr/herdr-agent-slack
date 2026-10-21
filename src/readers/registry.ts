@@ -71,7 +71,7 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
       const session = resolve();
       if (session?.kind !== "id") return null;
       const path = findCodexSessionPath(session.id);
-      return path ? new CodexJsonlReader(path, req.logger, req.paneId) : null;
+      return path ? Object.assign(new CodexJsonlReader(path, req.logger, req.paneId), { session }) : null;
     }, req.logger, req.paneId, new ScrapeReader(req.paneId, req.readPane));
   }
 
@@ -85,7 +85,7 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
       // The transcript itself may still be missing; the reader looks again on
       // every read, so hand it over only once the file is there.
       return findClaudeSessionPath(sessionId)
-        ? new ClaudeJsonlReader(() => findClaudeSessionPath(sessionId), req.logger, req.paneId)
+        ? Object.assign(new ClaudeJsonlReader(() => findClaudeSessionPath(sessionId), req.logger, req.paneId), { session })
         : null;
     }, req.logger, req.paneId, new ScrapeReader(req.paneId, req.readPane));
   }

@@ -268,6 +268,8 @@ export function findClaudeSessionByPrompt(cwd: string | undefined, prompts: Iter
 export interface AgentOutputReader {
   /** Short identifier for logs ("scrape", "jsonl", "opencode-db"). */
   readonly kind: string;
+  /** The session actually selected by a deferred structured reader, if resolved. */
+  readonly session?: AgentSessionRef;
   /**
    * Return the latest output for this pane. Empty string when nothing is
    * available. Implementations MUST NOT throw; runtime read errors MUST
