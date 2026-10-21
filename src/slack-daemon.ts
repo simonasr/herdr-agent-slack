@@ -1898,7 +1898,7 @@ export async function startSlackDaemon(
           const panes = getAgents();
           await client.post(
             thread,
-            `This thread is not bound to a pane yet.\n\n${describePanes(panes)}\n\nUse a !bind command above, or a unique tab label.`,
+            `This thread is not bound to a pane yet.\n\n${describePanes(panes)}\n\nCopy a !bind command above.`,
           );
           return;
         }

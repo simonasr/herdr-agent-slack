@@ -152,6 +152,7 @@ describe("Pane discovery", () => {
       expect(text).toContain("~/payments/review");
       expect(text).toContain("`!bind w2:p1`");
       expect(text).toContain("`!bind w3:p1`");
+      if (prompt === "where can I bind?") expect(text).toContain("Copy a !bind command above.");
     }
     expect(mocks.post.mock.calls.at(-1)![1]).toContain('"1" matches 2 panes');
     expect(sendText).not.toHaveBeenCalled();
