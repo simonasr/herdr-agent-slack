@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   react: vi.fn(async (_channel: string, _ts: string, _name: string, _on: boolean) => true),
   upload: vi.fn(async (_thread: SlackThread, _path: string, _name: string, _title: string) => {}),
   history: vi.fn(async (): Promise<ThreadMessage[]> => []),
+  download: vi.fn(async (_url: string): Promise<Buffer> => Buffer.from("file data")),
   start: vi.fn(async () => {}),
   stop: vi.fn(async () => {}),
 }));
@@ -38,6 +39,10 @@ vi.mock("../src/herdr-client.js", async (original) => ({
   ]),
   readPane: vi.fn(() => mocks.screen),
   sendText: vi.fn(),
+  sendKeys: vi.fn(),
+  createTab: vi.fn(async () => ({ pane_id: "w1:p2", tab_id: "w1:t2" })),
+  startAgent: vi.fn(async () => {}),
+  closeTab: vi.fn(),
 }));
 
 vi.mock("../src/slack-client.js", async (original) => ({
@@ -49,6 +54,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
     }
     mention() { return `<@U_${this.deps.name}>`; }
     threadHistory = mocks.history;
+    downloadFile = mocks.download;
     rename = vi.fn(async () => {});
     start = mocks.start;
     stop = mocks.stop;
@@ -62,7 +68,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
 
 // PaneAgent, ObserveLoopController and the Pi reader are all real here.
 import { startSlackDaemon } from "../src/slack-daemon.js";
-import { getAgentInfoAsync, sendText } from "../src/herdr-client.js";
+import { closeTab, getAgentInfoAsync, sendKeys, sendText, startAgent } from "../src/herdr-client.js";
 import { formatForSlack } from "../src/slack-format.js";
 
 let dir: string;
@@ -96,6 +102,7 @@ beforeEach(() => {
   mocks.status.mockReset().mockResolvedValue(undefined);
   mocks.post.mockReset().mockResolvedValue("answer-ts");
   mocks.history.mockReset().mockResolvedValue([]);
+  mocks.download.mockReset().mockResolvedValue(Buffer.from("file data"));
   mocks.start.mockReset().mockResolvedValue(undefined);
   mocks.stop.mockReset().mockResolvedValue(undefined);
   dir = mkdtempSync(join(tmpdir(), "slack-session-integration-"));
@@ -125,6 +132,176 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe("Slack input cancellation — real observe loops", () => {
+  async function flush() { for (let i = 0; i < 160; i++) await Promise.resolve(); }
+  const pending = () => existsSync(join(dir, "pending-turns.json"))
+    ? JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8")) : [];
+
+  it.each([
+    { cancel: "same-bind", sample: 1 }, { cancel: "same-bind", sample: 2 },
+    { cancel: "shared-unbind", sample: 1 }, { cancel: "last-unbind", sample: 1 },
+    { cancel: "stop", sample: 1 },
+  ])("does not send after $cancel during metadata sample $sample", async ({ cancel, sample }) => {
+    writeFileSync(oldPath, codexTurn("old question", "old answer"));
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex" };
+    if (sample === 2) {
+      writeFileSync(oldPath, JSON.stringify({ type: "message", id: "prior-record", message: {
+        role: "assistant", content: [{ type: "text", text: "old answer" }],
+      } }) + "\n");
+      mocks.live = { ...liveSession(oldPath, "idle"), completion_evidence: {
+        terminal_id: "terminal", endpoint_identity: "endpoint", state_change_seq: 1,
+        completion_seq: 1, screen_detection_skipped: true, launch_pending: false,
+      } };
+    }
+    if (cancel === "shared-unbind") {
+      const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+      state.threads["default|C2:other"] = { ...state.threads["default|C1:1.0"], channel: "C2", thread_ts: "other" };
+      writeFileSync(join(dir, "state.json"), JSON.stringify(state));
+    }
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    let release!: (value: AgentInfo | null) => void;
+    let calls = 0;
+    vi.mocked(getAgentInfoAsync).mockImplementation(async () => {
+      if (++calls === sample) return new Promise(resolve => { release = resolve; });
+      return mocks.live;
+    });
+    const sending = mocks.client!.onUserMessage(thread, "U1", "cancel me", "2.0");
+    await flush();
+    expect(release).toBeTypeOf("function");
+    expect(calls).toBe(sample);
+    expect(sendText).not.toHaveBeenCalled();
+    if (cancel === "same-bind") await mocks.client!.onUserMessage(thread, "U1", "!bind project", "3.0");
+    else if (cancel.includes("unbind")) await mocks.client!.onUserMessage(thread, "U1", "!unbind", "3.0");
+    else await daemon.stop();
+    release(mocks.live);
+    await sending;
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pending()).toEqual([]);
+  });
+
+  it("does not start setup after a held status returns during stop, or replay false debt on restart", async () => {
+    writeFileSync(oldPath, codexTurn("answered question", "OLD_ANSWER_NOT_OWED"));
+    mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex" };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    let release!: () => void;
+    mocks.status.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const sending = mocks.client!.onUserMessage(thread, "U1", "cancel at status", "2.0");
+    await flush();
+    let finishStop!: () => void;
+    mocks.stop.mockImplementationOnce(() => new Promise(resolve => { finishStop = resolve; }));
+    const stopping = daemon.stop(); await flush();
+    expect(finishStop).toBeTypeOf("function");
+    mocks.react.mockClear(); mocks.screen = "Teach auto mode about your environment?";
+    release(); await flush();
+    const effects = { reactions: mocks.react.mock.calls.length, keys: vi.mocked(sendKeys).mock.calls.length, debt: pending() };
+    finishStop(); await stopping; mocks.screen = "";
+    await vi.advanceTimersByTimeAsync(1500); await sending;
+    expect(effects).toEqual({ reactions: 0, keys: 0, debt: [] });
+    mocks.post.mockClear(); daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post.mock.calls.map(c => c[1]).join("\n")).not.toContain("OLD_ANSWER_NOT_OWED");
+  });
+
+  it("does not fetch history after an existing dialog wait returns during stop", async () => {
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    state.threads["default|C1:1.0"].context_sent = false;
+    writeFileSync(join(dir, "state.json"), JSON.stringify(state));
+    mocks.screen = "Teach auto mode about your environment?";
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const sending = mocks.client!.onUserMessage(thread, "U1", "cancel at dialog", "2.0");
+    await flush(); expect(sendKeys).toHaveBeenCalledExactlyOnceWith("w1:p1", "Escape");
+    await daemon.stop(); mocks.screen = "";
+    await vi.advanceTimersByTimeAsync(1500); await sending;
+    expect(mocks.history).not.toHaveBeenCalled();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("does not start prompt setup or another download after a download returns during stop", async () => {
+    mocks.live = { ...mocks.live!, cwd: dir };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    let release!: (bytes: Buffer) => void;
+    mocks.download.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const file = { name: "a.txt", size: 10, urlPrivateDownload: "https://example.invalid/a" };
+    const incoming = mocks.client!.onUserFiles(thread, "U1", "caption", [file, { ...file, name: "b.txt" }], "2.0");
+    await flush(); expect(release).toBeTypeOf("function");
+    await daemon.stop(); mocks.status.mockClear(); mocks.react.mockClear();
+    release(Buffer.from("file data")); await incoming;
+    expect(mocks.download).toHaveBeenCalledTimes(1);
+    expect(mocks.status).not.toHaveBeenCalled();
+    expect(mocks.react).not.toHaveBeenCalled();
+    expect(sendText).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, ".inbox"))).toBe(false);
+  });
+
+  it.each(["remove", "fallback"])("does not start another working reaction after %s returns during stop", async mode => {
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    if (mode === "remove") state.marked = { "w1:p1": { channel: "C1", ts: "old", name: "hourglass_flowing_sand" } };
+    else appendFileSync(join(dir, "config.toml"), 'mark_working = "custom_mark"\n');
+    writeFileSync(join(dir, "state.json"), JSON.stringify(state));
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    let release!: (ok: boolean) => void;
+    mocks.react.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const sending = mocks.client!.onUserMessage(thread, "U1", "cancel at mark", "2.0");
+    await flush(); expect(release).toBeTypeOf("function");
+    await daemon.stop(); release(mode === "remove"); await sending;
+    expect(mocks.react).toHaveBeenCalledTimes(1);
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("removes a working reaction that finishes being added during stop", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    let release!: (ok: boolean) => void;
+    mocks.react.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const sending = mocks.client!.onUserMessage(thread, "U1", "cancel while adding mark", "2.0");
+    await flush(); expect(release).toBeTypeOf("function");
+    await daemon.stop(); release(true); await sending;
+    expect(mocks.react.mock.calls.map(c => [c[1], c[3]])).toEqual([["2.0", true], ["2.0", false]]);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked["w1:p1"]).toBeUndefined();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("removes a canceled follow-up's mark after stop without erasing restored debt", async () => {
+    const debt = [{ pane_id: "w1:p1", started_at: new Date().toISOString() }];
+    writeFileSync(join(dir, "pending-turns.json"), JSON.stringify(debt));
+    mocks.screen = "Teach auto mode about your environment?";
+    let sending!: Promise<void>;
+    mocks.start.mockImplementationOnce(async () => {
+      sending = mocks.client!.onUserMessage(thread, "U1", "cancel at dialog", "2.0");
+      await flush();
+    });
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    expect(sendKeys).toHaveBeenCalledExactlyOnceWith("w1:p1", "Escape");
+    await daemon.stop(); mocks.screen = "";
+    await vi.advanceTimersByTimeAsync(1500); await sending;
+    expect(mocks.react.mock.calls.map(c => [c[1], c[3]])).toEqual([["2.0", true], ["2.0", false]]);
+    expect(pending()).toEqual(debt);
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).marked["w1:p1"]).toBeUndefined();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("does not close a spawned tab when shutdown cancels its startup menu", async () => {
+    mocks.screen = "Update available!\n› 1. Update now\n  2. Skip\n  3. Skip until next version";
+    vi.mocked(startAgent).mockRejectedValueOnce(new Error("blocked during startup"));
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const spawning = mocks.client!.onUserMessage(thread, "U1", `!spawn ${dir} codex`, "2.0");
+    await flush(); expect(sendKeys).toHaveBeenCalledExactlyOnceWith("w1:p2", "Down");
+    await daemon.stop(); await vi.advanceTimersByTimeAsync(1000); await spawning;
+    expect(closeTab).not.toHaveBeenCalled();
+    expect(mocks.post).not.toHaveBeenCalled();
+  });
+
+  it("does not continue a startup menu after stop during its key delay", async () => {
+    mocks.screen = "Update available!\n› 1. Update now\n  2. Skip\n  3. Skip until next version";
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const sending = mocks.client!.onUserMessage(thread, "U1", "cancel at startup menu", "2.0");
+    await flush(); expect(sendKeys).toHaveBeenCalledExactlyOnceWith("w1:p1", "Down");
+    await daemon.stop();
+    await vi.advanceTimersByTimeAsync(1000); await sending;
+    expect(sendKeys).toHaveBeenCalledTimes(1);
+    expect(sendText).not.toHaveBeenCalled();
+  });
 });
 
 describe("Slack session routing — real observe loops", () => {
