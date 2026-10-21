@@ -755,6 +755,10 @@ export class AgentCommunicator {
   get readerKind(): string {
     return this.reader.kind;
   }
+  /** The source actually selected by a deferred reader, not a turn identity. */
+  get readerSession(): AgentSessionRef {
+    return this.reader.session;
+  }
   /** Whether the reader's text is the model's own, needing no pane filters. */
   get verbatim(): boolean {
     return this.reader.verbatim === true;
