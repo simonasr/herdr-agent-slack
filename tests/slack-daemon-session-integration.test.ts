@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   home: "",
   screen: "",
   client: undefined as SlackClientDeps | undefined,
+  clients: new Map<string, SlackClientDeps>(),
+  liveByPane: new Map<string, AgentInfo>(),
   extraPanes: [] as Array<{ pane_id: string; label: string; agent: string; status: string }>,
   post: vi.fn(async (_thread: SlackThread, _text: string) => "answer-ts"),
   status: vi.fn(async () => {}),
@@ -28,8 +30,8 @@ vi.mock("node:os", async (original) => ({
 
 vi.mock("../src/herdr-client.js", async (original) => ({
   ...await original<typeof import("../src/herdr-client.js")>(),
-  getAgentInfo: vi.fn(() => mocks.live),
-  getAgentInfoAsync: vi.fn(async () => mocks.live),
+  getAgentInfo: vi.fn((paneId: string) => mocks.liveByPane.get(paneId) ?? mocks.live),
+  getAgentInfoAsync: vi.fn(async (paneId: string) => mocks.liveByPane.get(paneId) ?? mocks.live),
   getAgents: vi.fn(() => [
     { pane_id: "w1:p1", label: "project", agent: mocks.live?.agent ?? "pi", status: mocks.live?.agent_status ?? "idle" },
     ...mocks.extraPanes,
@@ -41,7 +43,11 @@ vi.mock("../src/herdr-client.js", async (original) => ({
 vi.mock("../src/slack-client.js", async (original) => ({
   ...await original<typeof import("../src/slack-client.js")>(),
   SlackClient: class {
-    constructor(deps: SlackClientDeps) { mocks.client = deps; }
+    constructor(private readonly deps: SlackClientDeps) {
+      mocks.client = deps;
+      mocks.clients.set(deps.name, deps);
+    }
+    mention() { return `<@U_${this.deps.name}>`; }
     threadHistory = mocks.history;
     rename = vi.fn(async () => {});
     start = mocks.start;
@@ -95,6 +101,8 @@ beforeEach(() => {
   mocks.home = dir;
   mocks.screen = "";
   mocks.client = undefined;
+  mocks.clients.clear();
+  mocks.liveByPane.clear();
   mocks.extraPanes.length = 0;
   writeFileSync(join(dir, "config.toml"), '[slack]\nbot_token = "test"\napp_token = "test"\nallowed_user_ids = ["U1"]\nprogress_interval_ms = 100\nstability_window_ms = 100\n');
   writeFileSync(join(dir, "state.json"), JSON.stringify({
@@ -303,6 +311,124 @@ describe("Slack session routing — real observe loops", () => {
     expect(JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"))).toEqual([]);
   });
 
+
+  describe("deferred startup observation", () => {
+    const pending = () => JSON.parse(readFileSync(join(dir, "pending-turns.json"), "utf8"));
+    let incoming: Promise<void>;
+    let release: () => void;
+    let reject: (error: Error) => void;
+    async function startDeferred(agent = "pi") {
+      writeFileSync(join(dir, "pending-turns.json"), JSON.stringify([
+        { pane_id: "w1:p1", started_at: new Date().toISOString() },
+      ]));
+      mocks.live = { ...liveSession(oldPath, "working"), agent };
+      if (agent === "codex") writeFileSync(oldPath, codexTurn("owed question"));
+      mocks.status.mockImplementationOnce(() => new Promise<void>((resolve, fail) => { release = resolve; reject = fail; }));
+      mocks.start.mockImplementationOnce(async () => {
+        incoming = mocks.client!.onUserMessage(thread, "U1", "unsent startup input", "3.0");
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      expect(sendText).not.toHaveBeenCalled();
+      expect(pending()).toHaveLength(1);
+    }
+
+    it.each(["rebind", "failure", "queued"] as const)("resumes owed observation after %s setup cancellation", async mode => {
+      await startDeferred();
+      let queued: Promise<void> | undefined;
+      if (mode === "queued") {
+        queued = mocks.client!.onUserMessage(thread, "U1", "second unsent input", "3.1");
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      if (mode === "failure") {
+        const failed = expect(incoming).rejects.toThrow("Slack setup failed");
+        reject(new Error("Slack setup failed")); await failed;
+      } else {
+        await mocks.client!.onUserMessage(thread, "U1", "!bind project", "4.0");
+        release(); await incoming; await queued;
+      }
+      mocks.post.mockClear();
+      // The busy transition was already consumed at startup. The exiting
+      // reservation must resume it, without waiting for another transition.
+      await vi.advanceTimersByTimeAsync(6000);
+      appendFileSync(oldPath, message("owed startup answer"));
+      mocks.live = liveSession(oldPath, "idle");
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sendText).not.toHaveBeenCalled();
+      expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "owed startup answer");
+      expect(pending()).toEqual([]);
+    });
+
+    it("does not restart deferred observation after shutdown", async () => {
+      await startDeferred();
+      await daemon!.stop(); daemon = undefined;
+      mocks.post.mockClear(); mocks.status.mockClear();
+      release(); await incoming;
+      appendFileSync(oldPath, message("answer after shutdown"));
+      mocks.live = liveSession(oldPath, "idle");
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(mocks.post).not.toHaveBeenCalled();
+      expect(mocks.status.mock.calls.some(([, status]) => status === "is working…")).toBe(false);
+      expect(sendText).not.toHaveBeenCalled();
+      expect(pending()).toHaveLength(1);
+    });
+
+    it.each(["codex", "pi"])("uses safe %s recovery if the pane finishes before setup exits", async agent => {
+      await startDeferred(agent);
+      await mocks.client!.onUserMessage(thread, "U1", "!bind project", "4.0");
+      appendFileSync(oldPath, agent === "codex" ? codexTurn("owed question", "finished while setup waited") : message("finished while setup waited"));
+      mocks.live = { ...mocks.live!, agent_status: "idle" };
+      mocks.post.mockClear(); release(); await incoming;
+      await vi.advanceTimersByTimeAsync(6000);
+      if (agent === "codex") {
+        expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "🕘 Answered while the bridge was down:\n\nfinished while setup waited");
+      } else {
+        // A finished Pi log is cumulative: resuming must not send its history.
+        expect(mocks.post).not.toHaveBeenCalled();
+      }
+      expect(sendText).not.toHaveBeenCalled();
+      expect(pending()).toEqual([]);
+    });
+  });
+
+  describe("handoff source message ownership", () => {
+    it.each([false, true])("retains the original source timestamp, held=%s", async held => {
+      appendFileSync(join(dir, "config.toml"), `max_handoffs = ${held ? 1 : 20}\n\n[slack.other]\nbot_token = "test2"\napp_token = "test2"\nallowed_user_ids = ["U1"]\n`);
+      const targetPath = join(dir, "target.jsonl");
+      writeFileSync(targetPath, message("target history"));
+      mocks.liveByPane.set("w1:p2", { ...liveSession(targetPath, "idle"), pane_id: "w1:p2" });
+      mocks.extraPanes.push({ pane_id: "w1:p2", label: "target", agent: "pi", status: "idle" });
+      const statePath = join(dir, "state.json");
+      const initial = JSON.parse(readFileSync(statePath, "utf8"));
+      initial.threads["other|C1:1.0"] = { ...initial.threads["default|C1:1.0"], bot: "other", pane_id: "w1:p2", label: "target" };
+      writeFileSync(statePath, JSON.stringify(initial));
+      mocks.live = liveSession(oldPath, "idle");
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      const ask = (text: string, ts: string) => mocks.clients.get("default")!.onUserMessage(thread, "U1", text, ts);
+      await ask("Q1", "2.0");
+      let finishPost!: (ts: string) => void;
+      mocks.post.mockImplementationOnce(() => new Promise<string>(resolve => { finishPost = resolve; }));
+      appendFileSync(oldPath, message("old answer\n@other handle Q1" + (held ? "\ninterlude\n@other held Q1 brief" : "")));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(finishPost).toBeTypeOf("function");
+      await ask("Q2", "3.0");
+      mocks.post.mockResolvedValueOnce("q2-answer-ts");
+      appendFileSync(oldPath, message("newer answer"));
+      await vi.advanceTimersByTimeAsync(300);
+      finishPost("q1-handoff-ts"); await vi.advanceTimersByTimeAsync(0);
+      if (held) {
+        expect(mocks.post.mock.calls.some(([, text]) => text.includes("Holding this one"))).toBe(true);
+        await ask("!panes", "4.0"); await vi.advanceTimersByTimeAsync(0);
+      }
+      const recipient = JSON.parse(readFileSync(statePath, "utf8"));
+      expect(recipient.last_answer["w1:p1"].ts).toBe("q2-answer-ts");
+      expect(vi.mocked(sendText).mock.calls.at(-1)![1]).toContain(held ? "held Q1 brief" : "handle Q1");
+      expect(recipient.marked["w1:p2"].ts).toBe("q1-handoff-ts");
+      appendFileSync(targetPath, message("recipient finished"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mocks.react.mock.calls.filter(([, , name, on]) => name === "white_check_mark" && on).at(-1)?.[1]).toBe("q1-handoff-ts");
+    });
+  });
 
   describe("follow-up ownership and debt", () => {
     const state = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));

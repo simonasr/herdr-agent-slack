@@ -63,6 +63,7 @@ vi.mock("../src/pane-agent.js", () => ({
       } };
       mocks.panes.push(this);
     }
+    isLoopActive() { return this.active; }
     noteExternalTurn() {
       if (this.active) return false;
       this.active = true;
