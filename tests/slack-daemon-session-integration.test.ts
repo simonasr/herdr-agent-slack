@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
   liveByPane: new Map<string, AgentInfo>(),
   extraPanes: [] as Array<{ pane_id: string; label: string; agent: string; status: string }>,
   post: vi.fn(async (_thread: SlackThread, _text: string) => "answer-ts"),
-  status: vi.fn(async () => {}),
+  status: vi.fn(async (_thread: SlackThread, _status: string) => {}),
   react: vi.fn(async (_channel: string, _ts: string, _name: string, _on: boolean) => true),
   upload: vi.fn(async (_thread: SlackThread, _path: string, _name: string, _title: string) => {}),
   history: vi.fn(async (): Promise<ThreadMessage[]> => []),
@@ -357,6 +357,31 @@ describe("Slack session routing — real observe loops", () => {
       expect(sendText).not.toHaveBeenCalled();
       expect(mocks.post).toHaveBeenCalledExactlyOnceWith(thread, "owed startup answer");
       expect(pending()).toEqual([]);
+    });
+
+    it("does not recover old history for a setup-only input whose dispatch fails", async () => {
+      writeFileSync(oldPath, codexTurn("old question", "old answer never owed here"));
+      mocks.live = { ...liveSession(oldPath, "idle"), agent: "codex" };
+      const statePath = join(dir, "state.json");
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      state.threads["default|C1:1.0"].context_sent = false;
+      writeFileSync(statePath, JSON.stringify(state));
+      let finishHistory!: (messages: ThreadMessage[]) => void;
+      mocks.history.mockImplementationOnce(() => new Promise<ThreadMessage[]>(resolve => { finishHistory = resolve; }));
+      daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+      const sending = mocks.client!.onUserMessage(thread, "U1", "input that never dispatches", "3.0");
+      await vi.advanceTimersByTimeAsync(0);
+      mocks.live = { ...mocks.live!, agent_status: "working" };
+      await vi.advanceTimersByTimeAsync(5000); // The watcher defers during setup.
+      mocks.live = { ...mocks.live!, agent_status: "idle" };
+      vi.mocked(sendText).mockImplementationOnce(() => { throw new Error("dispatch failed"); });
+      const failed = expect(sending).rejects.toThrow("dispatch failed");
+      finishHistory([]); await failed;
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mocks.post).not.toHaveBeenCalled();
+      // Keep the pre-existing exception bookkeeping policy; this fix must
+      // simply not promote positively unsent debt into immediate recovery.
+      expect(pending()).toHaveLength(1);
     });
 
     it("does not restart deferred observation after shutdown", async () => {
