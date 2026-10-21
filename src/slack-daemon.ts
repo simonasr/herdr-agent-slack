@@ -1175,14 +1175,11 @@ export async function startSlackDaemon(
     thread: SlackThread,
     text: string,
     messageTs: string,
-  ): Promise<string> => {
+  ): Promise<{ text: string; needsNote: boolean; needsHistory: boolean }> => {
     const bot = botOf(binding);
     const needsNote = (binding.note_version ?? 0) < NOTE_VERSION;
     const needsHistory = !binding.context_sent;
-    if (!needsNote && !needsHistory) return text;
-    binding.note_version = NOTE_VERSION;
-    binding.context_sent = true;
-    persist();
+    if (!needsNote && !needsHistory) return { text, needsNote, needsHistory };
     // The pane has to be told what a line starting with @<name> does:
     // nothing else in its world says so.
     const parts: string[] = needsNote ? [bridgeNote(bot)] : [];
@@ -1191,13 +1188,13 @@ export async function startSlackDaemon(
         const context = formatThreadContext(await bot.client.threadHistory(thread, messageTs));
         if (context) {
           parts.push(context);
-          log.info("thread context relayed", { bot: bot.name, paneId: binding.pane_id, thread: threadKey(thread), chars: context.length });
+          log.info("thread context prepared", { bot: bot.name, paneId: binding.pane_id, thread: threadKey(thread), chars: context.length });
         }
       } catch (err) {
         log.warn("could not read the thread's history", { thread: threadKey(thread), message: String(err) });
       }
     }
-    return parts.length ? `${parts.join("\n\n")}\n\n${text}` : text;
+    return { text: parts.length ? `${parts.join("\n\n")}\n\n${text}` : text, needsNote, needsHistory };
   };
 
   /** Hand a prompt to a bound pane and start watching for its answer. */
@@ -1247,8 +1244,13 @@ export async function startSlackDaemon(
         const framed = await withThreadContext(binding, thread, text, messageTs);
         if (stillWanted()) {
           const agent = paneAgentFor(binding);
-          if (await agent.handleMessage(framed, stillWanted) !== false) {
+          if (await agent.handleMessage(framed.text, stillWanted) !== false) {
             sent = true;
+            // Commit only the context prepared for an input actually sent,
+            // before the next queued input can decide what it still needs.
+            if (framed.needsNote) binding.note_version = Math.max(binding.note_version ?? 0, NOTE_VERSION);
+            if (framed.needsHistory) binding.context_sent = true;
+            if (framed.needsNote || framed.needsHistory) persist();
             deferredResumes.delete(paneId);
             if (setupOnlyTurns.delete(paneId)) {
               // Earlier debt was paid (or this entry was only setup). The
