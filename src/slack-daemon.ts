@@ -449,9 +449,12 @@ export async function startSlackDaemon(
   const inputDispatches = new Map<string, Promise<void>>();
   const turnOwners = new Map<string, object>();
   const startingTurns = new Map<string, number>();
+  /** Owed observation deferred while Slack owns an input's setup. */
+  const deferredResumes = new Set<string>();
   /** Questions definitely not dispatched; restored entries remain owed. */
   const setupOnlyTurns = new Set<string>();
   const closePendingTurn = (paneId: string): void => {
+    deferredResumes.delete(paneId);
     setupOnlyTurns.delete(paneId);
     pendingTurns.close(paneId);
   };
@@ -472,7 +475,7 @@ export async function startSlackDaemon(
    * person speaks in the thread, so nothing is lost to the brake, only
    * delayed until somebody has looked.
    */
-  const heldHandoffs = new Map<string, { from: Bot; handoff: Handoff; fromPane?: string }>();
+  const heldHandoffs = new Map<string, { from: Bot; handoff: Handoff; messageTs: string }>();
   /** When each pane's current turn began, for the status line's clock. */
   const turnStartedAt = new Map<string, number>();
   /**
@@ -719,7 +722,7 @@ export async function startSlackDaemon(
     for (const handoff of handoffs) {
       if (!nextOperation()) return;
       beginOperation();
-      await handOff(bot, thread, handoff, paneId).catch((err) =>
+      await handOff(bot, thread, handoff, lastTs).catch((err) =>
         log.error("handoff failed", { from: bot.name, to: handoff.bot, message: String(err) }),
       );
     }
@@ -733,7 +736,7 @@ export async function startSlackDaemon(
    * until a person speaks, because two agents can hand work to each other
    * forever.
    */
-  const handOff = async (from: Bot, thread: SlackThread, handoff: Handoff, handoffFromPane?: string): Promise<void> => {
+  const handOff = async (from: Bot, thread: SlackThread, handoff: Handoff, messageTs: string): Promise<void> => {
     const to = bots.get(handoff.bot);
     if (!to) return;
     const key = threadKey(thread);
@@ -763,7 +766,7 @@ export async function startSlackDaemon(
     if (limit > 0 && count > limit) {
       log.warn("handoff limit reached; holding it", { thread: key, from: from.name, to: to.name, count });
       const first = !heldHandoffs.has(key);
-      heldHandoffs.set(key, { from, handoff, fromPane: handoffFromPane });
+      heldHandoffs.set(key, { from, handoff, messageTs });
       if (first) {
         await from.client.post(
           thread,
@@ -795,7 +798,7 @@ export async function startSlackDaemon(
       `[Handoff from ${from.name} in this Slack thread. To answer ${from.name}, start a line with @${from.name}.]\n\n` +
       prompt.join("\n");
     // The sender's message is what this turn answers: it carries the mark.
-    await startTurn(to, binding, thread, framed, state.last_answer[handoffFromPane ?? ""]?.ts ?? "");
+    await startTurn(to, binding, thread, framed, messageTs);
   };
 
   /**
@@ -934,7 +937,10 @@ export async function startSlackDaemon(
 
   const adoptExternalTurn = (paneId: string): boolean => {
     // Slack owns setup until handleMessage starts observation with its prompt.
-    if (startingTurns.has(paneId)) return false;
+    if (startingTurns.has(paneId)) {
+      if (pendingTurns.isOpen(paneId)) deferredResumes.add(paneId);
+      return false;
+    }
     const binding = bindingForPane(paneId);
     if (!binding) return false;
     const agent = paneAgentFor(binding);
@@ -1219,6 +1225,7 @@ export async function startSlackDaemon(
         const agent = paneAgentFor(binding);
         if (await agent.handleMessage(framed) !== false) {
           sent = true;
+          deferredResumes.delete(paneId);
           setupOnlyTurns.delete(paneId);
         }
       }
@@ -1243,6 +1250,12 @@ export async function startSlackDaemon(
       if (remaining > 0) startingTurns.set(paneId, remaining);
       else startingTurns.delete(paneId);
       releaseDispatch();
+      if (remaining === 0 && deferredResumes.delete(paneId) && !stopping
+        && pendingTurns.isOpen(paneId) && !agents.get(paneId)?.isLoopActive()) {
+        void resumePendingTurns(paneId).catch((err) =>
+          log.error("resuming a deferred turn failed", { paneId, message: String(err) }),
+        );
+      }
     }
   };
 
@@ -1669,7 +1682,7 @@ export async function startSlackDaemon(
     if (held) {
       heldHandoffs.delete(key);
       log.info("releasing a held handoff", { thread: key, from: held.from.name, to: held.handoff.bot });
-      void handOff(held.from, thread, held.handoff, held.fromPane).catch((err) =>
+      void handOff(held.from, thread, held.handoff, held.messageTs).catch((err) =>
         log.error("held handoff failed", { from: held.from.name, to: held.handoff.bot, message: String(err) }),
       );
     }
@@ -1777,8 +1790,9 @@ export async function startSlackDaemon(
    * adopt a pane that is already working. These panes are the exception —
    * somebody asked in a thread and is still waiting.
    */
-  const resumePendingTurns = async (): Promise<void> => {
-    const owed = pendingTurns.resumable(cfg.maxTotalWaitS * 1000);
+  const resumePendingTurns = async (onlyPane?: string): Promise<void> => {
+    const owed = pendingTurns.resumable(cfg.maxTotalWaitS * 1000)
+      .filter(paneId => onlyPane === undefined || paneId === onlyPane);
     if (owed.length === 0) return;
     let panes: PaneInfo[];
     try {
@@ -1791,8 +1805,12 @@ export async function startSlackDaemon(
     for (const paneId of owed) {
       const binding = bindingForPane(paneId);
       const pane = byId.get(paneId);
-      if (startingTurns.has(paneId)) continue;
+      if (startingTurns.has(paneId)) {
+        deferredResumes.add(paneId);
+        continue;
+      }
       if (!binding || !pane) { closePendingTurn(paneId); continue; }
+      if (agents.get(paneId)?.isLoopActive()) continue;
       setupOnlyTurns.delete(paneId);
       if (pane.status === "working") {
         paneAgentFor(binding).noteExternalTurn();
