@@ -90,6 +90,28 @@ describe("parseAgentList", () => {
     expect(agents[0].agent).toBe("pi");
   });
 
+  it("retains display metadata without changing the binding label", () => {
+    const raw = JSON.stringify({ result: { agents: [{
+      pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "working",
+      name: "payments-fix", cwd: "/repo", foreground_cwd: "/repo/worktree",
+      terminal_title_stripped: "Fix payments", terminal_title: "\u001b[1mFix payments",
+    }] } });
+    expect(parseAgentList(raw, new Map([["w1:t1", "1"]]))[0]).toMatchObject({
+      label: "1", name: "payments-fix", cwd: "/repo/worktree", title: "Fix payments", status: "working",
+    });
+  });
+
+  it("uses the launch cwd when foreground metadata is missing and ignores blank display names", () => {
+    const raw = JSON.stringify({ result: { agents: [{
+      pane_id: "w1:p1", tab_id: "w1:t1", agent: "pi", cwd: "/repo", foreground_cwd: "",
+      name: "  ", terminal_title_stripped: null,
+    }] } });
+    const pane = parseAgentList(raw, new Map([["w1:t1", "project"]]))[0];
+    expect(pane).toMatchObject({ label: "project", cwd: "/repo" });
+    expect(pane.name).toBeUndefined();
+    expect(pane.title).toBeUndefined();
+  });
+
   it("returns empty array for invalid JSON", () => {
     expect(parseAgentList("{ invalid }")).toEqual([]);
   });

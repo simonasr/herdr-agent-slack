@@ -4,6 +4,10 @@ export interface PaneInfo {
   agent: string;
   tab_id: string;
   workspace_id: string;
+  /** Display metadata only; binding still uses label or pane_id. */
+  name?: string;
+  title?: string;
+  cwd?: string;
   /**
    * herdr's `agent_status`, verbatim.
    *

@@ -25,7 +25,7 @@ import { basename, dirname, join } from "node:path";
 import { loadConfig, type Config, type SlackBotConfig } from "./config.js";
 import { createLogger, type Logger } from "./logger.js";
 import { SlackClient, isDirectMessage, type SlackThread, type ThreadMessage } from "./slack-client.js";
-import { formatForSlack } from "./slack-format.js";
+import { escapeMrkdwn, formatForSlack } from "./slack-format.js";
 import { cleanPaneDelta, cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { createAgentCommunicator, findClaudeSessionByPrompt } from "./agent-sessions.js";
 import { closeTab, createTab, getAgents, getAgentInfo, getAgentInfoAsync, readPane, renameAgent, renameTab, sendKeys, startAgent } from "./herdr-client.js";
@@ -1898,7 +1898,7 @@ export async function startSlackDaemon(
           const panes = getAgents();
           await client.post(
             thread,
-            `This thread is not bound to a pane yet.\n\n${describePanes(panes)}\n\nUse !bind <label>.`,
+            `This thread is not bound to a pane yet.\n\n${describePanes(panes)}\n\nCopy a !bind command above.`,
           );
           return;
         }
@@ -2117,7 +2117,18 @@ export async function startSlackDaemon(
 }
 
 function describePanes(panes: PaneInfo[]): string {
-  return panes.map((pane) => `  • ${pane.label} (${pane.agent}, ${pane.pane_id})`).join("\n");
+  const home = homedir();
+  const text = (value: string) => escapeMrkdwn(value.replace(/\s+/g, " ").trim());
+  return panes.map((pane) => {
+    const name = pane.name || pane.title || pane.label;
+    const cwd = pane.cwd === home ? "~"
+      : pane.cwd?.startsWith(home + "/") ? "~" + pane.cwd.slice(home.length) : pane.cwd;
+    return [
+      `  • *${text(name)}* — ${text(pane.agent)} · ${text(pane.status)}`,
+      ...(cwd ? [`    ${text(cwd)}`] : []),
+      `    \`!bind ${text(pane.pane_id)}\``,
+    ].join("\n");
+  }).join("\n\n");
 }
 
 /** Separate from the Telegram daemon's, so both can run on one machine. */
