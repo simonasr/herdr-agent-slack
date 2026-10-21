@@ -876,6 +876,51 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+describe("PaneAgent — input validity at dispatch", () => {
+  it("rechecks the caller after an earlier ceiling decision", async () => {
+    const held = deferred<AgentInfo | null>();
+    const e = completionEnv({ capture: false, maxTotalWaitS: 1, metadata: (info, call) => call === 2 ? held.promise : info });
+    await e.agent.handleMessage("first");
+    await e.tick();
+    expect(e.metadataCalls()).toBe(2);
+    let wanted = true;
+    const canceled = e.agent.handleMessage("cancel", () => wanted);
+    await flushMicrotasks();
+    expect(e.sent()).toBe(1);
+    wanted = false; held.resolve(e.getInfo());
+    expect(await canceled).toBe(false);
+    expect(e.sent()).toBe(1);
+    e.agent.dispose();
+  });
+
+  it("checks the caller even without completion metadata", async () => {
+    const e = makeEnv({ snapshots: [""] });
+    const send = vi.spyOn(e.comm, "sendInput");
+    expect(await e.agent.handleMessage("cancel", () => false)).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(await e.agent.handleMessage("valid", () => true)).toBe(true);
+    expect(send).toHaveBeenCalledExactlyOnceWith("valid");
+    e.agent.dispose();
+  });
+
+  it.each([1, 2])("rechecks validity after metadata sample %s and keeps later input runnable", async sample => {
+    const held = deferred<AgentInfo | null>();
+    const e = completionEnv({ metadata: (info, call) => call === sample ? held.promise : info });
+    let wanted = true;
+    const canceled = e.agent.handleMessage("cancel", () => wanted);
+    await flushMicrotasks();
+    expect(e.metadataCalls()).toBe(sample);
+    expect(e.sent()).toBe(0);
+    wanted = false;
+    const next = e.agent.handleMessage("next", () => true);
+    held.resolve(e.getInfo());
+    expect(await canceled).toBe(false);
+    expect(await next).toBe(true);
+    expect(vi.mocked(e.comm.sendInput).mock.calls.map(([text]) => text)).toEqual(["next"]);
+    e.agent.dispose();
+  });
+});
+
 describe("PaneAgent — asynchronous metadata and turn ownership", () => {
   it("delivers both answers when a new input arrives during the ceiling decision", async () => {
     const ceiling = deferred<AgentInfo | null>();
