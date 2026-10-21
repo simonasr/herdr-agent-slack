@@ -445,6 +445,8 @@ export async function startSlackDaemon(
 
   const agents = new Map<string, PaneAgent>();
   let stopping = false;
+  /** Started answer text must drain before its Slack client is stopped. */
+  const textBatches = new Set<Promise<void>>();
   /** A reservation exists before the first asynchronous setup step. */
   const inputDispatches = new Map<string, Promise<void>>();
   const turnOwners = new Map<string, object>();
@@ -561,9 +563,11 @@ export async function startSlackDaemon(
   };
 
   // A later asker does not retire a dispatched answer's captured binding.
-  const bindingLive = (binding: ThreadBinding, owner: PaneAgent): boolean =>
-    !stopping && agents.get(binding.pane_id) === owner &&
+  const bindingAttached = (binding: ThreadBinding, owner: PaneAgent): boolean =>
+    agents.get(binding.pane_id) === owner &&
     state.threads[bindingKey(binding.bot, { channel: binding.channel, threadTs: binding.thread_ts })] === binding;
+  const bindingLive = (binding: ThreadBinding, owner: PaneAgent): boolean =>
+    !stopping && bindingAttached(binding, owner);
   const localOwner = (binding: ThreadBinding, owner: PaneAgent): boolean =>
     bindingLive(binding, owner) && bindingForPane(binding.pane_id) === binding;
   /** Deliver a finished turn into the thread it belongs to. */
@@ -697,10 +701,20 @@ export async function startSlackDaemon(
     const quoted = asked && !alreadyShown ? `${quoteForSlack(asked)}\n\n` : "";
     const prefix = note + quoted + (event.reason === "aborted" ? "🛑 Stopped.\n\n" : "");
     let lastTs = "";
-    for (const [index, message] of messages.entries()) {
-      if (index > 0 && !nextOperation()) return;
-      beginOperation(true);
-      lastTs = await bot.client.post(thread, (index === 0 ? prefix : "") + message.text) || lastTs;
+    let finishText!: () => void;
+    const textDone = new Promise<void>(resolve => { finishText = resolve; });
+    textBatches.add(textDone);
+    try {
+      for (const [index, message] of messages.entries()) {
+        // Shutdown drains started text, but an actual binding/owner loss
+        // still stops it. Later side effects keep their normal stop guard.
+        if (index > 0 && !bindingAttached(binding, owner)) return;
+        beginOperation(true);
+        lastTs = await bot.client.post(thread, (index === 0 ? prefix : "") + message.text) || lastTs;
+      }
+    } finally {
+      textBatches.delete(textDone);
+      finishText();
     }
     if (messages.length > 0 && isCurrent()) {
       if (lastTs) state.last_answer[paneId] = { channel: thread.channel, ts: lastTs };
@@ -1226,7 +1240,12 @@ export async function startSlackDaemon(
         if (await agent.handleMessage(framed) !== false) {
           sent = true;
           deferredResumes.delete(paneId);
-          setupOnlyTurns.delete(paneId);
+          if (setupOnlyTurns.delete(paneId)) {
+            // Earlier debt was paid (or this entry was only setup). The
+            // newly dispatched question starts its own recovery clock.
+            pendingTurns.close(paneId);
+            pendingTurns.open(paneId);
+          }
         }
       }
       // An unsent question can abandon only positively setup-only debt, not
@@ -1714,6 +1733,7 @@ export async function startSlackDaemon(
        * the agent is told the path, so reading it becomes an ordinary tool call.
        */
       onUserFiles: async (thread, userId, caption, files, messageTs) => {
+        if (stopping) return;
         log.info("slack files", { bot: bot.name, userId, thread: threadKey(thread), count: files.length });
         if (!isAllowed(bot, userId)) { log.warn("files from unauthorized user", { bot: bot.name, userId }); return; }
         if (isAside(caption)) { log.info("aside ignored", { thread: threadKey(thread), files: files.length }); return; }
@@ -1756,6 +1776,7 @@ export async function startSlackDaemon(
         await startTurn(bot, binding, thread, described, messageTs);
       },
       onUserMessage: async (thread, userId, text, messageTs) => {
+        if (stopping) return;
         log.info("slack message", { bot: bot.name, userId, thread: threadKey(thread), text: text.slice(0, 80) });
         if (!isAllowed(bot, userId)) { log.warn("message from unauthorized user", { bot: bot.name, userId }); return; }
         if (isAside(text)) { log.info("aside ignored", { thread: threadKey(thread) }); return; }
@@ -1983,6 +2004,7 @@ export async function startSlackDaemon(
       clearInterval(idleSweep);
       paneWatcher.stop();
       for (const agent of agents.values()) agent.dispose();
+      await Promise.all(textBatches);
       agents.clear();
       for (const bot of bots.values()) await bot.client.stop();
     },
