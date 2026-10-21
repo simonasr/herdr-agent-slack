@@ -1251,7 +1251,7 @@ export async function startSlackDaemon(
       else startingTurns.delete(paneId);
       releaseDispatch();
       if (remaining === 0 && deferredResumes.delete(paneId) && !stopping
-        && pendingTurns.isOpen(paneId) && !agents.get(paneId)?.isLoopActive()) {
+        && pendingTurns.isOpen(paneId) && !setupOnlyTurns.has(paneId) && !agents.get(paneId)?.isLoopActive()) {
         void resumePendingTurns(paneId).catch((err) =>
           log.error("resuming a deferred turn failed", { paneId, message: String(err) }),
         );
