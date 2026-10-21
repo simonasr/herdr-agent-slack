@@ -10,6 +10,22 @@ All agents share the same turn pipeline: one `PaneAgent` per Herdr pane, one `Ag
 | Pi / OMP | Herdr-provided JSONL session path | Cumulative assistant text from JSONL. |
 | Other agents | Screen scraping fallback | Used only when no structured source is validated. |
 
+## Session changes
+
+The bridge retires a reader when a metadata lookup observes a different agent
+or a different known session of the same reference kind. Missing metadata and
+path/id aliases alone are not proof of replacement. Checks run before input
+and on observation polls, not between every Slack operation.
+
+An input being prepared when the change is detected is canceled with a retry
+notice, including the first question after an idle session change. Send it
+again to use the new reader. The bridge does not resend input or reconstruct
+an unfinished answer from another session; check the terminal first.
+
+Already-started answer text finishes posting before the reader is replaced.
+Files and handoffs not yet started are skipped. A terminal turn already running
+in the replacement session may not be relayed automatically.
+
 ## Verbatim sources
 
 A screen carries TUI chrome — spinner lines, tool summaries, the prompt row —
