@@ -22,11 +22,14 @@
  *     sees every message in every channel it belongs to, and answering what
  *     was not said to it would be noise.
  */
-import bolt from "@slack/bolt";
+import bolt, { type BlockButtonAction, type types } from "@slack/bolt";
 import { createReadStream } from "node:fs";
 import type { Logger } from "./logger.js";
 
 const { App, Assistant, LogLevel } = bolt;
+
+export const BIND_PANE_ACTION = "herdr_bind_pane";
+export type SlackBlock = types.KnownBlock;
 
 /** A thread's address: Slack needs both halves to act on one. */
 export interface SlackThread {
@@ -44,6 +47,8 @@ export interface SlackClientDeps {
   onThreadStarted: (thread: SlackThread, userId: string) => Promise<void>;
   /** A user sent a message in a thread. `messageTs` is the message's own id. */
   onUserMessage: (thread: SlackThread, userId: string, text: string, messageTs: string) => Promise<void>;
+  /** A person clicked Bind in a pane listing. Value identifies the listed session. */
+  onBindPane: (thread: SlackThread, userId: string, value: string) => Promise<void>;
   /** A user shared one or more files in a thread. */
   onUserFiles: (
     thread: SlackThread,
@@ -132,6 +137,19 @@ export class SlackClient {
     });
     this.app.assistant(assistant);
 
+    this.app.action<BlockButtonAction>(BIND_PANE_ACTION, async ({ ack, body, action }) => {
+      // Acknowledge before any Herdr or Slack work: actions have a short deadline.
+      await ack();
+      if (!body.channel?.id || !body.message?.ts || !body.user.id || !action.value) return;
+      if (this.deps.isOwnBot(body.user.id)) return;
+      const thread = {
+        channel: body.channel.id,
+        // Never trust a thread address embedded in the button value.
+        threadTs: body.message.thread_ts ?? body.message.ts,
+      };
+      await this.deps.onBindPane(thread, body.user.id, action.value);
+    });
+
     // Messages typed into the DM itself, and channel messages that name this
     // app. Everything else in a channel is ignored — this listener sees every
     // message in every channel the app belongs to. One listener rather than
@@ -219,14 +237,20 @@ export class SlackClient {
   }
 
   /** Post one message into a thread. Returns the message's ts, or "" if Slack gave none. */
-  async post(thread: SlackThread, text: string): Promise<string> {
-    const result = await this.app.client.chat.postMessage({
-      channel: thread.channel,
-      thread_ts: thread.threadTs,
-      text,
-      mrkdwn: true,
-    });
-    return (result.ts as string | undefined) ?? "";
+  async post(thread: SlackThread, text: string, blocks?: SlackBlock[]): Promise<string> {
+    const message = { channel: thread.channel, thread_ts: thread.threadTs, text, mrkdwn: true };
+    try {
+      const result = await this.app.client.chat.postMessage({ ...message, ...(blocks ? { blocks } : {}) });
+      return result.ts ?? "";
+    } catch (err) {
+      // Retry only an explicit rejection: a network timeout may have posted
+      // successfully, and retrying that would duplicate the listing.
+      const code = (err as { data?: { error?: string } } | null)?.data?.error;
+      if (!blocks || !["invalid_blocks", "invalid_blocks_format", "invalid_arguments"].includes(code ?? "")) throw err;
+      this.logger.warn("pane listing blocks failed; retrying as text", { message: describe(err) });
+      const result = await this.app.client.chat.postMessage(message);
+      return result.ts ?? "";
+    }
   }
 
   /**

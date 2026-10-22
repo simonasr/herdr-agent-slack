@@ -73,6 +73,10 @@ an **App-Level Token** with `connections:write` (`xapp-…`). It runs on Socket
 Mode, so nothing is exposed; the daemon dials out. Invite the app to every
 channel it should answer in.
 
+For an existing app, enable **Interactivity & Shortcuts → Interactivity** (or
+apply the updated manifest) to receive Bind button clicks over Socket Mode.
+No request URL or additional OAuth scopes are needed.
+
 An app installed from an older manifest is told at startup which scopes it is
 missing and what each one costs. Changing an app's scopes or events needs a
 daemon restart.
@@ -123,7 +127,7 @@ the DM):
 
 | | |
 |---|---|
-| `!panes` | the panes herdr reports |
+| `!panes` | the panes herdr reports, with inline Bind buttons |
 | `!bind <label\|pane id>` | bind this thread to a pane |
 | `!spawn [dir] [agent] [-- args]` | open a pane for this bot here and bind it |
 | `!close` | unbind, and close the tab `!spawn` opened |

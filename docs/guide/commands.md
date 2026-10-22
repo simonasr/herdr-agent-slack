@@ -7,7 +7,7 @@ per turn, and turns you start in the terminal arrive here too.
 | Command | What it does |
 | --- | --- |
 | `!help` | Print this list. |
-| `!panes` | List panes with names, agent/status, working directories and copyable bind commands. |
+| `!panes` | List panes with names, agent/status, working directories, Bind buttons and copyable bind commands. |
 | `!tracking` | Every thread the bridge is bound in — channel, link, pane — from any thread. |
 | `!bind <label\|pane id>` | Bind this thread to a pane, by label or by id (`!bind w4:p7`). Rebinding moves the thread. |
 | `!spawn [dir] [agent] [-- args]` | Open a pane for this bot and bind it here. See below. |
@@ -22,8 +22,19 @@ An unrecognised `!word` replies with this list.
 
 Pane lists use the agent's name, falling back to its terminal title or tab
 label when unavailable. These names are for identification, not new binding
-aliases: copy the `!bind <pane id>` command to avoid ambiguous labels such as
-`1`. Existing unique tab labels still work. Working directories are shown when
+aliases: click **Bind** beside the pane or copy its `!bind <pane id>` command
+to avoid ambiguous labels such as `1`. The button binds the thread containing
+the list, using the bot that posted it and the same `allowed_user_ids` policy
+as commands. It does not send a prompt. Rebinding moves that bot's binding.
+
+Buttons recheck the listed session before binding. If it changed or disappeared,
+ask for `!panes` again. Panes without a verifiable session reference remain
+text-only; use their bind command. Long lists are split across messages, and
+text commands remain available if Slack cannot render the buttons. Existing
+apps must enable **Interactivity** in Slack's **Interactivity & Shortcuts**
+settings (the supplied manifest now enables it); no new OAuth scopes are needed.
+
+Existing unique tab labels still work. Working directories are shown when
 herdr reports them, with your home directory shortened to `~`.
 
 A DM thread forwards everything you type in it, so `#` is how you talk

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import type { AgentInfo } from "../src/herdr-client.js";
-import type { SlackClientDeps, SlackThread, ThreadMessage } from "../src/slack-client.js";
+import type { SlackBlock, SlackClientDeps, SlackThread, ThreadMessage } from "../src/slack-client.js";
 
 const mocks = vi.hoisted(() => ({
   live: null as AgentInfo | null,
@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
   clients: new Map<string, SlackClientDeps>(),
   liveByPane: new Map<string, AgentInfo>(),
   extraPanes: [] as Array<{ pane_id: string; label: string; agent: string; status: string; name?: string; title?: string; cwd?: string }>,
-  post: vi.fn(async (_thread: SlackThread, _text: string) => "answer-ts"),
+  post: vi.fn(async (_thread: SlackThread, _text: string, _blocks?: SlackBlock[]) => "answer-ts"),
   status: vi.fn(async (_thread: SlackThread, _status: string) => {}),
   react: vi.fn(async (_channel: string, _ts: string, _name: string, _on: boolean) => true),
   upload: vi.fn(async (_thread: SlackThread, _path: string, _name: string, _title: string) => {}),
@@ -68,7 +68,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
 
 // PaneAgent, ObserveLoopController and the Pi reader are all real here.
 import { startSlackDaemon } from "../src/slack-daemon.js";
-import { closeTab, getAgentInfoAsync, sendKeys, sendText, startAgent } from "../src/herdr-client.js";
+import { closeTab, getAgentInfo, getAgentInfoAsync, getAgents, sendKeys, sendText, startAgent } from "../src/herdr-client.js";
 import { formatForSlack } from "../src/slack-format.js";
 
 let dir: string;
@@ -152,7 +152,7 @@ describe("Pane discovery", () => {
       expect(text).toContain("~/payments/review");
       expect(text).toContain("`!bind w2:p1`");
       expect(text).toContain("`!bind w3:p1`");
-      if (prompt === "where can I bind?") expect(text).toContain("Copy a !bind command above.");
+      if (prompt === "where can I bind?") expect(text).toContain("Click Bind or copy a !bind command below.");
     }
     expect(mocks.post.mock.calls.at(-1)![1]).toContain('"1" matches 2 panes');
     expect(sendText).not.toHaveBeenCalled();
@@ -171,6 +171,160 @@ describe("Pane discovery", () => {
     expect(text).toContain("*home* — pi · done\n    ~\n");
     expect(text).toContain("*project* — pi · working"); // old metadata without a name/title/cwd
     expect(text).not.toContain("undefined");
+  });
+});
+
+describe("Bind buttons — daemon wiring", () => {
+  const unbound = { channel: "C1", threadTs: "other" };
+  const state = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  const button = (row = 1, post = 0) => {
+    const block = mocks.post.mock.calls[post][2]![row];
+    if (block.type !== "section" || block.accessory?.type !== "button") throw new Error("expected Bind button");
+    expect(block.accessory.text.text).toBe("Bind");
+    return block.accessory.value!;
+  };
+
+  async function list(prompt = "!panes") {
+    mocks.post.mockClear();
+    await mocks.client!.onUserMessage(unbound, "U1", prompt, "2.0");
+    return button();
+  }
+
+  it.each(["!panes", "!bind", "!bind missing", "where can I bind?"])("offers a Bind button from %s and binds without sending a prompt", async prompt => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const value = await list(prompt);
+    expect(state().threads["default|C1:other"]).toBeUndefined();
+    await mocks.client!.onBindPane(unbound, "U1", value);
+    expect(state().threads["default|C1:other"]).toMatchObject({
+      pane_id: "w1:p1", bot: "default", channel: "C1", thread_ts: "other", context_sent: false,
+    });
+    expect(state().last_user["C1:other"]).toBe("U1");
+    expect(mocks.post).toHaveBeenLastCalledWith(unbound, expect.stringContaining("Roger"));
+    expect(sendText).not.toHaveBeenCalled();
+    expect(startAgent).not.toHaveBeenCalled();
+  });
+
+  it("uses exact pane ids for identical labels and rebinds an existing thread", async () => {
+    mocks.extraPanes.push({ pane_id: "w2:p1", label: "project", agent: "pi", status: "idle" });
+    mocks.liveByPane.set("w2:p1", { ...liveSession("/target.jsonl", "idle"), pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2" });
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await list("!bind project");
+    expect(mocks.post.mock.calls[0][1]).toContain('"project" matches 2 panes');
+    await mocks.client!.onBindPane(thread, "U1", button(2));
+    expect(state().threads["default|C1:1.0"].pane_id).toBe("w2:p1");
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it.each(["session", "agent", "tab", "gone", "unknown"])("rejects a stale %s target without changing the current binding", async change => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const value = await list();
+    const before = state().threads;
+    if (change === "session") mocks.live = liveSession("/replacement.jsonl");
+    if (change === "agent") mocks.live = { ...mocks.live!, agent: "claude" };
+    if (change === "tab") mocks.live = { ...mocks.live!, tab_id: "other-tab" };
+    if (change === "gone") vi.mocked(getAgents).mockReturnValueOnce([]);
+    if (change === "unknown") vi.mocked(getAgentInfo).mockReturnValueOnce(null);
+    await mocks.client!.onBindPane(thread, "U1", value);
+    expect(state().threads).toEqual(before);
+    expect(mocks.post).toHaveBeenLastCalledWith(thread, expect.stringContaining("fresh list"));
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("keeps buttons usable across status changes and daemon restarts", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const value = await list();
+    await daemon.stop();
+    mocks.live = { ...mocks.live!, agent_status: "idle" };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onBindPane(unbound, "U1", value);
+    expect(state().threads["default|C1:other"].pane_id).toBe("w1:p1");
+  });
+
+  it("uses asynchronous metadata reads while preparing a listing", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const value = await list();
+    let release!: (info: AgentInfo | null) => void;
+    vi.mocked(getAgentInfoAsync).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const listing = mocks.client!.onUserMessage(thread, "U1", "!panes", "3.0");
+    expect(release).toBeTypeOf("function");
+    await mocks.client!.onBindPane(unbound, "U1", value);
+    expect(state().threads["default|C1:other"].pane_id).toBe("w1:p1");
+    release(mocks.live);
+    await listing;
+  });
+
+  it("records a successful bind even if its confirmation fails, without claiming it did not bind", async () => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "!panes", "2.0");
+    const value = button();
+    mocks.post.mockRejectedValueOnce(new Error("confirmation failed"));
+    await mocks.client!.onBindPane(unbound, "U1", value);
+    expect(state().threads["default|C1:other"].pane_id).toBe("w1:p1");
+    expect(state().last_user["C1:other"]).toBe("U1");
+    expect(mocks.post).toHaveBeenLastCalledWith(unbound, expect.stringContaining("!tracking to check"));
+  });
+
+  it("keeps unknown sessions text-only with an explicit bind command", async () => {
+    mocks.live = { ...mocks.live!, agent_session: undefined };
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(unbound, "U1", "!panes", "2.0");
+    expect(mocks.post.mock.calls[0][1]).toContain("`!bind w1:p1`");
+    expect(mocks.post.mock.calls[0][2]![1]).not.toHaveProperty("accessory");
+  });
+
+  it.each(["unauthorized", "stopped"])("does not act when %s", async mode => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const value = await list();
+    if (mode === "stopped") await daemon.stop();
+    const before = state();
+    mocks.post.mockClear();
+    vi.mocked(getAgents).mockClear();
+    await mocks.client!.onBindPane(unbound, mode === "unauthorized" ? "U2" : "U1", value);
+    expect(state()).toEqual(before);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(getAgents).not.toHaveBeenCalled();
+  });
+
+  it.each(["not json", "null", '{"pane":"w1:p1"}', '{"pane":1,"identity":"fake"}'])("rejects malformed values: %s", async value => {
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const before = state();
+    await mocks.client!.onBindPane(unbound, "U1", value);
+    expect(state()).toEqual(before);
+    expect(mocks.post).toHaveBeenLastCalledWith(unbound, expect.stringContaining("Could not complete the bind request"));
+  });
+
+  it("splits a long list within Slack block and text limits, without omitting panes", async () => {
+    for (let i = 2; i <= 45; i++) {
+      const pane_id = `w${i}:p1`;
+      mocks.extraPanes.push({ pane_id, label: `pane-${i}`, agent: "pi", status: "idle" });
+      mocks.liveByPane.set(pane_id, { ...liveSession(`/session-${i}.jsonl`), pane_id });
+    }
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(unbound, "U1", "!panes", "2.0");
+    expect(mocks.post).toHaveBeenCalledTimes(3);
+    const ids: string[] = [];
+    for (const [, text, blocks] of mocks.post.mock.calls) {
+      expect(text.length).toBeLessThan(40_000);
+      expect(blocks!.length).toBeLessThanOrEqual(50);
+      for (const block of blocks!.slice(1)) {
+        if (block.type !== "section" || block.accessory?.type !== "button") throw new Error("missing button");
+        expect(block.text!.text.length).toBeLessThanOrEqual(3000);
+        ids.push(JSON.parse(block.accessory.value!).pane);
+      }
+    }
+    expect(new Set(ids).size).toBe(45);
+  });
+
+  it("binds only the posting bot in a multi-bot thread", async () => {
+    writeFileSync(join(dir, "config.toml"), '[slack.first]\nbot_token = "test"\napp_token = "test"\nallowed_user_ids = ["U1"]\n[slack.second]\nbot_token = "test"\napp_token = "test"\nallowed_user_ids = ["U2"]\n');
+    writeFileSync(join(dir, "state.json"), "{}");
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const first = mocks.clients.get("first")!;
+    await first.onUserMessage(unbound, "U1", "!panes", "2.0");
+    await first.onBindPane(unbound, "U2", button());
+    expect(state().threads).toEqual({});
+    await first.onBindPane(unbound, "U1", button());
+    expect(Object.keys(state().threads)).toEqual(["first|C1:other"]);
   });
 });
 

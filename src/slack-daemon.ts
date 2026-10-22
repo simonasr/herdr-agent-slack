@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { loadConfig, type Config, type SlackBotConfig } from "./config.js";
 import { createLogger, type Logger } from "./logger.js";
-import { SlackClient, isDirectMessage, type SlackThread, type ThreadMessage } from "./slack-client.js";
+import { BIND_PANE_ACTION, SlackClient, isDirectMessage, type SlackBlock, type SlackThread, type ThreadMessage } from "./slack-client.js";
 import { escapeMrkdwn, formatForSlack } from "./slack-format.js";
 import { cleanPaneDelta, cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { createAgentCommunicator, findClaudeSessionByPrompt } from "./agent-sessions.js";
@@ -1070,17 +1070,44 @@ export async function startSlackDaemon(
     logger: log,
   });
 
+  /** Render bounded Block Kit lists, retaining copyable commands in the text fallback. */
+  const postPanes = async (bot: Bot, thread: SlackThread, panes: PaneInfo[], heading: string): Promise<void> => {
+    if (panes.length === 0) { await bot.client.post(thread, `${heading}\n  (none)`); return; }
+    // 20 rows plus a heading fits Slack's 50-block and 40,000-character limits.
+    for (let start = 0; start < panes.length; start += 20) {
+      const page = panes.slice(start, start + 20);
+      const blocks: SlackBlock[] = [{ type: "section", text: { type: "mrkdwn", text: heading.slice(0, 1500) } }];
+      const rows = page.map(pane => describePanes([pane]).slice(0, 1500));
+      for (const [index, pane] of page.entries()) {
+        let info: AgentInfo | null = null;
+        try { info = await getAgentInfoAsync(pane.pane_id); } catch { /* textual bind remains available */ }
+        const identity = paneIdentity(pane, info);
+        blocks.push({
+          type: "section",
+          text: { type: "mrkdwn", text: rows[index] },
+          ...(identity ? { accessory: {
+            type: "button" as const,
+            text: { type: "plain_text" as const, text: "Bind" },
+            action_id: BIND_PANE_ACTION,
+            value: JSON.stringify({ pane: pane.pane_id, identity }),
+          } } : {}),
+        });
+      }
+      await bot.client.post(thread, `${heading}\n${rows.join("\n\n")}`, blocks);
+    }
+  };
+
   /** Resolve a pane by label or id, refusing an ambiguous label. */
-  const lookupPane = (arg: string, panes: PaneInfo[]): { pane: PaneInfo } | { reply: string } => {
+  const lookupPane = (arg: string, panes: PaneInfo[]): { pane: PaneInfo } | { reply: string; panes: PaneInfo[] } => {
     const needle = arg.trim().toLowerCase();
     const byId = panes.find((pane) => pane.pane_id.toLowerCase() === needle);
     if (byId) return { pane: byId };
     const byLabel = panes.filter((pane) => pane.label.toLowerCase() === needle);
     if (byLabel.length === 1) return { pane: byLabel[0] };
     if (byLabel.length > 1) {
-      return { reply: `"${arg}" matches ${byLabel.length} panes. Use the pane id:\n${describePanes(byLabel)}` };
+      return { reply: `"${arg}" matches ${byLabel.length} panes. Click Bind or use the pane id:`, panes: byLabel };
     }
-    return { reply: `Pane "${arg}" not found.\n\nAvailable:\n${describePanes(panes) || "  (none)"}` };
+    return { reply: `Pane "${arg}" not found.\n\nAvailable:`, panes };
   };
 
   const bind = async (
@@ -1181,7 +1208,7 @@ export async function startSlackDaemon(
         const found = lookupPane(wanted, getAgents());
         if ("reply" in found) {
           log.warn("the channel's configured pane was not found", { bot: bot.name, channel: thread.channel, pane: wanted });
-          await bot.client.post(thread, `This channel is set to pane *${wanted}*, but herdr does not list it.\n\n${found.reply}`);
+          await postPanes(bot, thread, found.panes, `This channel is set to pane *${wanted}*, but herdr does not list it.\n\n${found.reply}`);
           return undefined;
         }
         log.info("binding to the channel's pane", { bot: bot.name, channel: thread.channel, paneId: found.pane.pane_id, thread: threadKey(thread) });
@@ -1650,7 +1677,7 @@ export async function startSlackDaemon(
     const panes = getAgents();
 
     if (word === "panes") {
-      await client.post(thread, `Panes:\n${describePanes(panes) || "  (none)"}`);
+      await postPanes(bot, thread, panes, "Panes:");
       return true;
     }
     if (word === "tracking") {
@@ -1681,9 +1708,9 @@ export async function startSlackDaemon(
       return true;
     }
     if (word === "bind") {
-      if (!arg) { await client.post(thread, `Usage: !bind <label or pane id>\n\n${describePanes(panes)}`); return true; }
+      if (!arg) { await postPanes(bot, thread, panes, "Click Bind or use !bind <label or pane id>:"); return true; }
       const found = lookupPane(arg, panes);
-      if ("reply" in found) { await client.post(thread, found.reply); return true; }
+      if ("reply" in found) { await postPanes(bot, thread, found.panes, found.reply); return true; }
       await bind(bot, thread, found.pane, userId);
       return true;
     }
@@ -1820,6 +1847,35 @@ export async function startSlackDaemon(
       appToken: botCfg.appToken,
       logger: log,
       isOwnBot: (userId) => botByUserId(userId) !== undefined,
+      onBindPane: async (thread, userId, value) => {
+        if (stopping) return;
+        if (!isAllowed(bot, userId)) { log.warn("bind click from unauthorized user", { bot: bot.name, userId }); return; }
+        try {
+          const target: unknown = JSON.parse(value);
+          if (!target || typeof target !== "object" || !("pane" in target) || !("identity" in target)
+            || typeof target.pane !== "string" || typeof target.identity !== "string") {
+            throw new Error("invalid bind target");
+          }
+          // Exact id only: a renamed/reused label must never select another pane.
+          const pane = getAgents().find(candidate => candidate.pane_id === target.pane);
+          const identity = pane && paneIdentity(pane, getAgentInfo(pane.pane_id));
+          if (!pane || !identity || identity !== target.identity) {
+            await client.post(thread, "That pane/session changed or is no longer available. Use !panes for a fresh list.");
+            return;
+          }
+          // bind persists synchronously before its first await. No external work
+          // may interleave between the identity check and changing the binding.
+          try {
+            await bind(bot, thread, pane, userId);
+          } finally {
+            noteHuman(bot, thread, userId);
+            persist();
+          }
+        } catch (err) {
+          log.warn("bind action failed", { bot: bot.name, message: String(err) });
+          await client.post(thread, "Could not complete the bind request. Use !tracking to check the current binding, or !panes to try again.");
+        }
+      },
       onThreadStarted: async (_thread, userId) => {
         // Nothing is posted into a new thread. Slack caps a picker at four
         // prompts — fewer panes than this machine runs — and the first message
@@ -1896,10 +1952,8 @@ export async function startSlackDaemon(
           // An unbound thread cannot route a question anywhere; say so rather
           // than guessing a pane.
           const panes = getAgents();
-          await client.post(
-            thread,
-            `This thread is not bound to a pane yet.\n\n${describePanes(panes)}\n\nCopy a !bind command above.`,
-          );
+          await postPanes(bot, thread, panes,
+            "This thread is not bound to a pane yet. Click Bind or copy a !bind command below.");
           return;
         }
         await startTurn(bot, binding, thread, text, messageTs);
@@ -2114,6 +2168,16 @@ export async function startSlackDaemon(
       for (const bot of bots.values()) await bot.client.stop();
     },
   };
+}
+
+/** A button names a session, not just a reusable pane id. Unknown identity is text-only. */
+function paneIdentity(pane: PaneInfo, info: AgentInfo | null): string | undefined {
+  const session = info?.agent_session;
+  const ref = session?.kind === "path" ? session.path : session?.id;
+  if (!ref?.trim() || !info || info.pane_id !== pane.pane_id || info.agent !== pane.agent) return undefined;
+  return createHash("sha256").update(JSON.stringify([
+    info.pane_id, info.tab_id, info.workspace_id, info.agent, session?.kind, ref,
+  ])).digest("hex");
 }
 
 function describePanes(panes: PaneInfo[]): string {
