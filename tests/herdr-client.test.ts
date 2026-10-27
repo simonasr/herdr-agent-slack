@@ -119,6 +119,14 @@ describe("parseAgentList", () => {
   it("returns empty array for missing result", () => {
     expect(parseAgentList('{"id":"x"}')).toEqual([]);
   });
+
+  it("distinguishes invalid and empty inventories for strict read-only discovery", () => {
+    expect(parseAgentList('{"result":{"agents":[]}}', undefined, true)).toEqual([]);
+    for (const raw of ["broken", '{}', '{"result":{"agents":{}}}', '{"result":{"agents":[{"agent":"pi"}]}}', '{"result":{"agents":[null]}}']) {
+      expect(() => parseAgentList(raw, undefined, true)).toThrow();
+    }
+    expect(parseAgentList('{"result":{"agents":[{"pane_id":"w1:p1","agent":"pi"}]}}', undefined, true)).toHaveLength(1);
+  });
 });
 
 describe("buildSendTextArgs", () => {

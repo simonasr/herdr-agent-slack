@@ -8,6 +8,7 @@ per turn, and turns you start in the terminal arrive here too.
 | --- | --- |
 | `!help` | Print this list. |
 | `!panes` | List panes with names, agent/status, working directories and copyable bind commands. |
+| `!concierge <request>` | Opt-in, read-only discovery through an existing agent pane. |
 | `!tracking` | Every thread the bridge is bound in — channel, link, pane — from any thread. |
 | `!bind <label\|pane id>` | Bind this thread to a pane, by label or by id (`!bind w4:p7`). Rebinding moves the thread. |
 | `!spawn [dir] [agent] [-- args]` | Open a pane for this bot and bind it here. See below. |
@@ -70,6 +71,41 @@ conversation never spills into the channel itself; a mention inside an
 existing thread joins that thread. A reply that names no bot is not for the
 bridge — a channel thread is a place where people talk, and the bridge is a
 guest in it. A bare `@Shaka` answers with `!help`.
+
+### Read-only concierge prototype
+
+With [`concierge_pane`](./configuration.md#concierge_pane--read-only-prototype)
+configured for the addressed bot:
+
+```text
+DM:       !concierge what agents are running?
+Channel:  @Shaka !concierge find the agent working on Redis failover
+Inspect:  @Shaka !concierge inspect w4:p7
+```
+
+The `!concierge` prefix is required even in a DM and even when a work pane is
+already bound. Without it, plain text retains the ordinary direct-work routing.
+Discovery also works before binding; it does not move the existing binding or
+create a default/fresh work pane. To address the concierge again after manually
+binding, use the same prefix. In a multi-bot thread, `@Shaka !bind w4:p7` binds
+**Shaka's** work pane, not another bot's.
+
+The response shows real live pane IDs, names/titles, agent/status, project/cwd
+and binding availability (`here` for this bot/thread, `elsewhere`, or `unbound`).
+Inspecting one exact pane adds its available session identity, not its transcript.
+Lists show at most eight candidates; narrow larger lists with a project/name hint.
+Topic matching searches available names/titles/project metadata only—no scrollback,
+conversation bodies, archived sessions or Slack history. Missing topic metadata
+requires another hint; even one inferred match never binds automatically.
+
+Use the existing `!bind <pane id>` command for manual selection. Concierge bind,
+spawn, rename, close and file operations are not supported in this slice.
+Attachments are rejected without downloading them. An unavailable, busy or
+unconfigured concierge gives deterministic manual-command guidance; no agent is
+silently started. Quoted examples do not invoke the concierge.
+
+This is an **instruction-constrained existing-agent prototype**, not a tool
+sandbox. Read the configuration warning before enabling it.
 
 ### ⏳ and ✅
 

@@ -38,6 +38,7 @@ import { extractSendRequests, listRecentFiles, resolveInsideCwd } from "./tool-f
 import { MAX_INBOUND_BYTES, describeReceived, describeVoice, inboxTarget, isAudioName } from "./inbound-files.js";
 import { formatBytes } from "./format-bytes.js";
 import type { PaneInfo } from "./types.js";
+import { classifyConciergeRequest, CONCIERGE_FALLBACK, findConciergePanes, isConciergeMessage, renderConciergePanes, sameConciergeSession } from "./concierge.js";
 
 /** Ceiling on one delivered answer; the tail is what carries the conclusion. */
 const MAX_ANSWER_CHARS = 20_000;
@@ -273,6 +274,7 @@ const COMMANDS = [
   "!help — this list",
   "# <text> — an aside for the thread; not sent to the pane",
   "!panes — list the panes herdr reports",
+  "!concierge <request> — read-only discovery via a configured existing pane (opt-in prototype)",
   "!tracking — every thread the bridge is bound in, and to which pane",
   "!bind <label|pane id> — bind this thread to a pane (e.g. !bind w4:p7)",
   "!spawn [dir] [agent] [-- args] — open a pane for this bot here and bind it",
@@ -444,6 +446,13 @@ export async function startSlackDaemon(
   }
 
   const agents = new Map<string, PaneAgent>();
+  /** Global per-pane reservations: two bots must not share a management turn. */
+  const conciergeRequests = new Map<string, AbortController>();
+  /** An idle configured classifier must not become work through implicit reuse. */
+  const isConfiguredConcierge = (pane: PaneInfo): boolean => cfg.slackBots.some(bot => {
+    const wanted = bot.conciergePane.toLowerCase();
+    return !!wanted && [pane.pane_id, pane.name, pane.label].some(value => value?.toLowerCase() === wanted);
+  });
   const sources = new WeakMap<PaneAgent, {
     agent?: string;
     session: () => AgentSessionRef;
@@ -1091,6 +1100,10 @@ export async function startSlackDaemon(
     opts: { spawnedTab?: string; quiet?: boolean } = {},
   ): Promise<void> => {
     const { spawnedTab, quiet = false } = opts;
+    if (conciergeRequests.has(pane.pane_id)) {
+      await bot.client.post(thread, "That pane is handling a concierge request. Try another pane or wait for it to finish.");
+      return;
+    }
     const binding: ThreadBinding = {
       bot: bot.name,
       pane_id: pane.pane_id,
@@ -1440,7 +1453,7 @@ export async function startSlackDaemon(
     // be this thread's own.
     const bound = new Set(Object.values(state.threads).map((b) => b.pane_id));
     const idle = opts.fresh ? undefined : getAgents().find(
-      (pane) => pane.agent === kind && !bound.has(pane.pane_id) && pane.status !== "working" &&
+      (pane) => pane.agent === kind && !bound.has(pane.pane_id) && !isConfiguredConcierge(pane) && !conciergeRequests.has(pane.pane_id) && pane.status !== "working" &&
         getAgentInfo(pane.pane_id)?.cwd === dir,
     );
     if (idle) {
@@ -1807,6 +1820,70 @@ export async function startSlackDaemon(
     }
   };
 
+  /**
+   * Management bypasses autoBind, noteHuman and the work output interpreter.
+   * Only the host's captured requester/bot/thread may receive this response.
+   */
+  const handleConcierge = async (bot: Bot, thread: SlackThread, userId: string, text: string): Promise<void> => {
+    const reply = (message: string) => bot.client.post(thread, message);
+    if (!bot.cfg.conciergePane) {
+      await reply(`Concierge is not configured for this bot. ${CONCIERGE_FALLBACK}`);
+      return;
+    }
+    if (!bot.cfg.allowedUserIds.length) {
+      await reply(`Concierge requires an explicit allowed_user_ids list. ${CONCIERGE_FALLBACK}`);
+      return;
+    }
+    const query = text.trim().replace(/^!concierge\s*/i, "");
+    if (!query || query.length > 2_000) {
+      await reply("Usage: !concierge <request up to 2000 characters>. Try ‘what agents are running?’ or ‘find the Redis failover work’. Read-only: no binding or spawning.");
+      return;
+    }
+    let paneId: string | undefined;
+    let controller: AbortController | undefined;
+    try {
+      const inventory = getAgents({ strict: true });
+      const wanted = bot.cfg.conciergePane.toLowerCase();
+      const exact = inventory.filter(pane => pane.pane_id.toLowerCase() === wanted);
+      const candidates = exact.length ? exact : inventory.filter(pane => [pane.name, pane.label].some(name => name?.toLowerCase() === wanted));
+      if (candidates.length !== 1) throw new Error("Configured concierge pane is missing or ambiguous");
+      paneId = candidates[0].pane_id;
+      if (conciergeRequests.has(paneId) || bindingForPane(paneId)) {
+        await reply(`Concierge pane is busy or bound to a work thread. Use an idle, unbound pane. ${CONCIERGE_FALLBACK}`);
+        return;
+      }
+      const pane = getAgentInfo(paneId);
+      if (!pane || !["idle", "done"].includes(pane.agent_status) || !sameConciergeSession(pane, pane)) {
+        throw new Error("Concierge pane is not ready with a known session");
+      }
+      controller = new AbortController();
+      conciergeRequests.set(paneId, controller);
+      const isAvailable = () => !stopping && isAllowed(bot, userId)
+        && conciergeRequests.get(paneId!) === controller && !bindingForPane(paneId!);
+      const action = await classifyConciergeRequest({ pane, query, config: cfg, logger: log, signal: controller.signal, isAvailable });
+      // Re-authorize and verify the actual session before executing the proposal.
+      const live = await getAgentInfoAsync(paneId);
+      if (!isAvailable() || !sameConciergeSession(live, pane)) throw new Error("Concierge ownership changed");
+      const panes = getAgents({ strict: true }).filter(pane => !isConfiguredConcierge(pane));
+      const found = findConciergePanes(action, panes);
+      const info = action.action === "inspect" && found.length === 1 ? getAgentInfo(found[0].pane_id) : undefined;
+      if (action.action === "inspect" && found.length === 1 && (!info || info.pane_id !== found[0].pane_id || info.agent !== found[0].agent)) {
+        await reply(`That pane disappeared or its metadata is unavailable. Try discovery again. ${CONCIERGE_FALLBACK}`);
+        return;
+      }
+      await reply(renderConciergePanes(action, panes, id => {
+        const bindings = Object.values(state.threads).filter(binding => binding.pane_id === id);
+        return bindings.some(binding => binding.bot === bot.name && binding.channel === thread.channel && binding.thread_ts === thread.threadTs)
+          ? "here" : bindings.length ? "elsewhere" : "unbound";
+      }, info));
+    } catch (err) {
+      log.warn("concierge unavailable", { bot: bot.name, message: String(err) });
+      if (!stopping) await reply(`Concierge unavailable or unable to interpret that as read-only discovery. ${CONCIERGE_FALLBACK}`);
+    } finally {
+      if (paneId && controller && conciergeRequests.get(paneId) === controller) conciergeRequests.delete(paneId);
+    }
+  };
+
   /** One connection per bot; the handlers close over which one it is. */
   const connect = (botCfg: SlackBotConfig): Bot => {
     const bot: Bot = {
@@ -1837,6 +1914,10 @@ export async function startSlackDaemon(
         log.info("slack files", { bot: bot.name, userId, thread: threadKey(thread), count: files.length });
         if (!isAllowed(bot, userId)) { log.warn("files from unauthorized user", { bot: bot.name, userId }); return; }
         if (isAside(caption)) { log.info("aside ignored", { thread: threadKey(thread), files: files.length }); return; }
+        if (isConciergeMessage(caption)) {
+          await client.post(thread, `Concierge accepts text-only discovery requests; attachments were not downloaded. ${CONCIERGE_FALLBACK}`);
+          return;
+        }
         noteHuman(bot, thread, userId);
         const binding = state.threads[bindingKey(bot.name, thread)] ?? await autoBind(bot, thread, userId);
         if (stopping) return;
@@ -1884,6 +1965,7 @@ export async function startSlackDaemon(
         log.info("slack message", { bot: bot.name, userId, thread: threadKey(thread), text: text.slice(0, 80) });
         if (!isAllowed(bot, userId)) { log.warn("message from unauthorized user", { bot: bot.name, userId }); return; }
         if (isAside(text)) { log.info("aside ignored", { thread: threadKey(thread) }); return; }
+        if (isConciergeMessage(text)) { await handleConcierge(bot, thread, userId, text); return; }
         noteHuman(bot, thread, userId);
         let binding: ThreadBinding | undefined = state.threads[bindingKey(bot.name, thread)];
         if (text.trim().startsWith("!")) {
@@ -2101,6 +2183,8 @@ export async function startSlackDaemon(
   return {
     stop: async () => {
       stopping = true;
+      for (const controller of conciergeRequests.values()) controller.abort();
+      conciergeRequests.clear();
       for (const paneId of setupOnlyTurns) {
         const binding = bindingForPane(paneId);
         if (binding) abandonTurn(binding);

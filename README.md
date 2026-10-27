@@ -9,7 +9,7 @@ Markdown intact. Several bots can live in one daemon, each on its own Slack
 app, and a line of one bot's answer that starts with `@lilith` goes to
 Lilith's pane. A planner briefs a coder in the open, the coder reports back,
 the planner reviews — in a thread you can read. The bridge routes text; it
-never reads it. No LLM in the path.
+never reads it. No LLM in the ordinary work-message path.
 
 ```
 you:     @Shaka tambahin rate limit di endpoint login
@@ -46,6 +46,11 @@ Shaka:   Beres, siap di-merge. @lilith !close
   runs; ⏳ on the message being answered, ✅ when its answer is up — held
   while a background shell is still running; ⚠️ with the screen when a pane
   is stuck on a question only the terminal can answer.
+- **Optional read-only concierge prototype.** Explicit `!concierge …` requests
+  can use an existing pane to interpret live pane discovery. The bridge renders
+  metadata results and never binds or spawns from the proposal. Disabled by
+  default; the existing CLI agent is **not sandboxed**. See
+  [configuration](docs/guide/configuration.md#concierge_pane--read-only-prototype).
 - **Files both ways.** Share a file into a thread and the pane gets it under
   `.inbox/`; `!files`, `!file <n>` or an `@@send: path` line in an answer
   sends one back.
@@ -124,6 +129,7 @@ the DM):
 | | |
 |---|---|
 | `!panes` | the panes herdr reports |
+| `!concierge <request>` | optional read-only discovery prototype; requires configuration |
 | `!bind <label\|pane id>` | bind this thread to a pane |
 | `!spawn [dir] [agent] [-- args]` | open a pane for this bot here and bind it |
 | `!close` | unbind, and close the tab `!spawn` opened |

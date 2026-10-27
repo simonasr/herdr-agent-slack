@@ -36,6 +36,8 @@ export interface SlackBotConfig {
    * to `!bind` first.
    */
   defaultPane: string;
+  /** Existing, unbound pane for explicit !concierge requests. Empty disables it. */
+  conciergePane: string;
   /**
    * What a channel thread with no binding gets: the shared `default_pane`
    * ("shared"), or a pane of its own, opened for it ("fresh") so threads do
@@ -187,7 +189,7 @@ export function loadConfig(configDir?: string): Config {
   // the declared type from narrowing to `null` at every use.
   let currentSlackBot = null as SlackBotConfig | null;
   const openSlackBot = (name: string): void => {
-    currentSlackBot = { name, botToken: "", appToken: "", allowedUserIds: [], spawnAgent: "codex", spawnArgs: [], defaultPane: "", channelPane: "shared", spawnCwd: "", idleCloseMinutes: 120, role: "", markWorking: "hourglass_flowing_sand", markDone: "white_check_mark", maxHandoffs: 20, channelPanes: {} };
+    currentSlackBot = { name, botToken: "", appToken: "", allowedUserIds: [], spawnAgent: "codex", spawnArgs: [], defaultPane: "", conciergePane: "", channelPane: "shared", spawnCwd: "", idleCloseMinutes: 120, role: "", markWorking: "hourglass_flowing_sand", markDone: "white_check_mark", maxHandoffs: 20, channelPanes: {} };
     fileSlackBots.push(currentSlackBot);
   };
 
@@ -246,6 +248,7 @@ export function loadConfig(configDir?: string): Config {
         else if (kv[0] === "spawn_agent") currentSlackBot.spawnAgent = kv[1].trim() || "codex";
         else if (kv[0] === "spawn_args") currentSlackBot.spawnArgs = parseStringList(kv[1]);
         else if (kv[0] === "default_pane") currentSlackBot.defaultPane = kv[1].trim();
+        else if (kv[0] === "concierge_pane") currentSlackBot.conciergePane = kv[1].trim();
         else if (kv[0] === "channel_pane") currentSlackBot.channelPane = kv[1].trim() === "fresh" ? "fresh" : "shared";
         else if (kv[0] === "spawn_cwd") currentSlackBot.spawnCwd = kv[1].trim();
         else if (kv[0] === "idle_close_minutes") currentSlackBot.idleCloseMinutes = Math.max(0, parseInt(kv[1], 10) || 0);

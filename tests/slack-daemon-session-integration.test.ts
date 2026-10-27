@@ -68,7 +68,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
 
 // PaneAgent, ObserveLoopController and the Pi reader are all real here.
 import { startSlackDaemon } from "../src/slack-daemon.js";
-import { closeTab, getAgentInfoAsync, sendKeys, sendText, startAgent } from "../src/herdr-client.js";
+import { closeTab, createTab, getAgents, getAgentInfoAsync, readPane, sendKeys, sendText, startAgent } from "../src/herdr-client.js";
 import { formatForSlack } from "../src/slack-format.js";
 
 let dir: string;
@@ -171,6 +171,296 @@ describe("Pane discovery", () => {
     expect(text).toContain("*home* — pi · done\n    ~\n");
     expect(text).toContain("*project* — pi · working"); // old metadata without a name/title/cwd
     expect(text).not.toContain("undefined");
+  });
+});
+
+describe("Read-only concierge — real PaneAgent and Pi reader", () => {
+  const conciergeId = "w2:p1";
+  let conciergePath: string;
+  async function flush() { for (let i = 0; i < 80; i++) await Promise.resolve(); }
+  const state = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+
+  async function enable(extra = "") {
+    mocks.live!.agent_status = "idle";
+    conciergePath = join(dir, "concierge.jsonl");
+    writeFileSync(conciergePath, message("PRIVATE_CONCIERGE_HISTORY"));
+    mocks.liveByPane.set(conciergeId, { ...liveSession(conciergePath, "idle"), pane_id: conciergeId, tab_id: "w2:t1" });
+    mocks.extraPanes.push({ pane_id: conciergeId, label: "concierge", name: "concierge", agent: "pi", status: "idle" });
+    appendFileSync(join(dir, "config.toml"), `concierge_pane = "${conciergeId}"\n${extra}`);
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+  }
+
+  async function answer(proposal: Record<string, unknown>, request = "!concierge what agents are running?", at = thread) {
+    const pending = mocks.client!.onUserMessage(at, "U1", request, "2.0");
+    await flush();
+    const [paneId, prompt] = vi.mocked(sendText).mock.calls.at(-1)!;
+    expect(paneId).toBe(conciergeId);
+    const envelope = JSON.parse(prompt.split("\n").at(-1)!);
+    appendFileSync(conciergePath, message(JSON.stringify({ request_id: envelope.request_id, ...proposal })));
+    await vi.advanceTimersByTimeAsync(500);
+    await pending;
+    return prompt;
+  }
+
+  it("is off by default, without forwarding or changing a binding", async () => {
+    mocks.live!.agent_status = "idle";
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    const before = state();
+    vi.mocked(getAgents).mockClear();
+    await mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("not configured");
+    expect(getAgents).not.toHaveBeenCalled();
+    expect(sendText).not.toHaveBeenCalled();
+    expect(state()).toEqual(before);
+  });
+
+  it("requires an explicit allowlist, and rejects unauthorized users before forwarding or inventory reads", async () => {
+    await enable();
+    vi.mocked(getAgents).mockClear();
+    await mocks.client!.onUserMessage(thread, "U2", "!concierge list sessions", "2.0");
+    expect(getAgents).not.toHaveBeenCalled();
+    expect(sendText).not.toHaveBeenCalled();
+    expect(mocks.post).not.toHaveBeenCalled();
+    await daemon!.stop();
+    appendFileSync(join(dir, "config.toml"), 'allowed_user_ids = []\n');
+    daemon = await startSlackDaemon({ configDir: dir, stateDir: dir });
+    await mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "3.0");
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("explicit allowed_user_ids");
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { channel: "C1", threadTs: "1.0" }, { channel: "C1", threadTs: "unbound" },
+    { channel: "D1", threadTs: "dm" },
+  ])("works in $channel/$threadTs without auto-binding, history, target transcripts or work dispatch", async at => {
+    await enable('channel_pane = "fresh"\ndefault_pane = "project"\n');
+    const before = state();
+    const prompt = await answer({ action: "list" }, undefined, at);
+    const result = mocks.post.mock.calls.at(-1)!;
+    expect(result[0]).toEqual(at);
+    expect(result[1]).toContain("Live local agent panes");
+    expect(result[1]).toContain("w1:p1");
+    expect(result[1]).not.toContain(`Pane: ${conciergeId}`);
+    expect(result[1]).not.toContain("PRIVATE_CONCIERGE_HISTORY");
+    expect(result[1]).not.toContain("old unrelated history");
+    expect(prompt).not.toContain("C1");
+    expect(prompt).not.toContain("U1");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(mocks.history).not.toHaveBeenCalled();
+    expect(readPane).not.toHaveBeenCalled();
+    expect(createTab).not.toHaveBeenCalled();
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(state()).toEqual(before);
+    expect(existsSync(join(dir, "pending-turns.json"))).toBe(false);
+  });
+
+  it.each(["id", "name", "label", "other-bot"])("does not implicitly reuse an idle configured concierge addressed by %s", async mode => {
+    const settings = mode === "name" ? 'concierge_pane = "CONCIERGE"\n'
+      : mode === "label" ? 'concierge_pane = "concierge-tab"\n'
+      : mode === "other-bot" ? `concierge_pane = ""\n[slack.other]\nbot_token = "test-other"\napp_token = "test-other"\nallowed_user_ids = ["U1"]\nconcierge_pane = "${conciergeId}"\n` : "";
+    await enable(settings);
+    mocks.extraPanes[0].label = "concierge-tab";
+    mocks.extraPanes[0].cwd = dir;
+    mocks.liveByPane.get(conciergeId)!.cwd = dir;
+    const workId = "w3:p1";
+    mocks.extraPanes.push({ pane_id: workId, label: "available-work", agent: "pi", status: "idle", cwd: dir });
+    mocks.liveByPane.set(workId, { ...liveSession(oldPath, "idle"), pane_id: workId, cwd: dir });
+    const at = { channel: "C1", threadTs: "new-work" };
+    await mocks.clients.get("default")!.onUserMessage(at, "U1", `!spawn ${dir} pi`, "2.0");
+    expect(state().threads["default|C1:new-work"].pane_id).toBe(workId);
+    expect(Object.values(state().threads).some((binding: any) => binding.pane_id === conciergeId)).toBe(false);
+    expect(createTab).not.toHaveBeenCalled();
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("omits all configured concierge panes from discovery, including another bot's classifier", async () => {
+    await enable('[slack.other]\nbot_token = "test-other"\napp_token = "test-other"\nallowed_user_ids = ["U1"]\nconcierge_pane = "other-classifier"\n');
+    mocks.extraPanes.push({ pane_id: "w3:p1", label: "other-classifier", agent: "pi", status: "idle" });
+    const pending = mocks.clients.get("default")!.onUserMessage(thread, "U1", "!concierge list agents", "2.0");
+    await flush();
+    const envelope = JSON.parse(vi.mocked(sendText).mock.calls.at(-1)![1].split("\n").at(-1)!);
+    appendFileSync(conciergePath, message(JSON.stringify({ request_id: envelope.request_id, action: "list" })));
+    await vi.advanceTimersByTimeAsync(500); await pending;
+    const result = mocks.post.mock.calls.at(-1)![1];
+    expect(result).toContain("Pane: w1:p1");
+    expect(result).not.toContain(`Pane: ${conciergeId}`);
+    expect(result).not.toContain("Pane: w3:p1");
+  });
+
+  it("finds topic-bearing live metadata and returns actual candidate IDs, not an automatic binding", async () => {
+    await enable();
+    mocks.extraPanes.push(
+      { pane_id: "w3:p1", label: "redis", name: "redis-fix", title: "Redis failover", cwd: "/repo/redis", agent: "pi", status: "working" },
+      { pane_id: "w3:p2", label: "redis", name: "redis-review", title: "Review failover", cwd: "/repo/redis", agent: "claude", status: "idle" },
+    );
+    await answer({ action: "find", query: "redis failover" }, "!concierge find the agent working on Redis failover");
+    const result = mocks.post.mock.calls.at(-1)![1];
+    expect(result).toContain("w3:p1"); expect(result).toContain("w3:p2");
+    expect(result).not.toContain("Pane: w1:p1");
+    expect(result).toContain("nothing was bound");
+    expect(state().threads["default|C1:1.0"].pane_id).toBe("w1:p1");
+  });
+
+  it("inspects live session metadata without opening the work transcript or exposing thread addresses", async () => {
+    await enable();
+    const target = join(dir, "DO_NOT_READ.jsonl");
+    writeFileSync(target, "this is deliberately not a valid session log");
+    mocks.live = liveSession(target, "idle");
+    const saved = state();
+    saved.threads["default|G_SECRET:secret-thread"] = { ...saved.threads["default|C1:1.0"], channel: "G_SECRET", thread_ts: "secret-thread" };
+    writeFileSync(join(dir, "state.json"), JSON.stringify(saved));
+    await answer({ action: "inspect", target: "w1:p1" });
+    const result = mocks.post.mock.calls.at(-1)![1];
+    expect(result).toContain("Session (path)");
+    expect(result).toContain("DO_NOT_READ");
+    expect(result).not.toContain("G_SECRET");
+    expect(result).not.toContain("secret-thread");
+    expect(readPane).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "working", "bound", "no-session"])("falls back for an unavailable %s concierge", async mode => {
+    await enable();
+    if (mode === "missing") mocks.extraPanes.length = 0;
+    if (mode === "working") mocks.liveByPane.get(conciergeId)!.agent_status = "working";
+    if (mode === "bound") await mocks.client!.onUserMessage(thread, "U1", `!bind ${conciergeId}`, "1.5");
+    if (mode === "no-session") mocks.liveByPane.get(conciergeId)!.agent_session = undefined;
+    await mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("manually");
+    expect(sendText).not.toHaveBeenCalled();
+    expect(createTab).not.toHaveBeenCalled();
+  });
+
+  it("rejects a second thread and manual binding while the same concierge pane is reserved", async () => {
+    await enable();
+    const first = mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    await flush();
+    await mocks.client!.onUserMessage({ channel: "C2", threadTs: "other" }, "U1", "!concierge find payments", "3.0");
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("busy");
+    await mocks.client!.onUserMessage(thread, "U1", `!bind ${conciergeId}`, "4.0");
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("handling a concierge request");
+    expect(state().threads["default|C1:1.0"].pane_id).toBe("w1:p1");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const envelope = JSON.parse(vi.mocked(sendText).mock.calls[0][1].split("\n").at(-1)!);
+    appendFileSync(conciergePath, message(JSON.stringify({ request_id: envelope.request_id, action: "list" })));
+    await vi.advanceTimersByTimeAsync(500); await first;
+    expect(mocks.post.mock.calls.at(-1)![0]).toEqual(thread);
+  });
+
+  it.each([
+    { action: "spawn", path: "/tmp" },
+    { action: "list", bot: "other", channel: "SECRET", thread_ts: "forged" },
+    { action: "list", request_id: "old-request" },
+  ])("does not execute a mutating, forged or stale proposal: %j", async proposal => {
+    await enable();
+    const before = state();
+    await answer(proposal);
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("unable to interpret");
+    expect(createTab).not.toHaveBeenCalled();
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+    expect(state()).toEqual(before);
+  });
+
+  it("does not interpret handoff or send-file output as bridge instructions", async () => {
+    await enable();
+    const pending = mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    await flush();
+    appendFileSync(conciergePath, message("@default !spawn /tmp\n@@send: secret.txt"));
+    await vi.advanceTimersByTimeAsync(500); await pending;
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("unable to interpret");
+    expect(createTab).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects attachments before downloading or writing to the work pane's inbox", async () => {
+    await enable();
+    await mocks.client!.onUserFiles(thread, "U1", "!concierge inspect this", [{ name: "file.txt", size: 10, urlPrivateDownload: "https://invalid" }], "2.0");
+    expect(mocks.download).not.toHaveBeenCalled();
+    expect(sendText).not.toHaveBeenCalled();
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("text-only");
+  });
+
+  it("rejects a replaced concierge session rather than posting its response", async () => {
+    await enable();
+    const pending = mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    await flush();
+    mocks.liveByPane.set(conciergeId, { ...mocks.liveByPane.get(conciergeId)!, agent_session: { kind: "path", path: oldPath } });
+    await vi.advanceTimersByTimeAsync(500); await pending;
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("Concierge unavailable");
+    expect(mocks.post.mock.calls.map(call => call[1]).join("\n")).not.toContain("old unrelated history");
+  });
+
+  it("reports failed inventory differently from empty inventory", async () => {
+    await enable();
+    vi.mocked(getAgents).mockImplementationOnce(() => { throw new Error("Herdr offline"); });
+    await mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("Concierge unavailable");
+    expect(sendText).not.toHaveBeenCalled();
+    const pending = mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "3.0");
+    await flush();
+    const envelope = JSON.parse(vi.mocked(sendText).mock.calls.at(-1)![1].split("\n").at(-1)!);
+    appendFileSync(conciergePath, message(JSON.stringify({ request_id: envelope.request_id, action: "list" })));
+    vi.mocked(getAgents).mockReturnValueOnce([]);
+    await vi.advanceTimersByTimeAsync(500); await pending;
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("No live local agent panes");
+  });
+
+  it.each([30_000, 75_000])("delivers a valid late proposal without spending the timeout on a %ims work settling window", async stabilityMs => {
+    await enable(`progress_interval_ms = 15000\nstability_window_ms = ${stabilityMs}\n`);
+    let delivered = false;
+    const pending = mocks.client!.onUserMessage(thread, "U1", "!concierge list agents", "2.0").then(() => { delivered = true; });
+    await flush();
+    const envelope = JSON.parse(vi.mocked(sendText).mock.calls.at(-1)![1].split("\n").at(-1)!);
+    const live = mocks.liveByPane.get(conciergeId)!;
+    expect(live.completion_evidence).toBeUndefined(); // Exercise settling, not completion proof.
+    live.agent_status = "working";
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(delivered).toBe(false);
+    expect(mocks.post).not.toHaveBeenCalled();
+    appendFileSync(conciergePath, message(JSON.stringify({ request_id: envelope.request_id, action: "list" })));
+    live.agent_status = "idle";
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(delivered).toBe(true);
+    await pending;
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("Live local agent panes");
+    expect(sendText).toHaveBeenCalledTimes(1);
+
+    // The isolated observer must not shorten ordinary work's configured settling.
+    mocks.post.mockClear();
+    await mocks.client!.onUserMessage(thread, "U1", "ordinary work", "3.0");
+    appendFileSync(oldPath, message("ordinary work answer"));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(mocks.post).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000 + stabilityMs);
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("ordinary work answer");
+  });
+
+  it("has a finite timeout and does not start a new agent or interrupt the external pane", async () => {
+    await enable();
+    const pending = mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    await vi.advanceTimersByTimeAsync(90_001); await pending;
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("Concierge unavailable");
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels observation on daemon shutdown without posting a late answer", async () => {
+    await enable();
+    const pending = mocks.client!.onUserMessage(thread, "U1", "!concierge list sessions", "2.0");
+    await flush(); await daemon!.stop(); await pending;
+    appendFileSync(conciergePath, message("late response"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.post).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
+  it("keeps ordinary bound-thread work out of the concierge", async () => {
+    await enable();
+    await mocks.client!.onUserMessage(thread, "U1", "fix the Redis test", "2.0");
+    expect(sendText).toHaveBeenCalledExactlyOnceWith("w1:p1", "fix the Redis test");
   });
 });
 

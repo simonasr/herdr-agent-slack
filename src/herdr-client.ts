@@ -106,9 +106,12 @@ function execHerdr(args: string[]): void {
   }
 }
 
-export function parseAgentList(raw: string, tabLabels?: Map<string, string>): PaneInfo[] {
+export function parseAgentList(raw: string, tabLabels?: Map<string, string>, strict = false): PaneInfo[] {
   try {
     const parsed = JSON.parse(raw);
+    if (strict && (!Array.isArray(parsed?.result?.agents) || parsed.result.agents.some(
+      (agent: any) => !nonemptyString(agent?.pane_id) || !nonemptyString(agent?.agent),
+    ))) throw new Error("Invalid live agent inventory");
     const agents: any[] = parsed?.result?.agents ?? [];
     return agents.map((a: any) => {
       const tabId = String(a.tab_id);
@@ -126,12 +129,13 @@ export function parseAgentList(raw: string, tabLabels?: Map<string, string>): Pa
         status: String(a.agent_status || "unknown") as PaneInfo["status"],
       };
     });
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     return [];
   }
 }
 
-export function getAgents(): PaneInfo[] {
+export function getAgents(opts: { strict?: boolean } = {}): PaneInfo[] {
   // Fetch tab labels first, preserving order (some agents on same host share a tab)
   let tabLabels = new Map<string, string>();
   const tabOrder: string[] = [];
@@ -149,7 +153,7 @@ export function getAgents(): PaneInfo[] {
     // Tab list failed — fall back to cwd dirnames
   }
   const raw = execHerdrJson(["agent", "list"]);
-  const agents = parseAgentList(raw, tabLabels);
+  const agents = parseAgentList(raw, tabLabels, opts.strict);
   // Sort by tab order from herdr
   const orderMap = new Map(tabOrder.map((id, i) => [id, i]));
   agents.sort((a, b) => {
