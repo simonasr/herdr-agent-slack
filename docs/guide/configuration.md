@@ -23,6 +23,7 @@ spawn_agent = "codex"         # what !spawn starts for this bot (default codex)
 spawn_args = ["--yolo"]       # handed to that agent (default none)
 default_pane = "server-local" # pane (label or id) a thread with no binding for
                               # this bot is bound to when spoken to
+# concierge_pane = "w9:p2"    # optional existing, idle, unbound classifier pane
 channel_pane = "fresh"        # "shared" (default): channel threads use default_pane
                               # "fresh": each channel thread gets a pane of its own
 spawn_cwd = "~"               # where such a pane starts (default: home)
@@ -95,6 +96,40 @@ has no binding for — a new DM thread, a mention in a channel. That binding
 is silent: only the answer appears. Without a default such a thread is told
 to `!bind` first. The pane can then move the thread
 itself: see [moving a thread](./commands.md#a-pane-that-moves-its-own-thread).
+
+### concierge_pane — read-only prototype
+
+Disabled by default. Set this per bot to an **existing** live pane ID (preferred),
+agent name or unique tab label. The pane must be idle/done, unbound to all work
+threads, and have a known Pi/OMP, Codex or Claude JSONL session. Missing or
+unsupported readers do not fall back to terminal scrollback. An explicit,
+nonempty `allowed_user_ids` list is required for concierge requests.
+
+The bridge sends only the explicitly addressed question, asking the pane for
+one read-only `list`, `find` or `inspect` proposal. It validates that proposal
+and queries live metadata itself; it does not forward thread history, model
+prose, file requests or bot handoffs. Requester, bot and reply thread come from
+Slack callbacks, not model fields. Ordinary work still uses its existing binding.
+
+Only one management request may use a pane at once, even across bots. Busy
+requests are rejected, not queued. The classification wait is capped at 90
+seconds. Its observer polls at most two seconds apart and settles for at most
+five seconds, independently of slower work-message settings; a working agent
+still prevents settling. Timeouts/shutdown stop observation, not the external agent. Outstanding
+concierge requests are not recovered across daemon restarts: retry explicitly.
+The bridge never launches a missing concierge or changes a binding for discovery.
+Configured concierge panes are excluded from automatic idle-pane reuse and from
+concierge discovery results, including those configured for other bots. `!panes`
+still shows the full inventory; explicit manual binding is unchanged.
+
+**This is not a sandbox.** The existing CLI agent retains its own tools,
+credentials, extensions and conversation history. “Do not use tools” is a prompt,
+not an enforced restriction. Use only a trusted operator-controlled pane for UX
+experiments; this is not a production security boundary or an untrusted-user
+service. Keep it separate from ongoing work, and do not type into it during a
+request. A future restricted runtime needs a separately enforced tool policy.
+
+See [concierge addressing](./commands.md#read-only-concierge-prototype) for examples.
 
 ### role
 
