@@ -48,8 +48,9 @@ Shaka:   Beres, siap di-merge. @lilith !close
   is stuck on a question only the terminal can answer.
 - **Optional read-only concierge prototype.** Explicit `!concierge …` requests
   can use an existing pane to interpret live pane discovery. The bridge renders
-  metadata results and never binds or spawns from the proposal. Disabled by
-  default; the existing CLI agent is **not sandboxed**. See
+  ranked metadata results and never binds or spawns from the proposal. A separate
+  opt-in adds bounded recent task-keyword matching without forwarding transcripts.
+  Disabled by default; the existing CLI agent is **not sandboxed**. See
   [configuration](docs/guide/configuration.md#concierge_pane--read-only-prototype).
 - **Files both ways.** Share a file into a thread and the pane gets it under
   `.inbox/`; `!files`, `!file <n>` or an `@@send: path` line in an answer

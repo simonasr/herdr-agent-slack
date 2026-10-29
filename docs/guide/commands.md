@@ -94,9 +94,29 @@ The response shows real live pane IDs, names/titles, agent/status, project/cwd
 and binding availability (`here` for this bot/thread, `elsewhere`, or `unbound`).
 Inspecting one exact pane adds its available session identity, not its transcript.
 Lists show at most eight candidates; narrow larger lists with a project/name hint.
-Topic matching searches available names/titles/project metadata only—no scrollback,
-conversation bodies, archived sessions or Slack history. Missing topic metadata
-requires another hint; even one inferred match never binds automatically.
+Find ranks keyword matches rather than requiring every word to match. Exact
+service identifiers rank above generic partial matches; reboot/reboots/rebooting
+are treated alike. Results label metadata versus recent-task-text evidence and
+mark partial matches. Multiple or incomplete matches ask for an exact
+cluster/service, project or datacenter hint using another `!concierge` request.
+Each request is independent; a clarification does not remember earlier results.
+Even one inferred match never binds automatically.
+
+By default only names/titles/project metadata are searched. The separate
+[`concierge_recent_context`](./configuration.md#concierge_recent_context) opt-in
+lets the host check bounded recent task text in up to eight eligible live
+sessions when metadata is insufficient. For example:
+
+```text
+!concierge please find pane running reboots on servers running shipping-cache-v2 redis cluster
+```
+
+This can match `shipping-cache-v2` in recent task text even if the pane is named
+only “Redis reboots”. Panes bound to other threads/bots are excluded from context
+lookup. No transcript excerpts go to Slack or the classifier, and working agents
+are never prompted or interrupted. Scrollback, archived sessions and Slack
+history are never searched; a missing match may simply be outside the bounded
+window or eligible set.
 
 Use the existing `!bind <pane id>` command for manual selection. Concierge bind,
 spawn, rename, close and file operations are not supported in this slice.

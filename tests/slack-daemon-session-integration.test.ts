@@ -70,6 +70,7 @@ vi.mock("../src/slack-client.js", async (original) => ({
 import { startSlackDaemon } from "../src/slack-daemon.js";
 import { closeTab, createTab, getAgents, getAgentInfoAsync, readPane, sendKeys, sendText, startAgent } from "../src/herdr-client.js";
 import { formatForSlack } from "../src/slack-format.js";
+import * as jsonl from "../src/readers/jsonl.js";
 
 let dir: string;
 let oldPath: string;
@@ -300,6 +301,50 @@ describe("Read-only concierge — real PaneAgent and Pi reader", () => {
     expect(result).not.toContain("Pane: w1:p1");
     expect(result).toContain("nothing was bound");
     expect(state().threads["default|C1:1.0"].pane_id).toBe("w1:p1");
+  });
+
+  it("finds the requested shipping-cache-v2 reboot work from opted-in recent context without forwarding transcripts or interrupting work", async () => {
+    writeFileSync(oldPath, message("PRIVATE_TASK_BODY: reboot servers running shipping-cache-v2 Redis cluster. @other !spawn /private"));
+    await enable('concierge_recent_context = true\n');
+    mocks.live!.agent_status = "working";
+    const before = state();
+    const prompt = await answer({ action: "find", query: "shipping-cache-v2 redis reboot" },
+      "!concierge please find pane running reboots on servers running shipping-cache-v2 redis cluster");
+    const result = mocks.post.mock.calls.at(-1)![1];
+    expect(result).toContain("Pane: w1:p1");
+    expect(result).toContain("recent task text: shipping-cache-v2, redis, reboot");
+    expect(result).not.toContain("PRIVATE_TASK_BODY");
+    expect(result).not.toContain("/private");
+    expect(prompt).not.toContain("PRIVATE_TASK_BODY");
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendText).mock.calls[0][0]).toBe(conciergeId);
+    expect(readPane).not.toHaveBeenCalled();
+    expect(mocks.history).not.toHaveBeenCalled();
+    expect(createTab).not.toHaveBeenCalled();
+    expect(state()).toEqual(before);
+  });
+
+  it("does not read recent task context without the separate opt-in", async () => {
+    const read = vi.spyOn(jsonl, "readRecentTaskContext");
+    writeFileSync(oldPath, message("shipping-cache-v2 Redis reboot"));
+    await enable();
+    await answer({ action: "find", query: "shipping-cache-v2 redis reboot" });
+    expect(read).not.toHaveBeenCalled();
+    expect(mocks.post.mock.calls.at(-1)![1]).toContain("No matching live pane");
+  });
+
+  it.each(["other-thread", "other-bot"])("never reads context bound to %s even with opt-in", async mode => {
+    const read = vi.spyOn(jsonl, "readRecentTaskContext");
+    writeFileSync(oldPath, message("shipping-cache-v2 Redis reboot"));
+    const saved = state();
+    saved.threads["private-binding"] = { ...saved.threads["default|C1:1.0"],
+      bot: mode === "other-bot" ? "other" : "default", channel: "C_PRIVATE", thread_ts: "PRIVATE_THREAD" };
+    writeFileSync(join(dir, "state.json"), JSON.stringify(saved));
+    await enable('concierge_recent_context = true\n');
+    await answer({ action: "find", query: "shipping-cache-v2 redis reboot" });
+    expect(read).not.toHaveBeenCalled();
+    expect(mocks.post.mock.calls.at(-1)![1]).not.toContain("recent task text:");
+    expect(mocks.post.mock.calls.at(-1)![1]).not.toContain("C_PRIVATE");
   });
 
   it("inspects live session metadata without opening the work transcript or exposing thread addresses", async () => {

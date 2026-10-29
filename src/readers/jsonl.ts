@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type { AgentOutputReader, CompletedReaderTurn } from "./types.js";
 import type { AgentSessionRef } from "../agent-sessions.js";
@@ -15,6 +15,55 @@ function extractTextFromContent(content: unknown[]): string {
     })
     .filter((s: string) => s.length > 0)
     .join("\n\n");
+}
+
+/**
+ * Discovery-only task hints, not an output reader. Read at most 64 KiB of one
+ * live session and retain six recent user/assistant text messages (2k each).
+ * Never includes tool payloads, reasoning, system prompts or terminal fallback.
+ */
+export function readRecentTaskContext(path: string, agent: string): string {
+  if (!["pi", "omp", "codex", "claude"].includes(agent)) return "";
+  let fd: number | undefined;
+  try {
+    if (!statSync(path).isFile()) return "";
+    fd = openSync(path, "r");
+    const before = fstatSync(fd);
+    if (!before.isFile()) return "";
+    const start = Math.max(0, before.size - 65_536);
+    const bytes = Buffer.alloc(before.size - start);
+    const count = readSync(fd, bytes, 0, bytes.length, start);
+    const after = fstatSync(fd);
+    const current = statSync(path);
+    if (count !== bytes.length || after.size < before.size || before.ino !== current.ino || before.dev !== current.dev) return "";
+    let raw = bytes.toString("utf8");
+    if (start) raw = raw.includes("\n") ? raw.slice(raw.indexOf("\n") + 1) : ""; // Drop a possibly partial first record.
+    const messages: string[] = [];
+    for (const line of raw.split("\n")) {
+      let event: any;
+      try { event = JSON.parse(line); } catch { continue; }
+      let text = "";
+      if ((agent === "pi" || agent === "omp") && event?.type === "message") {
+        const m = event.message;
+        if (m?.role === "user" || m?.role === "assistant") {
+          text = m.role === "user" && typeof m.content === "string" ? m.content : extractTextFromContent(m.content);
+        }
+      } else if (agent === "codex" && event?.type === "response_item" && event.payload?.type === "message") {
+        const m = event.payload;
+        if (m.role === "assistant") text = extractTextFromContent(m.content);
+        if (m.role === "user") text = codexPromptText(extractTextFromContent(m.content));
+      } else if (agent === "claude" && !event?.isSidechain && !event?.isMeta) {
+        if (event?.type === "user") text = claudePromptText(event);
+        if (event?.type === "assistant") text = extractTextFromContent(event.message?.content);
+      }
+      if (text.trim()) messages.push(text.length <= 2_000 ? text : text.slice(0, 995) + "\n[…]\n" + text.slice(-1_000));
+    }
+    return messages.slice(-6).join("\n\n");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 export function readPiCumulativeSnapshot(path: string): string {
