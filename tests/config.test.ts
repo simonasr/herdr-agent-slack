@@ -29,6 +29,7 @@ describe("loadConfig — the turn settings", () => {
     expect(cfg.outputMode).toBe("final");
     expect(cfg.relayTerminalTurns).toBe(true);
     expect(cfg.slackBots[0].conciergePane).toBe("");
+    expect(cfg.slackBots[0].conciergeRecentContext).toBe(false);
   });
 
   it("reads the turn settings from a [slack.<name>] section", () => {
@@ -123,6 +124,7 @@ describe("[slack.<name>] — several bots in one config", () => {
         'spawn_args = ["--yolo"]',
         'default_pane = "coder-home"',
         'concierge_pane = "w9:p2"',
+        'concierge_recent_context = true',
         'channel_pane = "fresh"',
         'spawn_cwd = "/srv/work"',
         'idle_close_minutes = 30',
@@ -135,6 +137,7 @@ describe("[slack.<name>] — several bots in one config", () => {
       expect(cfg.slackBots[1]).toMatchObject({ botToken: "xoxb-l", allowedUserIds: [], spawnArgs: ["--yolo"], defaultPane: "coder-home", channelPane: "fresh", spawnCwd: "/srv/work", idleCloseMinutes: 30, role: "You code. Plans come from shaka.", maxHandoffs: 5 });
       expect(cfg.slackBots[0].maxHandoffs).toBe(20);
       expect(cfg.slackBots.map(bot => bot.conciergePane)).toEqual(["", "w9:p2"]);
+      expect(cfg.slackBots.map(bot => bot.conciergeRecentContext)).toEqual([false, true]);
       expect(cfg.slackBots[0]).toMatchObject({ defaultPane: "", channelPane: "shared", spawnCwd: "", idleCloseMinutes: 120 });
       // The flat fields still describe the first bot.
       expect(cfg.slackBotToken).toBe("xoxb-s");

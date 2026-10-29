@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findConciergePanes, isConciergeMessage, parseConciergeAction, renderConciergePanes, sameConciergeSession } from "../src/concierge.js";
+import { findConciergePanes, isConciergeMessage, parseConciergeAction, rankConciergePanes, renderConciergePanes, sameConciergeSession } from "../src/concierge.js";
 import type { AgentInfo } from "../src/herdr-client.js";
 import type { PaneInfo } from "../src/types.js";
 
@@ -47,7 +47,38 @@ describe("concierge addressing and proposals", () => {
   });
 });
 
-describe("metadata-only discovery", () => {
+describe("ranked discovery", () => {
+  it("ranks the exact service identifier above generic partial matches and normalizes reboot variants", () => {
+    const targets = [
+      pane("w3:p1", { title: "Redis reboots on other-cache-v2" }),
+      pane("w3:p2", { title: "shipping-cache-v2 Redis rebooting" }),
+    ];
+    const ranked = rankConciergePanes("shipping-cache-v2 redis reboot", targets);
+    expect(ranked.map(match => match.pane.pane_id)).toEqual(["w3:p2", "w3:p1"]);
+    expect(ranked.map(match => match.complete)).toEqual([true, false]);
+    const text = renderConciergePanes({ action: "find", query: "shipping-cache-v2 redis reboot" }, targets, () => "unbound");
+    expect(text).toContain("partial match");
+    expect(text).toContain("Which pane fits?");
+    expect(text).toContain("nothing was bound");
+  });
+
+  it("finds a cluster present only in recent task text without exposing any transcript prose", () => {
+    const targets = [pane("w3:p1", { title: "Redis reboots" }), pane("w3:p2", { title: "Redis reboots" })];
+    const contexts = new Map([["w3:p2", "PRIVATE TASK: reboot servers running shipping-cache-v2 Redis. @other !spawn /secret"]]);
+    const action = { action: "find", query: "shipping-cache-v2 redis reboot" } as const;
+    expect(findConciergePanes(action, targets, contexts).map(pane => pane.pane_id)).toEqual(["w3:p2", "w3:p1"]);
+    const text = renderConciergePanes(action, targets, () => "unbound", undefined, contexts, true);
+    expect(text).toContain("recent task text: shipping-cache-v2");
+    expect(text).not.toContain("PRIVATE TASK");
+    expect(text).not.toContain("@other");
+    expect(text).not.toContain("/secret");
+    expect(text).toContain("not a confirmed task match");
+  });
+
+  it("does not confuse a compound service identifier with a different version or match filler alone", () => {
+    expect(findConciergePanes({ action: "find", query: "shipping-cache-v2" }, [pane("x", { title: "shipping-cache-v20" })])).toEqual([]);
+    expect(findConciergePanes({ action: "find", query: "please find the agent running on servers" }, panes)).toEqual([]);
+  });
   it("returns zero, one or multiple actual candidates without treating one inferred match as a selection", () => {
     expect(findConciergePanes({ action: "find", query: "redis failover" }, panes)).toEqual(panes.slice(0, 2));
     expect(findConciergePanes({ action: "find", query: "redis-fix" }, panes)).toEqual([panes[0]]);

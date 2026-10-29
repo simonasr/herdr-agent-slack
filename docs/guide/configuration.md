@@ -24,6 +24,7 @@ spawn_args = ["--yolo"]       # handed to that agent (default none)
 default_pane = "server-local" # pane (label or id) a thread with no binding for
                               # this bot is bound to when spoken to
 # concierge_pane = "w9:p2"    # optional existing, idle, unbound classifier pane
+concierge_recent_context = false # separate opt-in for bounded task-text matching
 channel_pane = "fresh"        # "shared" (default): channel threads use default_pane
                               # "fresh": each channel thread gets a pane of its own
 spawn_cwd = "~"               # where such a pane starts (default: home)
@@ -110,6 +111,35 @@ one read-only `list`, `find` or `inspect` proposal. It validates that proposal
 and queries live metadata itself; it does not forward thread history, model
 prose, file requests or bot handoffs. Requester, bot and reply thread come from
 Slack callbacks, not model fields. Ordinary work still uses its existing binding.
+
+#### concierge_recent_context
+
+Off by default, independently per bot. Set `concierge_recent_context = true`
+only if the bot's allowed users may discover task keywords in local **unbound**
+agent sessions and sessions bound exclusively to this bot and requesting thread.
+Panes bound to any other thread or bot are never read, even if their metadata is
+visible. A pane configured as another bot's default/channel target still counts
+as unbound until an actual thread binding exists. All configured classifier
+panes are excluded.
+
+For `find` requests without a complete metadata match, the host checks at most
+eight eligible candidates, preferring partial metadata matches. With no metadata
+matches it checks up to eight eligible live panes; this is not exhaustive search.
+It reads at most the last 64 KiB of each current Pi/OMP, Codex or Claude JSONL
+session, keeping six recent user/assistant text messages, at most 2k characters
+per message. Tool payloads, reasoning, system records, archived sessions,
+terminal scrollback and Slack history are excluded. Missing/unsupported or
+changed sessions supply no evidence. A five-second deadline is checked between
+lookup operations; no additional context reads start after it. Filesystem reads
+and session-ID path lookup are synchronous and cannot be interrupted, so an
+operation already in progress can exceed that deadline.
+
+Task text stays in the host's request memory: it is not sent to the classifier,
+posted to Slack, logged or persisted. Only the **query keywords** that matched
+are shown, labelled as task-text evidence. This can reveal that an allowed local
+session mentions a keyword; it is not a confirmed summary of its current work.
+Old topics outside the bounded window may not be found. Disabling this option
+retains metadata-only discovery. Restart the daemon after changing configuration.
 
 Only one management request may use a pane at once, even across bots. Busy
 requests are rejected, not queued. The classification wait is capped at 90

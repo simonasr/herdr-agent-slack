@@ -38,7 +38,7 @@ import { extractSendRequests, listRecentFiles, resolveInsideCwd } from "./tool-f
 import { MAX_INBOUND_BYTES, describeReceived, describeVoice, inboxTarget, isAudioName } from "./inbound-files.js";
 import { formatBytes } from "./format-bytes.js";
 import type { PaneInfo } from "./types.js";
-import { classifyConciergeRequest, CONCIERGE_FALLBACK, findConciergePanes, isConciergeMessage, renderConciergePanes, sameConciergeSession } from "./concierge.js";
+import { classifyConciergeRequest, collectConciergeContext, CONCIERGE_FALLBACK, findConciergePanes, isConciergeMessage, renderConciergePanes, sameConciergeSession } from "./concierge.js";
 
 /** Ceiling on one delivered answer; the tail is what carries the conclusion. */
 const MAX_ANSWER_CHARS = 20_000;
@@ -1865,7 +1865,14 @@ export async function startSlackDaemon(
       const live = await getAgentInfoAsync(paneId);
       if (!isAvailable() || !sameConciergeSession(live, pane)) throw new Error("Concierge ownership changed");
       const panes = getAgents({ strict: true }).filter(pane => !isConfiguredConcierge(pane));
-      const found = findConciergePanes(action, panes);
+      const canReadContext = (id: string) => Object.values(state.threads).filter(binding => binding.pane_id === id)
+        .every(binding => binding.bot === bot.name && binding.channel === thread.channel && binding.thread_ts === thread.threadTs);
+      const contexts = action.action === "find" && bot.cfg.conciergeRecentContext
+        ? await collectConciergeContext({ query: action.query, panes, isAvailable, canReadContext }) : new Map<string, string>();
+      if (!isAvailable()) throw new Error("Concierge ownership changed during discovery");
+      // A concurrent bind must not turn task evidence into cross-thread disclosure.
+      for (const id of contexts.keys()) if (!canReadContext(id)) contexts.delete(id);
+      const found = findConciergePanes(action, panes, contexts);
       const info = action.action === "inspect" && found.length === 1 ? getAgentInfo(found[0].pane_id) : undefined;
       if (action.action === "inspect" && found.length === 1 && (!info || info.pane_id !== found[0].pane_id || info.agent !== found[0].agent)) {
         await reply(`That pane disappeared or its metadata is unavailable. Try discovery again. ${CONCIERGE_FALLBACK}`);
@@ -1875,7 +1882,7 @@ export async function startSlackDaemon(
         const bindings = Object.values(state.threads).filter(binding => binding.pane_id === id);
         return bindings.some(binding => binding.bot === bot.name && binding.channel === thread.channel && binding.thread_ts === thread.threadTs)
           ? "here" : bindings.length ? "elsewhere" : "unbound";
-      }, info));
+      }, info, contexts, bot.cfg.conciergeRecentContext));
     } catch (err) {
       log.warn("concierge unavailable", { bot: bot.name, message: String(err) });
       if (!stopping) await reply(`Concierge unavailable or unable to interpret that as read-only discovery. ${CONCIERGE_FALLBACK}`);
